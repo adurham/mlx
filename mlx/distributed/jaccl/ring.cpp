@@ -157,7 +157,7 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 4;
     constexpr int WC_NUM = PIPELINE * MAX_CONNS * 2 * 2;
     int n_wires = left_.size();
     size_t n_bytes_per_wire = (n_bytes + (2 * n_wires) - 1) / (2 * n_wires);
@@ -280,7 +280,7 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
     auto& conns = (dst == left) ? left_ : right_;
     int dir = dst == left;
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 4;
     constexpr int WC_NUM = PIPELINE * MAX_CONNS;
 
     int n_wires = conns.size();
@@ -361,7 +361,7 @@ void RingGroup::recv(array& out, int src, Stream stream) {
     auto& conns = (src == right) ? right_ : left_;
     int dir = src == right;
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 4;
     constexpr int WC_NUM = PIPELINE * MAX_CONNS;
 
     int n_wires = conns.size();
@@ -454,7 +454,7 @@ void RingGroup::all_reduce_impl(
     std::memcpy(out_ptr, in_ptr, size * sizeof(T));
   }
 
-  constexpr int PIPELINE = 2;
+  constexpr int PIPELINE = 4;
   constexpr int WC_NUM = PIPELINE * MAX_CONNS * 2 * MAX_DIR;
   int64_t chunk_size = (size + size_ - 1) / size_;
   int64_t size_per_wire =
