@@ -15,6 +15,10 @@ RingGroup::RingGroup(
     const char* coordinator_addr)
     : rank_(rank),
       size_(size),
+      coordinator_addr_(coordinator_addr),
+      device_name_(
+          left_devices.empty() ? (right_devices.empty() ? "" : right_devices[0])
+                               : left_devices[0]),
       side_channel_(rank_, size_, coordinator_addr),
       left_(create_connections(left_devices)),
       right_(create_connections(right_devices)) {
@@ -687,6 +691,89 @@ void RingGroup::all_reduce_impl(
       send_count[i] = recv_count[i] = 0;
     }
   }
+}
+
+} // namespace mlx::core::distributed::jaccl
+
+// split() for RingGroup — delegates to MeshGroup for the sub-group.
+namespace mlx::core::distributed::jaccl {
+
+std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
+  if (key < 0) {
+    key = rank_;
+  }
+
+  // Step 1: Coordinate across all ranks to determine sub-group membership.
+  struct SplitInfo {
+    int color;
+    int key;
+  };
+  SplitInfo my_info{color, key};
+  auto all_info = side_channel_.all_gather(my_info);
+
+  // Step 2: Find peers with matching color, sorted by key for rank assignment.
+  struct PeerEntry {
+    int key;
+    int global_rank;
+    bool operator<(const PeerEntry& o) const {
+      return key < o.key;
+    }
+  };
+  std::vector<PeerEntry> peers;
+  for (int i = 0; i < size_; i++) {
+    if (all_info[i].color == color) {
+      peers.push_back({all_info[i].key, i});
+    }
+  }
+  std::sort(peers.begin(), peers.end());
+
+  int new_size = static_cast<int>(peers.size());
+
+  // Step 3: Determine new local rank and build device names for MeshGroup.
+  int new_rank = -1;
+  std::vector<int> global_ranks(new_size);
+  for (int i = 0; i < new_size; i++) {
+    global_ranks[i] = peers[i].global_rank;
+    if (peers[i].global_rank == rank_) {
+      new_rank = i;
+    }
+  }
+
+  if (new_rank < 0) {
+    throw std::runtime_error(
+        "[jaccl] split: current rank not found in sub-group");
+  }
+
+  // Gather device names from all ranks via side channel so we can build
+  // per-peer connection info for the MeshGroup sub-group.
+  auto all_device_names = side_channel_.all_gather(device_name_);
+
+  std::vector<std::string> new_device_names(new_size);
+  for (int i = 0; i < new_size; i++) {
+    int g = global_ranks[i];
+    if (g == rank_) {
+      new_device_names[i] = ""; // Self — no connection needed
+    } else {
+      new_device_names[i] = all_device_names[g];
+    }
+  }
+
+  // Step 4: Negotiate a new coordinator address for the sub-group.
+  std::string coordinator_addr = coordinator_addr_;
+  auto colon_pos = coordinator_addr_.rfind(':');
+  if (colon_pos != std::string::npos) {
+    std::string host = coordinator_addr_.substr(0, colon_pos);
+    int base_port = std::atoi(coordinator_addr_.substr(colon_pos + 1).c_str());
+    int new_port = base_port + (color + 1) * 100;
+    coordinator_addr = host + ":" + std::to_string(new_port);
+  }
+
+  auto all_coords = side_channel_.all_gather(coordinator_addr);
+  coordinator_addr = all_coords[global_ranks[0]];
+
+  // Step 5: Construct a MeshGroup sub-group.
+  return std::make_shared<MeshGroup>(
+      new_rank, new_device_names, coordinator_addr.c_str());
 }
 
 } // namespace mlx::core::distributed::jaccl

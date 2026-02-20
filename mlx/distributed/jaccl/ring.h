@@ -3,6 +3,7 @@
 #pragma once
 
 #include "mlx/distributed/distributed_impl.h"
+#include "mlx/distributed/jaccl/mesh.h"
 #include "mlx/distributed/jaccl/utils.h"
 
 using GroupImpl = mlx::core::distributed::detail::GroupImpl;
@@ -52,9 +53,7 @@ class RingGroup : public GroupImpl {
     throw std::runtime_error("[jaccl] sum_scatter not supported.");
   }
 
-  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[jaccl] Group split not supported.");
-  }
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override;
 
  private:
   template <typename T, typename ReduceOp>
@@ -168,6 +167,8 @@ class RingGroup : public GroupImpl {
 
   int rank_;
   int size_;
+  std::string coordinator_addr_;
+  std::string device_name_; // representative RDMA device for split
   SideChannel side_channel_;
   std::vector<Connection> left_;
   std::vector<Connection> right_;
