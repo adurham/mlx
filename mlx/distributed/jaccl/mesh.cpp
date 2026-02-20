@@ -15,6 +15,8 @@ MeshGroup::MeshGroup(
     const char* coordinator_addr)
     : rank_(rank),
       size_(device_names.size()),
+      coordinator_addr_(coordinator_addr),
+      device_names_(device_names),
       side_channel_(rank_, size_, coordinator_addr),
       connections_(create_connections(device_names)) {
   if (size_ > MAX_PEERS) {
@@ -446,6 +448,114 @@ void MeshGroup::all_reduce(
       }
     }
   });
+}
+
+} // namespace mlx::core::distributed::jaccl
+
+// split() implementation — must be outside the template-heavy section
+namespace mlx::core::distributed::jaccl {
+
+std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
+  // Use negative key as sentinel for "use current rank"
+  if (key < 0) {
+    key = rank_;
+  }
+
+  // Step 1: Coordinate across all ranks to determine sub-group membership.
+  // Pack (color, key) into a single struct for all_gather.
+  struct SplitInfo {
+    int color;
+    int key;
+  };
+  SplitInfo my_info{color, key};
+  auto all_info = side_channel_.all_gather(my_info);
+
+  // Step 2: Find peers with matching color, sorted by key for rank assignment.
+  struct PeerEntry {
+    int key;
+    int global_rank;
+    bool operator<(const PeerEntry& o) const {
+      return key < o.key;
+    }
+  };
+  std::vector<PeerEntry> peers;
+  for (int i = 0; i < size_; i++) {
+    if (all_info[i].color == color) {
+      peers.push_back({all_info[i].key, i});
+    }
+  }
+  std::sort(peers.begin(), peers.end());
+
+  int new_size = static_cast<int>(peers.size());
+
+  // Singleton group — just return an EmptyGroup-like wrapper (no comm needed)
+  if (new_size <= 1) {
+    // Return a single-node MeshGroup. Build a device_names with one entry
+    // (self, empty string) and use a dedicated coordinator port.
+    // For a size-1 group, communication ops are no-ops at the caller level.
+    //
+    // Actually, we can construct a MeshGroup with just ourselves.
+    // The coordinator negotiation below handles this correctly.
+    // Fall through to the general case.
+  }
+
+  // Step 3: Determine new local rank and build filtered device names.
+  int new_rank = -1;
+  // Build a map: new_rank -> global_rank
+  std::vector<int> global_ranks(new_size);
+  for (int i = 0; i < new_size; i++) {
+    global_ranks[i] = peers[i].global_rank;
+    if (peers[i].global_rank == rank_) {
+      new_rank = i;
+    }
+  }
+
+  if (new_rank < 0) {
+    throw std::runtime_error(
+        "[jaccl] split: current rank not found in sub-group");
+  }
+
+  // Build new device_names: for each sub-group member, use the original
+  // device name that connects us to that global rank.
+  std::vector<std::string> new_device_names(new_size);
+  for (int i = 0; i < new_size; i++) {
+    int g = global_ranks[i];
+    if (g == rank_) {
+      new_device_names[i] = ""; // Self — no connection needed
+    } else {
+      new_device_names[i] = device_names_[g];
+    }
+  }
+
+  // Step 4: Negotiate a new coordinator address for the sub-group.
+  // The lowest-ranked process in each sub-group (new_rank == 0) will
+  // start a new coordinator. We use the original coordinator address
+  // with a modified port.
+  //
+  // Strategy: the global rank 0 process in each sub-group picks a port
+  // by incrementing the original coordinator port by (color + 1) * 100.
+  // All processes learn this via all_gather on the original side channel.
+  std::string coordinator_addr = coordinator_addr_;
+
+  // Parse the original coordinator address to extract host and port
+  auto colon_pos = coordinator_addr_.rfind(':');
+  if (colon_pos != std::string::npos) {
+    std::string host = coordinator_addr_.substr(0, colon_pos);
+    int base_port = std::atoi(coordinator_addr_.substr(colon_pos + 1).c_str());
+    // Offset port by color to avoid collisions between sub-groups
+    int new_port = base_port + (color + 1) * 100;
+    coordinator_addr = host + ":" + std::to_string(new_port);
+  }
+
+  // Broadcast the coordinator address so all sub-group members agree.
+  // Use original side channel for this last coordination step.
+  auto all_coords = side_channel_.all_gather(coordinator_addr);
+  // Use the coordinator from the first member of our sub-group
+  coordinator_addr = all_coords[global_ranks[0]];
+
+  // Step 5: Construct the sub-group MeshGroup.
+  return std::make_shared<MeshGroup>(
+      new_rank, new_device_names, coordinator_addr.c_str());
 }
 
 } // namespace mlx::core::distributed::jaccl

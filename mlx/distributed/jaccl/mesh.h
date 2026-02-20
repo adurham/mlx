@@ -48,9 +48,7 @@ class MeshGroup : public GroupImpl {
     throw std::runtime_error("[jaccl] sum_scatter not supported.");
   }
 
-  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[jaccl] Group split not supported.");
-  }
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override;
 
  private:
   template <typename T, typename ReduceOp>
@@ -114,6 +112,8 @@ class MeshGroup : public GroupImpl {
 
   int rank_;
   int size_;
+  std::string coordinator_addr_;
+  std::vector<std::string> device_names_;
   SideChannel side_channel_;
   std::vector<Connection> connections_;
   std::vector<SharedBuffer> buffers_;
