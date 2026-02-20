@@ -703,6 +703,10 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
     key = rank_;
   }
 
+  std::cerr << "[jaccl-split] rank=" << rank_ << " color=" << color
+            << " key=" << key << " coordinator=" << coordinator_addr_
+            << std::endl;
+
   // Step 1: Coordinate across all ranks to determine sub-group membership.
   struct SplitInfo {
     int color;
@@ -710,6 +714,13 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   };
   SplitInfo my_info{color, key};
   auto all_info = side_channel_.all_gather(my_info);
+
+  std::cerr << "[jaccl-split] rank=" << rank_
+            << " all_gather(SplitInfo) complete. Peers:" << std::endl;
+  for (int i = 0; i < size_; i++) {
+    std::cerr << "  global_rank=" << i << " color=" << all_info[i].color
+              << " key=" << all_info[i].key << std::endl;
+  }
 
   // Step 2: Find peers with matching color, sorted by key for rank assignment.
   struct PeerEntry {
@@ -744,6 +755,14 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
         "[jaccl] split: current rank not found in sub-group");
   }
 
+  std::cerr << "[jaccl-split] rank=" << rank_ << " new_rank=" << new_rank
+            << " new_size=" << new_size << " global_ranks=[";
+  for (int i = 0; i < new_size; i++) {
+    if (i > 0) std::cerr << ",";
+    std::cerr << global_ranks[i];
+  }
+  std::cerr << "]" << std::endl;
+
   // Gather device names from all ranks via side channel so we can build
   // per-peer connection info for the MeshGroup sub-group.
   // NOTE: all ranks must participate in all_gather even if they are singletons.
@@ -760,13 +779,22 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
     coordinator_addr = host + ":" + std::to_string(new_port);
   }
 
+  std::cerr << "[jaccl-split] rank=" << rank_
+            << " computed sub-coordinator: " << coordinator_addr << std::endl;
+
   auto all_coords = side_channel_.all_gather(coordinator_addr);
   coordinator_addr = all_coords[global_ranks[0]];
+
+  std::cerr << "[jaccl-split] rank=" << rank_
+            << " final sub-coordinator (from global_ranks[0]="
+            << global_ranks[0] << "): " << coordinator_addr << std::endl;
 
   // Singleton sub-group: no communication needed, return a trivial group.
   // We already participated in all collective calls above so other ranks
   // won't hang.
   if (new_size <= 1) {
+    std::cerr << "[jaccl-split] rank=" << rank_
+              << " returning singleton (no MeshGroup needed)" << std::endl;
     // No-op singleton group — no sockets, no coordinator, no connections.
     class SingletonGroupImpl : public GroupImpl {
      public:
@@ -812,6 +840,17 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
       new_device_names[i] = all_device_names[g];
     }
   }
+
+  std::cerr << "[jaccl-split] rank=" << rank_
+            << " creating MeshGroup with new_rank=" << new_rank
+            << " new_size=" << new_size
+            << " coordinator=" << coordinator_addr
+            << " devices=[";
+  for (int i = 0; i < new_size; i++) {
+    if (i > 0) std::cerr << ",";
+    std::cerr << "'" << new_device_names[i] << "'";
+  }
+  std::cerr << "]" << std::endl;
 
   // Step 5: Construct a MeshGroup sub-group.
   return std::make_shared<MeshGroup>(
