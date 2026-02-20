@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 #include "mlx/distributed/jaccl/ring.h"
+#include <iostream>
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/distributed/reduction_ops.h"
 #include "mlx/dtype_utils.h"
@@ -758,7 +759,8 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   std::cerr << "[jaccl-split] rank=" << rank_ << " new_rank=" << new_rank
             << " new_size=" << new_size << " global_ranks=[";
   for (int i = 0; i < new_size; i++) {
-    if (i > 0) std::cerr << ",";
+    if (i > 0)
+      std::cerr << ",";
     std::cerr << global_ranks[i];
   }
   std::cerr << "]" << std::endl;
@@ -843,11 +845,11 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
 
   std::cerr << "[jaccl-split] rank=" << rank_
             << " creating MeshGroup with new_rank=" << new_rank
-            << " new_size=" << new_size
-            << " coordinator=" << coordinator_addr
+            << " new_size=" << new_size << " coordinator=" << coordinator_addr
             << " devices=[";
   for (int i = 0; i < new_size; i++) {
-    if (i > 0) std::cerr << ",";
+    if (i > 0)
+      std::cerr << ",";
     std::cerr << "'" << new_device_names[i] << "'";
   }
   std::cerr << "]" << std::endl;
