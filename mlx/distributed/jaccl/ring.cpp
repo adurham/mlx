@@ -746,19 +746,11 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
 
   // Gather device names from all ranks via side channel so we can build
   // per-peer connection info for the MeshGroup sub-group.
+  // NOTE: all ranks must participate in all_gather even if they are singletons.
   auto all_device_names = side_channel_.all_gather(device_name_);
 
-  std::vector<std::string> new_device_names(new_size);
-  for (int i = 0; i < new_size; i++) {
-    int g = global_ranks[i];
-    if (g == rank_) {
-      new_device_names[i] = ""; // Self — no connection needed
-    } else {
-      new_device_names[i] = all_device_names[g];
-    }
-  }
-
   // Step 4: Negotiate a new coordinator address for the sub-group.
+  // NOTE: all ranks must participate in all_gather even if they are singletons.
   std::string coordinator_addr = coordinator_addr_;
   auto colon_pos = coordinator_addr_.rfind(':');
   if (colon_pos != std::string::npos) {
@@ -770,6 +762,25 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
 
   auto all_coords = side_channel_.all_gather(coordinator_addr);
   coordinator_addr = all_coords[global_ranks[0]];
+
+  // Singleton sub-group: no communication needed, return a trivial group.
+  // We already participated in all collective calls above so other ranks
+  // won't hang.
+  if (new_size <= 1) {
+    std::vector<std::string> self_device = {""};
+    return std::make_shared<MeshGroup>(
+        0, self_device, coordinator_addr.c_str());
+  }
+
+  std::vector<std::string> new_device_names(new_size);
+  for (int i = 0; i < new_size; i++) {
+    int g = global_ranks[i];
+    if (g == rank_) {
+      new_device_names[i] = ""; // Self — no connection needed
+    } else {
+      new_device_names[i] = all_device_names[g];
+    }
+  }
 
   // Step 5: Construct a MeshGroup sub-group.
   return std::make_shared<MeshGroup>(
