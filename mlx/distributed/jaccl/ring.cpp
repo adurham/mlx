@@ -767,9 +767,40 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   // We already participated in all collective calls above so other ranks
   // won't hang.
   if (new_size <= 1) {
-    std::vector<std::string> self_device = {""};
-    return std::make_shared<MeshGroup>(
-        0, self_device, coordinator_addr.c_str());
+    // No-op singleton group — no sockets, no coordinator, no connections.
+    class SingletonGroupImpl : public GroupImpl {
+     public:
+      Stream communication_stream(StreamOrDevice s) override {
+        return to_stream(s, Device::cpu);
+      }
+      int rank() override {
+        return 0;
+      }
+      int size() override {
+        return 1;
+      }
+      std::shared_ptr<GroupImpl> split(int, int) override {
+        return std::make_shared<SingletonGroupImpl>();
+      }
+      void all_sum(const array& input, array& output, Stream) override {
+        output = input;
+      }
+      void all_max(const array& input, array& output, Stream) override {
+        output = input;
+      }
+      void all_min(const array& input, array& output, Stream) override {
+        output = input;
+      }
+      void all_gather(const array& input, array& output, Stream) override {
+        output = input;
+      }
+      void send(const array&, int, Stream) override {}
+      void recv(array&, int, Stream) override {}
+      void sum_scatter(const array& input, array& output, Stream) override {
+        output = input;
+      }
+    };
+    return std::make_shared<SingletonGroupImpl>();
   }
 
   std::vector<std::string> new_device_names(new_size);
