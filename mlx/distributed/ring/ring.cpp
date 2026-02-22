@@ -1,10 +1,13 @@
 // Copyright © 2024 Apple Inc.
 
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -384,27 +387,27 @@ class RingGroup : public GroupImpl {
       int rank,
       std::vector<std::vector<detail::address_t>> nodes,
       bool verbose)
-      : rank_(rank), verbose_(verbose), pool_(0) {
-    if (rank_ > 0 && rank_ >= nodes.size()) {
+      : rank_(rank), verbose_(verbose), pool_(0), nodes_(std::move(nodes)) {
+    if (rank_ > 0 && rank_ >= nodes_.size()) {
       throw std::runtime_error(
           "[ring] Rank cannot be larger than the size of the group");
     }
 
-    size_ = nodes.size();
+    size_ = nodes_.size();
     int connect_to = (rank_ + 1) % size_;
 
     // We define the connection order by having the rank_ == size_ - 1 connect
     // first and accept after.
     if (rank_ < connect_to) {
       log_info(verbose_, "Rank", rank_, "accepting");
-      sockets_left_ = accept_connections(nodes[rank_]);
+      sockets_left_ = accept_connections(nodes_[rank_]);
       log_info(verbose_, "Rank", rank_, "connecting to", connect_to);
-      sockets_right_ = make_connections(nodes[connect_to], verbose);
+      sockets_right_ = make_connections(nodes_[connect_to], verbose);
     } else {
       log_info(verbose_, "Rank", rank_, "connecting to", connect_to);
-      sockets_right_ = make_connections(nodes[connect_to], verbose);
+      sockets_right_ = make_connections(nodes_[connect_to], verbose);
       log_info(verbose_, "Rank", rank_, "accepting");
-      sockets_left_ = accept_connections(nodes[rank_]);
+      sockets_left_ = accept_connections(nodes_[rank_]);
     }
 
     // Failure if we couldn't make right or left sockets
@@ -489,9 +492,7 @@ class RingGroup : public GroupImpl {
         output, all_reduce<T>(input, output, stream, detail::MinOp<T>()));
   }
 
-  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[ring] Group split not supported.");
-  }
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override;
 
   void all_gather(const array& input, array& output, Stream stream) override {
     auto& encoder = cpu::get_command_encoder(stream);
@@ -838,6 +839,9 @@ class RingGroup : public GroupImpl {
   std::vector<int> sockets_left_;
 
   std::vector<char> buffers_;
+
+  // Original node addresses, stored for split() sub-ring creation.
+  std::vector<std::vector<detail::address_t>> nodes_;
 };
 
 bool is_available() {
@@ -865,6 +869,234 @@ std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
   int rank = std::atoi(rank_str);
 
   return std::make_shared<RingGroup>(rank, nodes, ring_verbose != nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// RingGroup::split() — create sub-groups by color.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Trivial group of size 1. All collective ops are identity / no-op.
+class SingletonGroupImpl : public GroupImpl {
+ public:
+  Stream communication_stream(StreamOrDevice s) override {
+    return to_stream(s, Device::cpu);
+  }
+  int rank() override { return 0; }
+  int size() override { return 1; }
+  std::shared_ptr<GroupImpl> split(int, int) override {
+    return std::make_shared<SingletonGroupImpl>();
+  }
+  void all_sum(const array& input, array& output, Stream) override {
+    output = input;
+  }
+  void all_max(const array& input, array& output, Stream) override {
+    output = input;
+  }
+  void all_min(const array& input, array& output, Stream) override {
+    output = input;
+  }
+  void all_gather(const array& input, array& output, Stream) override {
+    output = input;
+  }
+  void send(const array&, int, Stream) override {}
+  void recv(array&, int, Stream) override {}
+  void sum_scatter(const array& input, array& output, Stream) override {
+    output = input;
+  }
+};
+
+// Blocking send on a raw socket fd.
+void blocking_send(int fd, const void* data, size_t len) {
+  const char* p = static_cast<const char*>(data);
+  while (len > 0) {
+    ssize_t n = ::send(fd, p, len, 0);
+    if (n < 0) {
+      if (errno == EINTR || errno == EAGAIN) continue;
+      throw std::runtime_error("[ring-split] blocking_send failed");
+    }
+    p += n;
+    len -= n;
+  }
+}
+
+// Blocking recv on a raw socket fd.
+void blocking_recv(int fd, void* data, size_t len) {
+  char* p = static_cast<char*>(data);
+  while (len > 0) {
+    ssize_t n = ::recv(fd, p, len, 0);
+    if (n < 0) {
+      if (errno == EINTR || errno == EAGAIN) continue;
+      throw std::runtime_error("[ring-split] blocking_recv failed");
+    }
+    if (n == 0) {
+      throw std::runtime_error("[ring-split] connection closed during recv");
+    }
+    p += n;
+    len -= n;
+  }
+}
+
+// Extract IP string from `address_t`. Returns "" on failure.
+std::string ip_from_address(const detail::address_t& addr) {
+  char buf[INET6_ADDRSTRLEN] = {};
+  if (addr.addr.ss_family == AF_INET) {
+    auto* sa4 = reinterpret_cast<const sockaddr_in*>(&addr.addr);
+    inet_ntop(AF_INET, &sa4->sin_addr, buf, sizeof(buf));
+  } else if (addr.addr.ss_family == AF_INET6) {
+    auto* sa6 = reinterpret_cast<const sockaddr_in6*>(&addr.addr);
+    inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf));
+  }
+  return std::string(buf);
+}
+
+} // namespace
+
+std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
+  if (key < 0) key = rank_;
+
+  log_info(verbose_, "Rank", rank_, "split color=", color, "key=", key);
+
+  // ---- Step 1: All-gather (color, key) across the ring. ----
+  // We use BLOCKING I/O on the underlying socket fds.
+  // The SocketThread layer uses non-blocking I/O, so we temporarily set
+  // the sockets back to blocking for this coordination phase.
+  //
+  // Data layout: int[2] per rank -> {color, key}
+  struct SplitInfo { int color; int key; };
+  std::vector<SplitInfo> all_info(size_);
+  all_info[rank_] = {color, key};
+
+  // Use the first right and first left socket for coordination.
+  int sock_right = sockets_right_[0];
+  int sock_left = sockets_left_[0];
+
+  // Temporarily set to blocking.
+  int flags_r = fcntl(sock_right, F_GETFL, 0);
+  int flags_l = fcntl(sock_left, F_GETFL, 0);
+  fcntl(sock_right, F_SETFL, flags_r & ~O_NONBLOCK);
+  fcntl(sock_left, F_SETFL, flags_l & ~O_NONBLOCK);
+
+  // Ring all-gather: each step, send data one hop right and recv from left.
+  // After size_-1 steps, every rank has all data.
+  for (int step = 0; step < size_ - 1; step++) {
+    int send_slot = (rank_ - step + size_) % size_;
+    int recv_slot = (rank_ - step - 1 + size_) % size_;
+    blocking_send(sock_right, &all_info[send_slot], sizeof(SplitInfo));
+    blocking_recv(sock_left, &all_info[recv_slot], sizeof(SplitInfo));
+  }
+
+  log_info(verbose_, "Rank", rank_, "split all-gather complete");
+
+  // ---- Step 2: Determine my sub-group. ----
+  struct PeerEntry {
+    int key;
+    int global_rank;
+    bool operator<(const PeerEntry& o) const { return key < o.key; }
+  };
+  std::vector<PeerEntry> peers;
+  for (int i = 0; i < size_; i++) {
+    if (all_info[i].color == color) {
+      peers.push_back({all_info[i].key, i});
+    }
+  }
+  std::sort(peers.begin(), peers.end());
+
+  int new_size = static_cast<int>(peers.size());
+  int new_rank = -1;
+  for (int i = 0; i < new_size; i++) {
+    if (peers[i].global_rank == rank_) {
+      new_rank = i;
+      break;
+    }
+  }
+
+  if (new_rank < 0) {
+    throw std::runtime_error("[ring-split] current rank not found in sub-group");
+  }
+
+  log_info(verbose_, "Rank", rank_, "sub-group: new_rank=", new_rank,
+           "new_size=", new_size);
+
+  // ---- Step 3: Singleton -> no-op group. ----
+  if (new_size <= 1) {
+    // Restore non-blocking.
+    fcntl(sock_right, F_SETFL, flags_r);
+    fcntl(sock_left, F_SETFL, flags_l);
+    log_info(verbose_, "Rank", rank_, "returning singleton sub-group");
+    return std::make_shared<SingletonGroupImpl>();
+  }
+
+  // ---- Step 4: Create sub-ring with new TCP connections. ----
+  //
+  // Each node in the sub-group opens a listener on an ephemeral port.
+  // We all-gather the ports across the FULL ring (including nodes not
+  // in our sub-group — they just ignore our port).
+  // Then sub-group members extract their peers' IPs from the stored
+  // nodes_ and connect using the ephemeral ports.
+
+  // 4a. Bind an ephemeral listener.
+  int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0) {
+    throw std::runtime_error("[ring-split] socket() failed");
+  }
+  int one = 1;
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in bind_addr{};
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_addr.s_addr = INADDR_ANY;
+  bind_addr.sin_port = 0; // OS picks ephemeral port
+  if (::bind(listen_fd, (sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+    ::close(listen_fd);
+    throw std::runtime_error("[ring-split] bind() failed");
+  }
+  if (::listen(listen_fd, new_size) < 0) {
+    ::close(listen_fd);
+    throw std::runtime_error("[ring-split] listen() failed");
+  }
+  sockaddr_in bound{};
+  socklen_t bound_len = sizeof(bound);
+  getsockname(listen_fd, (sockaddr*)&bound, &bound_len);
+  int my_port = ntohs(bound.sin_port);
+
+  log_info(verbose_, "Rank", rank_, "listening on ephemeral port", my_port);
+
+  // 4b. All-gather ephemeral ports across the full ring.
+  std::vector<int> all_ports(size_, 0);
+  all_ports[rank_] = my_port;
+  for (int step = 0; step < size_ - 1; step++) {
+    int send_slot = (rank_ - step + size_) % size_;
+    int recv_slot = (rank_ - step - 1 + size_) % size_;
+    blocking_send(sock_right, &all_ports[send_slot], sizeof(int));
+    blocking_recv(sock_left, &all_ports[recv_slot], sizeof(int));
+  }
+
+  // Restore non-blocking on parent ring sockets.
+  fcntl(sock_right, F_SETFL, flags_r);
+  fcntl(sock_left, F_SETFL, flags_l);
+
+  // 4c. Build sub-ring addresses.
+  // Each peer's IP comes from nodes_[global_rank][0]; port from all_ports.
+  std::vector<std::vector<detail::address_t>> sub_nodes(new_size);
+  for (int i = 0; i < new_size; i++) {
+    int g = peers[i].global_rank;
+    // Get IP from the first address for this global rank.
+    std::string ip = ip_from_address(nodes_[g][0]);
+    int port = all_ports[g];
+    std::string addr_str = ip + ":" + std::to_string(port);
+    sub_nodes[i].push_back(detail::parse_address(addr_str));
+    log_info(verbose_, "Rank", rank_, "sub-ring peer", i, "=", addr_str);
+  }
+
+  // 4d. Create the new RingGroup for the sub-ring.
+  auto sub_group = std::make_shared<RingGroup>(new_rank, sub_nodes, verbose_);
+
+  // Clean up the listener — RingGroup already accepted/connected.
+  ::close(listen_fd);
+
+  log_info(verbose_, "Rank", rank_, "sub-ring created successfully");
+  return sub_group;
 }
 
 } // namespace mlx::core::distributed::ring
