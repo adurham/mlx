@@ -1,9 +1,9 @@
 // Copyright © 2024 Apple Inc.
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -356,24 +356,23 @@ std::vector<int> make_connections(
   int success;
 
   for (auto& address : addresses) {
-    sockets.push_back(
-        detail::TCPSocket::connect(
-            RING_TAG,
-            address,
-            CONN_ATTEMPTS,
-            CONN_WAIT,
-            [verbose](int attempt, int wait) {
-              log_info(
-                  verbose,
-                  "Attempt",
-                  attempt,
-                  "waiting",
-                  wait,
-                  "ms (error:",
-                  errno,
-                  ")");
-            })
-            .detach());
+    sockets.push_back(detail::TCPSocket::connect(
+                          RING_TAG,
+                          address,
+                          CONN_ATTEMPTS,
+                          CONN_WAIT,
+                          [verbose](int attempt, int wait) {
+                            log_info(
+                                verbose,
+                                "Attempt",
+                                attempt,
+                                "waiting",
+                                wait,
+                                "ms (error:",
+                                errno,
+                                ")");
+                          })
+                          .detach());
   }
 
   return sockets;
@@ -512,18 +511,17 @@ class RingGroup : public GroupImpl {
       std::vector<std::future<void>> all_gathers;
       for (int i = 0; i < n_gathers; i++) {
         auto offset = i * bytes_per_gather;
-        all_gathers.emplace_back(pool_.enqueue(
-            std::bind(
-                &RingGroup::all_gather_impl,
-                this,
-                input_ptr + offset,
-                output_ptr + offset,
-                nbytes,
-                offset + bytes_per_gather > nbytes ? nbytes - offset
-                                                   : bytes_per_gather,
-                sockets_right_[i / 2],
-                sockets_left_[i / 2],
-                (i % 2) ? -1 : 1)));
+        all_gathers.emplace_back(pool_.enqueue(std::bind(
+            &RingGroup::all_gather_impl,
+            this,
+            input_ptr + offset,
+            output_ptr + offset,
+            nbytes,
+            offset + bytes_per_gather > nbytes ? nbytes - offset
+                                               : bytes_per_gather,
+            sockets_right_[i / 2],
+            sockets_left_[i / 2],
+            (i % 2) ? -1 : 1)));
       }
       for (auto& f : all_gathers) {
         f.wait();
@@ -637,18 +635,17 @@ class RingGroup : public GroupImpl {
       std::vector<std::future<void>> all_sums;
 
       for (int i = 0; i < n_reduces; i++) {
-        all_sums.emplace_back(pool_.enqueue(
-            std::bind(
-                &RingGroup::all_reduce_impl<T, ReduceOp>,
-                this,
-                reinterpret_cast<T*>(
-                    buffers_.data() + i * ALL_SUM_SIZE * ALL_SUM_BUFFERS),
-                reinterpret_cast<T*>(out_ptr) + i * step,
-                std::min(size, (i + 1) * step) - i * step,
-                sockets_right_[i / 2],
-                sockets_left_[i / 2],
-                (i % 2) ? -1 : 1,
-                reduce_op)));
+        all_sums.emplace_back(pool_.enqueue(std::bind(
+            &RingGroup::all_reduce_impl<T, ReduceOp>,
+            this,
+            reinterpret_cast<T*>(
+                buffers_.data() + i * ALL_SUM_SIZE * ALL_SUM_BUFFERS),
+            reinterpret_cast<T*>(out_ptr) + i * step,
+            std::min(size, (i + 1) * step) - i * step,
+            sockets_right_[i / 2],
+            sockets_left_[i / 2],
+            (i % 2) ? -1 : 1,
+            reduce_op)));
       }
       for (auto& f : all_sums) {
         f.wait();
@@ -883,8 +880,12 @@ class SingletonGroupImpl : public GroupImpl {
   Stream communication_stream(StreamOrDevice s) override {
     return to_stream(s, Device::cpu);
   }
-  int rank() override { return 0; }
-  int size() override { return 1; }
+  int rank() override {
+    return 0;
+  }
+  int size() override {
+    return 1;
+  }
   std::shared_ptr<GroupImpl> split(int, int) override {
     return std::make_shared<SingletonGroupImpl>();
   }
@@ -913,7 +914,8 @@ void blocking_send(int fd, const void* data, size_t len) {
   while (len > 0) {
     ssize_t n = ::send(fd, p, len, 0);
     if (n < 0) {
-      if (errno == EINTR || errno == EAGAIN) continue;
+      if (errno == EINTR || errno == EAGAIN)
+        continue;
       throw std::runtime_error("[ring-split] blocking_send failed");
     }
     p += n;
@@ -927,7 +929,8 @@ void blocking_recv(int fd, void* data, size_t len) {
   while (len > 0) {
     ssize_t n = ::recv(fd, p, len, 0);
     if (n < 0) {
-      if (errno == EINTR || errno == EAGAIN) continue;
+      if (errno == EINTR || errno == EAGAIN)
+        continue;
       throw std::runtime_error("[ring-split] blocking_recv failed");
     }
     if (n == 0) {
@@ -954,7 +957,8 @@ std::string ip_from_address(const detail::address_t& addr) {
 } // namespace
 
 std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
-  if (key < 0) key = rank_;
+  if (key < 0)
+    key = rank_;
 
   log_info(verbose_, "Rank", rank_, "split color=", color, "key=", key);
 
@@ -964,7 +968,10 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   // the sockets back to blocking for this coordination phase.
   //
   // Data layout: int[2] per rank -> {color, key}
-  struct SplitInfo { int color; int key; };
+  struct SplitInfo {
+    int color;
+    int key;
+  };
   std::vector<SplitInfo> all_info(size_);
   all_info[rank_] = {color, key};
 
@@ -993,7 +1000,9 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   struct PeerEntry {
     int key;
     int global_rank;
-    bool operator<(const PeerEntry& o) const { return key < o.key; }
+    bool operator<(const PeerEntry& o) const {
+      return key < o.key;
+    }
   };
   std::vector<PeerEntry> peers;
   for (int i = 0; i < size_; i++) {
@@ -1013,11 +1022,18 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   }
 
   if (new_rank < 0) {
-    throw std::runtime_error("[ring-split] current rank not found in sub-group");
+    throw std::runtime_error(
+        "[ring-split] current rank not found in sub-group");
   }
 
-  log_info(verbose_, "Rank", rank_, "sub-group: new_rank=", new_rank,
-           "new_size=", new_size);
+  log_info(
+      verbose_,
+      "Rank",
+      rank_,
+      "sub-group: new_rank=",
+      new_rank,
+      "new_size=",
+      new_size);
 
   // ---- Step 3: Singleton -> no-op group. ----
   if (new_size <= 1) {
@@ -1089,11 +1105,11 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
     log_info(verbose_, "Rank", rank_, "sub-ring peer", i, "=", addr_str);
   }
 
-  // 4d. Create the new RingGroup for the sub-ring.
-  auto sub_group = std::make_shared<RingGroup>(new_rank, sub_nodes, verbose_);
-
-  // Clean up the listener — RingGroup already accepted/connected.
+  // 4d. Close the listener BEFORE creating the sub-ring RingGroup.
+  // The RingGroup constructor will bind the same port for accept_connections().
   ::close(listen_fd);
+
+  auto sub_group = std::make_shared<RingGroup>(new_rank, sub_nodes, verbose_);
 
   log_info(verbose_, "Rank", rank_, "sub-ring created successfully");
   return sub_group;
