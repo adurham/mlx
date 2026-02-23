@@ -1035,24 +1035,15 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
       "new_size=",
       new_size);
 
-  // ---- Step 3: Singleton -> no-op group. ----
-  if (new_size <= 1) {
-    // Restore non-blocking.
-    fcntl(sock_right, F_SETFL, flags_r);
-    fcntl(sock_left, F_SETFL, flags_l);
-    log_info(verbose_, "Rank", rank_, "returning singleton sub-group");
-    return std::make_shared<SingletonGroupImpl>();
-  }
-
-  // ---- Step 4: Create sub-ring with new TCP connections. ----
+  // ---- Step 3: For non-singleton groups, create sub-ring TCP connections.
+  // ----
   //
-  // Each node in the sub-group opens a listener on an ephemeral port.
-  // We all-gather the ports across the FULL ring (including nodes not
-  // in our sub-group — they just ignore our port).
-  // Then sub-group members extract their peers' IPs from the stored
-  // nodes_ and connect using the ephemeral ports.
+  // NOTE: We CANNOT return early for singleton groups before the port
+  // all-gather, because the all-gather uses a ring pattern across ALL nodes
+  // in the parent ring. If a singleton node returns early, the remaining
+  // nodes deadlock waiting for data to relay through the ring.
 
-  // 4a. Bind an ephemeral listener.
+  // 4a. Bind an ephemeral listener (all nodes, including singletons).
   int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd < 0) {
     throw std::runtime_error("[ring-split] socket() failed");
@@ -1067,7 +1058,7 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
     ::close(listen_fd);
     throw std::runtime_error("[ring-split] bind() failed");
   }
-  if (::listen(listen_fd, new_size) < 0) {
+  if (::listen(listen_fd, std::max(new_size, 1)) < 0) {
     ::close(listen_fd);
     throw std::runtime_error("[ring-split] listen() failed");
   }
@@ -1079,6 +1070,7 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   log_info(verbose_, "Rank", rank_, "listening on ephemeral port", my_port);
 
   // 4b. All-gather ephemeral ports across the full ring.
+  // ALL nodes must participate, including singletons, to avoid deadlock.
   std::vector<int> all_ports(size_, 0);
   all_ports[rank_] = my_port;
   for (int step = 0; step < size_ - 1; step++) {
@@ -1091,6 +1083,13 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
   // Restore non-blocking on parent ring sockets.
   fcntl(sock_right, F_SETFL, flags_r);
   fcntl(sock_left, F_SETFL, flags_l);
+
+  // Now it's safe to return for singleton groups.
+  if (new_size <= 1) {
+    ::close(listen_fd);
+    log_info(verbose_, "Rank", rank_, "returning singleton sub-group");
+    return std::make_shared<SingletonGroupImpl>();
+  }
 
   // 4c. Build sub-ring addresses.
   // Each peer's IP comes from nodes_[global_rank][0]; port from all_ports.
