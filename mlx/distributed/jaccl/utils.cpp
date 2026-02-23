@@ -267,6 +267,7 @@ std::vector<Connection> create_connections(
     }
 
     // Search for the name and try to open the device
+    bool found = false;
     for (int i = 0; i < num_devices; i++) {
       if (name == ibv().get_device_name(devices[i])) {
         auto ctx = ibv().open_device(devices[i]);
@@ -276,8 +277,18 @@ std::vector<Connection> create_connections(
           throw std::runtime_error(msg.str());
         }
         connections.emplace_back(ctx);
+        found = true;
         break;
       }
+    }
+    if (!found) {
+      std::ostringstream msg;
+      msg << "[jaccl] Device '" << name << "' not found. Available devices:";
+      for (int i = 0; i < num_devices; i++) {
+        msg << " " << ibv().get_device_name(devices[i]);
+      }
+      ibv().free_device_list(devices);
+      throw std::runtime_error(msg.str());
     }
   }
   ibv().free_device_list(devices);
