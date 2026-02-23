@@ -536,12 +536,12 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
 
   // Step 4: Negotiate a new coordinator address for the sub-group.
   // The lowest-ranked process in each sub-group (new_rank == 0) will
-  // start a new coordinator. We use the original coordinator address
-  // with a modified port.
+  // start a new coordinator.
   //
-  // Strategy: the global rank 0 process in each sub-group picks a port
-  // by incrementing the original coordinator port by (color + 1) * 100.
-  // All processes learn this via all_gather on the original side channel.
+  // Strategy: offset the coordinator port by (color + 1) * 100 to avoid
+  // collisions between sub-groups. Each node broadcasts a "connect"
+  // address (its reachable IP + new port). Non-leaders use the leader's
+  // address to connect. The leader itself always binds to 0.0.0.0.
   std::string coordinator_addr = coordinator_addr_;
 
   // Parse the original coordinator address to extract host and port
@@ -549,16 +549,41 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   if (colon_pos != std::string::npos) {
     std::string host = coordinator_addr_.substr(0, colon_pos);
     int base_port = std::atoi(coordinator_addr_.substr(colon_pos + 1).c_str());
-    // Offset port by color to avoid collisions between sub-groups
     int new_port = base_port + (color + 1) * 100;
     coordinator_addr = host + ":" + std::to_string(new_port);
   }
 
-  // Broadcast the coordinator address so all sub-group members agree.
-  // Use original side channel for this last coordination step.
+  // Broadcast each node's proposed coordinator address via all_gather.
   auto all_coords = side_channel_.all_gather(coordinator_addr);
-  // Use the coordinator from the first member of our sub-group
-  coordinator_addr = all_coords[global_ranks[0]];
+
+  // Non-leaders use the leader's address (which has the leader's
+  // reachable IP). The leader overrides to 0.0.0.0 for binding.
+  int leader_global_rank = global_ranks[0];
+  if (new_rank == 0) {
+    // Leader: extract the port from our address and bind to 0.0.0.0
+    auto leader_colon = coordinator_addr.rfind(':');
+    if (leader_colon != std::string::npos) {
+      coordinator_addr = "0.0.0.0" + coordinator_addr.substr(leader_colon);
+    }
+  } else {
+    // Non-leader: use the leader's address to connect
+    coordinator_addr = all_coords[leader_global_rank];
+    // If the leader's address is 0.0.0.0, we need a reachable IP.
+    // Use our original coordinator host as the leader IS the original
+    // coordinator in the typical case.
+    if (coordinator_addr.find("0.0.0.0") == 0) {
+      auto leader_colon = coordinator_addr.rfind(':');
+      auto our_colon = coordinator_addr_.rfind(':');
+      if (leader_colon != std::string::npos && our_colon != std::string::npos) {
+        std::string our_host = coordinator_addr_.substr(0, our_colon);
+        coordinator_addr = our_host + coordinator_addr.substr(leader_colon);
+      }
+    }
+  }
+
+  std::cerr << "[jaccl] split: rank=" << rank_ << " new_rank=" << new_rank
+            << " color=" << color << " coordinator=" << coordinator_addr
+            << std::endl;
 
   // Step 5: Construct the sub-group MeshGroup.
   return std::make_shared<MeshGroup>(
