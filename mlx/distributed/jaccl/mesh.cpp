@@ -5,6 +5,8 @@
 #include "mlx/distributed/reduction_ops.h"
 #include "mlx/dtype_utils.h"
 
+#include <iostream>
+
 constexpr int MAX_PEERS = 8;
 
 namespace mlx::core::distributed::jaccl {
@@ -35,10 +37,15 @@ MeshGroup::MeshGroup(
 
 void MeshGroup::initialize() {
   // Create the queue pairs
-  for (auto& conn : connections_) {
+  for (int i = 0; i < connections_.size(); i++) {
+    auto& conn = connections_[i];
     if (conn.ctx == nullptr) {
+      std::cerr << "[jaccl] Rank " << rank_ << " skipping peer " << i
+                << " (self)" << std::endl;
       continue;
     }
+    std::cerr << "[jaccl] Rank " << rank_ << " initializing peer " << i
+              << " device=" << device_names_[i] << std::endl;
     conn.allocate_protection_domain();
     conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
     conn.create_queue_pair();

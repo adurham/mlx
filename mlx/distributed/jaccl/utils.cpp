@@ -141,7 +141,10 @@ Connection::~Connection() {
 void Connection::allocate_protection_domain() {
   protection_domain = ibv().alloc_pd(ctx);
   if (protection_domain == nullptr) {
-    throw std::runtime_error("[jaccl] Couldn't allocate protection domain");
+    std::ostringstream msg;
+    msg << "[jaccl] Couldn't allocate protection domain (errno=" << errno
+        << ")";
+    throw std::runtime_error(msg.str());
   }
 }
 
