@@ -453,6 +453,46 @@ class RingGroup : public GroupImpl {
         ALL_SUM_SIZE);
   }
 
+  // Constructor with pre-connected sockets (used by split() to avoid port
+  // rebind).
+  RingGroup(
+      int rank,
+      std::vector<std::vector<detail::address_t>> nodes,
+      bool verbose,
+      std::vector<int> left_sockets,
+      std::vector<int> right_sockets)
+      : rank_(rank),
+        verbose_(verbose),
+        pool_(0),
+        nodes_(std::move(nodes)),
+        sockets_left_(std::move(left_sockets)),
+        sockets_right_(std::move(right_sockets)) {
+    size_ = nodes_.size();
+
+    if (sockets_right_.empty() || sockets_left_.empty()) {
+      throw std::invalid_argument(
+          "[ring] Pre-connected sockets must not be empty.");
+    }
+    if (sockets_right_.size() != sockets_left_.size()) {
+      throw std::invalid_argument(
+          "[ring] Left and right socket counts must match.");
+    }
+
+    // Configure all sockets to use TCP no delay.
+    int one = 1;
+    for (size_t i = 0; i < sockets_right_.size(); i++) {
+      setsockopt(sockets_right_[i], SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+      setsockopt(sockets_left_[i], SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+
+    pool_.resize(sockets_right_.size() + sockets_left_.size());
+    comm_.add(sockets_right_);
+    comm_.add(sockets_left_);
+    buffers_.resize(
+        (sockets_right_.size() + sockets_left_.size()) * ALL_SUM_BUFFERS *
+        ALL_SUM_SIZE);
+  }
+
   ~RingGroup() {
     for (auto s : sockets_right_) {
       shutdown(s, 2);
@@ -1091,24 +1131,107 @@ std::shared_ptr<GroupImpl> RingGroup::split(int color, int key) {
     return std::make_shared<SingletonGroupImpl>();
   }
 
-  // 4c. Build sub-ring addresses.
-  // Each peer's IP comes from nodes_[global_rank][0]; port from all_ports.
+  // 4c. Build sub-ring peer addresses (for connect targets, not for
+  // re-binding). Each peer's IP comes from nodes_[global_rank][0]; port from
+  // all_ports.
+  int connect_to = (new_rank + 1) % new_size;
+  int g_connect = peers[connect_to].global_rank;
+  std::string connect_ip = ip_from_address(nodes_[g_connect][0]);
+  int connect_port = all_ports[g_connect];
+  std::string connect_addr = connect_ip + ":" + std::to_string(connect_port);
+
+  for (int i = 0; i < new_size; i++) {
+    int g = peers[i].global_rank;
+    std::string ip = ip_from_address(nodes_[g][0]);
+    int port = all_ports[g];
+    std::string addr_str = ip + ":" + std::to_string(port);
+    log_info(verbose_, "Rank", rank_, "sub-ring peer", i, "=", addr_str);
+  }
+
+  // 4d. Do accept/connect directly using the ALREADY-OPEN listen_fd.
+  // We MUST NOT close listen_fd and rebind — SO_REUSEPORT causes the kernel
+  // to route connections to the old (closed) socket instead of the new one.
+  int sock_left_sub, sock_right_sub;
+  auto target = detail::parse_address(connect_addr);
+
+  if (new_rank < connect_to) {
+    // Accept first, then connect.
+    log_info(verbose_, "Rank", rank_, "sub-ring accepting");
+    sockaddr_in peer_addr{};
+    socklen_t peer_len = sizeof(peer_addr);
+    sock_left_sub = ::accept(listen_fd, (sockaddr*)&peer_addr, &peer_len);
+    if (sock_left_sub < 0) {
+      ::close(listen_fd);
+      throw std::runtime_error("[ring-split] accept() failed");
+    }
+    log_info(verbose_, "Rank", rank_, "sub-ring connecting to", connect_to);
+    sock_right_sub = detail::TCPSocket::connect(
+                         RING_TAG,
+                         target,
+                         CONN_ATTEMPTS,
+                         CONN_WAIT,
+                         [this](int attempt, int wait) {
+                           log_info(
+                               verbose_,
+                               "Attempt",
+                               attempt,
+                               "waiting",
+                               wait,
+                               "ms (error:",
+                               errno,
+                               ")");
+                         })
+                         .detach();
+  } else {
+    // Connect first, then accept.
+    log_info(verbose_, "Rank", rank_, "sub-ring connecting to", connect_to);
+    sock_right_sub = detail::TCPSocket::connect(
+                         RING_TAG,
+                         target,
+                         CONN_ATTEMPTS,
+                         CONN_WAIT,
+                         [this](int attempt, int wait) {
+                           log_info(
+                               verbose_,
+                               "Attempt",
+                               attempt,
+                               "waiting",
+                               wait,
+                               "ms (error:",
+                               errno,
+                               ")");
+                         })
+                         .detach();
+    log_info(verbose_, "Rank", rank_, "sub-ring accepting");
+    sockaddr_in peer_addr{};
+    socklen_t peer_len = sizeof(peer_addr);
+    sock_left_sub = ::accept(listen_fd, (sockaddr*)&peer_addr, &peer_len);
+    if (sock_left_sub < 0) {
+      ::close(listen_fd);
+      throw std::runtime_error("[ring-split] accept() failed");
+    }
+  }
+
+  // Done with the listener.
+  ::close(listen_fd);
+
+  // Build sub-ring nodes list (needed for RingGroup member).
   std::vector<std::vector<detail::address_t>> sub_nodes(new_size);
   for (int i = 0; i < new_size; i++) {
     int g = peers[i].global_rank;
-    // Get IP from the first address for this global rank.
     std::string ip = ip_from_address(nodes_[g][0]);
     int port = all_ports[g];
     std::string addr_str = ip + ":" + std::to_string(port);
     sub_nodes[i].push_back(detail::parse_address(addr_str));
-    log_info(verbose_, "Rank", rank_, "sub-ring peer", i, "=", addr_str);
   }
 
-  // 4d. Close the listener BEFORE creating the sub-ring RingGroup.
-  // The RingGroup constructor will bind the same port for accept_connections().
-  ::close(listen_fd);
-
-  auto sub_group = std::make_shared<RingGroup>(new_rank, sub_nodes, verbose_);
+  // Create sub-ring with pre-connected sockets (avoids port rebind).
+  auto sub_group = std::make_shared<RingGroup>(
+      new_rank,
+      sub_nodes,
+      verbose_,
+      std::vector<int>{sock_left_sub},
+      std::vector<int>{sock_right_sub});
 
   log_info(verbose_, "Rank", rank_, "sub-ring created successfully");
   return sub_group;
