@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <deque>
 #include <future>
 #include <numeric>
@@ -197,6 +199,20 @@ array eval_impl(std::vector<array> outputs, bool async) {
   }
 
   std::unordered_set<int> open_streams;
+
+  // EXO_EVAL_DEBUG: time each primitive in the eval tape
+  static bool eval_debug = std::getenv("EXO_EVAL_DEBUG") != nullptr;
+  double total_gpu_ms = 0, total_cpu_ms = 0, total_fence_wait_ms = 0,
+         total_fence_update_ms = 0, total_sched_wait_ms = 0;
+  int gpu_ops = 0, cpu_ops = 0, fence_waits = 0, sched_waits = 0;
+  auto now = []() { return std::chrono::high_resolution_clock::now(); };
+  auto ms_since = [](auto start) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::high_resolution_clock::now() - start)
+        .count();
+  };
+  auto eval_start = now();
+
   while (!tape.empty()) {
     auto arr = std::move(tape.back());
     tape.pop_back();
@@ -217,6 +233,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
       }
     }
 
+    auto t_fence_wait = now();
     for (auto& in : arr.inputs()) {
       if (auto it = needs_fence.find(in.id()); it != needs_fence.end()) {
         // Use fence to wait within a single eval
@@ -232,16 +249,35 @@ array eval_impl(std::vector<array> outputs, bool async) {
         }
       }
     }
+    if (eval_debug) {
+      auto fw_ms = ms_since(t_fence_wait);
+      if (fw_ms > 0.01) {
+        total_fence_wait_ms += fw_ms;
+        fence_waits++;
+      }
+    }
 
+    auto t_eval = now();
     if (arr.primitive().device() == Device::gpu) {
       gpu::eval(arr);
+      if (eval_debug) {
+        auto e_ms = ms_since(t_eval);
+        total_gpu_ms += e_ms;
+        gpu_ops++;
+      }
     } else {
       cpu::eval(arr);
+      if (eval_debug) {
+        auto e_ms = ms_since(t_eval);
+        total_cpu_ms += e_ms;
+        cpu_ops++;
+      }
     }
 
     if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
         (get_active_memory() > get_memory_limit() &&
          scheduler::n_active_tasks() > 0)) {
+      auto t_sched = now();
       // Commit any open streams
       for (auto i : open_streams) {
         auto s = get_stream(i);
@@ -254,8 +290,14 @@ array eval_impl(std::vector<array> outputs, bool async) {
              scheduler::n_active_tasks() > 0) {
         scheduler::wait_for_one();
       }
+      if (eval_debug) {
+        auto sw_ms = ms_since(t_sched);
+        total_sched_wait_ms += sw_ms;
+        sched_waits++;
+      }
     }
 
+    auto t_fence_upd = now();
     auto maybe_update_fence = [&fences, &needs_fence, stream](const array& a) {
       if (auto nf = needs_fence.find(a.id()); nf != needs_fence.end()) {
         auto it = fences.find(stream.index);
@@ -274,9 +316,34 @@ array eval_impl(std::vector<array> outputs, bool async) {
       sib.set_status(array::Status::evaluated);
       maybe_update_fence(sib);
     }
+    if (eval_debug) {
+      total_fence_update_ms += ms_since(t_fence_upd);
+    }
     if (!arr.is_tracer()) {
       arr.detach();
     }
+  }
+
+  if (eval_debug) {
+    auto total_ms = ms_since(eval_start);
+    fprintf(
+        stderr,
+        "[EVAL_DEBUG] total=%.1fms gpu_eval=%.1fms(%d ops) "
+        "cpu_eval=%.1fms(%d ops) fence_wait=%.1fms(%d) "
+        "fence_update=%.1fms sched_wait=%.1fms(%d) "
+        "tape_size=%zu needs_fence=%zu\n",
+        total_ms,
+        total_gpu_ms,
+        gpu_ops,
+        total_cpu_ms,
+        cpu_ops,
+        total_fence_wait_ms,
+        fence_waits,
+        total_fence_update_ms,
+        total_sched_wait_ms,
+        sched_waits,
+        open_streams.size(),
+        needs_fence.size());
   }
 
   // Signal the event in its stream
