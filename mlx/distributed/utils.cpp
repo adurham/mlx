@@ -137,7 +137,13 @@ TCPSocket TCPSocket::accept(const char* tag) {
 void TCPSocket::send(const char* tag, const void* data, size_t len) {
   while (len > 0) {
     auto n = ::send(sock_, data, len, 0);
-    if (n <= 0) {
+    if (n == 0) {
+      std::ostringstream msg;
+      msg << tag << " Connection closed by peer (send remaining=" << len
+          << " bytes)";
+      throw std::runtime_error(msg.str());
+    }
+    if (n < 0) {
       std::ostringstream msg;
       msg << tag << " Send failed with errno=" << errno;
       throw std::runtime_error(msg.str());
@@ -150,7 +156,13 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
 void TCPSocket::recv(const char* tag, void* data, size_t len) {
   while (len > 0) {
     auto n = ::recv(sock_, data, len, 0);
-    if (n <= 0) {
+    if (n == 0) {
+      std::ostringstream msg;
+      msg << tag << " Connection closed by peer (recv remaining=" << len
+          << " bytes)";
+      throw std::runtime_error(msg.str());
+    }
+    if (n < 0) {
       std::ostringstream msg;
       msg << tag << " Recv failed with errno=" << errno;
       throw std::runtime_error(msg.str());
