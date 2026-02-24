@@ -358,7 +358,7 @@ void MeshGroup::all_reduce(
     T* data = out_ptr;
     auto [sz, buffer_size] = buffer_size_from_message(size * sizeof(T));
     int64_t N = buffer_size / sizeof(T);
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = NUM_BUFFERS;
     constexpr int WC_NUM = PIPELINE * MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(size);
     int num_peers = size_ - 1;
