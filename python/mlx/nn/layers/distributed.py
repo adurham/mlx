@@ -330,13 +330,7 @@ class ShardedToAllLinear(Module):
     def __call__(self, x: mx.array) -> mx.array:
         x = x @ self["weight"].T
 
-        # all_gather + GPU reduce instead of CPU-side all_sum
-        N = self.group.size()
-        gathered = mx.distributed.all_gather(x, group=self.group)
-        # gathered shape: [B*N, L, D] -> reshape to [N, B, L, D] -> sum axis 0
-        orig_shape = x.shape  # [B, L, D]
-        gathered = gathered.reshape(N, *orig_shape)
-        x = gathered.sum(axis=0)
+        x = mx.distributed.all_sum(x, group=self.group)
 
         if "bias" in self:
             x = x + self["bias"]
@@ -588,15 +582,7 @@ class QuantizedShardedToAllLinear(Module):
             bits=self.bits,
             mode=self.mode,
         )
-
-        # all_gather + GPU reduce instead of CPU-side all_sum
-        N = self.group.size()
-        gathered = mx.distributed.all_gather(x, group=self.group)
-        # gathered shape: [B*N, L, D] -> reshape to [N, B, L, D] -> sum axis 0
-        orig_shape = x.shape  # [B, L, D]
-        gathered = gathered.reshape(N, *orig_shape)
-        x = gathered.sum(axis=0)
-
+        x = mx.distributed.all_sum(x, group=self.group)
         if "bias" in self:
             x = x + self["bias"]
         return x
