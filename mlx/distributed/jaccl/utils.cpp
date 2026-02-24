@@ -71,16 +71,32 @@ IBVWrapper& ibv() {
   return wrapper;
 }
 
-SharedBuffer::SharedBuffer(size_t num_bytes)
-    : data_(page_aligned_alloc(num_bytes)), num_bytes_(num_bytes) {}
+// === SharedBuffer implementation ===
 
-SharedBuffer::SharedBuffer(SharedBuffer&& b) : data_(nullptr), num_bytes_(0) {
+SharedBuffer::SharedBuffer(size_t num_bytes)
+    : data_(page_aligned_alloc(num_bytes)),
+      num_bytes_(num_bytes),
+      pool_(nullptr) {}
+
+SharedBuffer::SharedBuffer(
+    size_t num_bytes,
+    void* pool_data,
+    SharedBufferPool* pool)
+    : data_(pool_data), num_bytes_(num_bytes), pool_(pool) {}
+
+SharedBuffer::SharedBuffer(SharedBuffer&& b)
+    : data_(nullptr), num_bytes_(0), pool_(nullptr) {
   std::swap(data_, b.data_);
   std::swap(num_bytes_, b.num_bytes_);
+  std::swap(pool_, b.pool_);
   std::swap(memory_regions_, b.memory_regions_);
 }
 
 SharedBuffer::~SharedBuffer() {
+  // Pool-backed buffers do NOT own their memory or MR registrations
+  if (pool_ != nullptr) {
+    return;
+  }
   for (auto& [pd, mr] : memory_regions_) {
     ibv().dereg_mr(mr);
   }
@@ -89,7 +105,19 @@ SharedBuffer::~SharedBuffer() {
   }
 }
 
+uint32_t SharedBuffer::local_key(ibv_pd* protection_domain) const {
+  if (pool_ != nullptr) {
+    return pool_->local_key(protection_domain);
+  }
+  return memory_regions_.at(protection_domain)->lkey;
+}
+
 void SharedBuffer::register_to_protection_domain(ibv_pd* protection_domain) {
+  // Pool-backed buffers are already registered via the pool
+  if (pool_ != nullptr) {
+    return;
+  }
+
   auto [it, inserted] = memory_regions_.insert({protection_domain, nullptr});
   if (!inserted) {
     throw std::runtime_error(
@@ -105,6 +133,73 @@ void SharedBuffer::register_to_protection_domain(ibv_pd* protection_domain) {
   if (!it->second) {
     throw std::runtime_error("[jaccl] Register memory region failed");
   }
+}
+
+// === SharedBufferPool implementation ===
+
+SharedBufferPool::SharedBufferPool(size_t total_bytes)
+    : data_(page_aligned_alloc(total_bytes)),
+      total_bytes_(total_bytes),
+      offset_(0) {
+  if (data_ == nullptr) {
+    std::ostringstream msg;
+    msg << "[jaccl] Failed to allocate " << total_bytes / (1024 * 1024)
+        << " MB memory pool";
+    throw std::runtime_error(msg.str());
+  }
+}
+
+SharedBufferPool::SharedBufferPool(SharedBufferPool&& b)
+    : data_(nullptr), total_bytes_(0), offset_(0) {
+  std::swap(data_, b.data_);
+  std::swap(total_bytes_, b.total_bytes_);
+  std::swap(offset_, b.offset_);
+  std::swap(memory_regions_, b.memory_regions_);
+}
+
+SharedBufferPool::~SharedBufferPool() {
+  for (auto& [pd, mr] : memory_regions_) {
+    ibv().dereg_mr(mr);
+  }
+  if (data_ != nullptr) {
+    std::free(data_);
+  }
+}
+
+void SharedBufferPool::register_to_protection_domain(
+    ibv_pd* protection_domain) {
+  auto [it, inserted] = memory_regions_.insert({protection_domain, nullptr});
+  if (!inserted) {
+    // Already registered — this is fine, pools can be shared across buffers
+    return;
+  }
+
+  it->second = ibv().reg_mr(
+      protection_domain,
+      data_,
+      total_bytes_,
+      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+          IBV_ACCESS_REMOTE_WRITE);
+  if (!it->second) {
+    std::ostringstream msg;
+    msg << "[jaccl] Failed to register " << total_bytes_ / (1024 * 1024)
+        << " MB memory pool MR";
+    throw std::runtime_error(msg.str());
+  }
+}
+
+SharedBuffer SharedBufferPool::allocate(size_t num_bytes) {
+  if (offset_ + num_bytes > total_bytes_) {
+    std::ostringstream msg;
+    msg << "[jaccl] Pool exhausted: requested " << num_bytes
+        << " bytes but only " << (total_bytes_ - offset_) << " remaining";
+    throw std::runtime_error(msg.str());
+  }
+
+  void* ptr = static_cast<char*>(data_) + offset_;
+  offset_ += num_bytes;
+
+  return SharedBuffer(num_bytes, ptr, this);
 }
 
 Connection::Connection(ibv_context* ctx_)

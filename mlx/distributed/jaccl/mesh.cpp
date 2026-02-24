@@ -11,6 +11,21 @@ constexpr int MAX_PEERS = 8;
 
 namespace mlx::core::distributed::jaccl {
 
+namespace {
+
+// Calculate total bytes needed for all JACCL buffers.
+// Sum over k=0..BUFFER_SIZES-1: FRAME_SIZE * (1 << k) * NUM_BUFFERS * num_peers
+size_t calculate_pool_size(int num_peers) {
+  size_t total = 0;
+  for (int k = 0; k < BUFFER_SIZES; k++) {
+    total +=
+        static_cast<size_t>(FRAME_SIZE) * (1 << k) * NUM_BUFFERS * num_peers;
+  }
+  return total;
+}
+
+} // namespace
+
 MeshGroup::MeshGroup(
     int rank,
     const std::vector<std::string>& device_names,
@@ -20,7 +35,8 @@ MeshGroup::MeshGroup(
       coordinator_addr_(coordinator_addr),
       device_names_(device_names),
       side_channel_(rank_, size_, coordinator_addr),
-      connections_(create_connections(device_names)) {
+      connections_(create_connections(device_names)),
+      pool_(calculate_pool_size(device_names.size())) {
   if (size_ > MAX_PEERS) {
     std::ostringstream msg;
     msg << "[jaccl] The JACCL mesh supports up to " << MAX_PEERS
@@ -85,38 +101,25 @@ void MeshGroup::allocate_buffers() {
   // Deregister any buffers and free the memory
   buffers_.clear();
 
-  // Allocate the memory
+  // Register the pool with all active protection domains
+  for (auto& conn : connections_) {
+    if (conn.ctx != nullptr) {
+      pool_.register_to_protection_domain(conn.protection_domain);
+    }
+  }
+
+  // Allocate buffers from the pool (single MR, pointer arithmetic)
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
       for (int j = 0; j < size_; j++) {
-        buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        buffers_.push_back(pool_.allocate(FRAME_SIZE * (1 << k)));
       }
     }
   }
 
-  for (int k = 0; k < BUFFER_SIZES; k++) {
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-      for (int j = 0; j < size_; j++) {
-        // This is our send buffer so register it with all pds so we can send
-        // it to all connected devices.
-        if (j == rank_) {
-          for (auto& conn : connections_) {
-            if (conn.ctx != nullptr) {
-              buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
-                  .register_to_protection_domain(conn.protection_domain);
-            }
-          }
-        }
-
-        // This is the recv buffer from rank j so register it to rank j's
-        // protection domain.
-        else {
-          buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
-              .register_to_protection_domain(connections_[j].protection_domain);
-        }
-      }
-    }
-  }
+  // Pool-backed buffers don't need individual registration —
+  // the pool's MR covers all of them. register_to_protection_domain()
+  // on a pool-backed SharedBuffer is a no-op.
 }
 
 void MeshGroup::all_sum(const array& input, array& output, Stream stream) {

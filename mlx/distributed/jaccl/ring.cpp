@@ -8,6 +8,22 @@
 
 namespace mlx::core::distributed::jaccl {
 
+namespace {
+
+// Calculate total bytes needed for ring send or recv buffers.
+// Sum over k=0..BUFFER_SIZES-1: FRAME_SIZE * (1 << k) * NUM_BUFFERS * MAX_CONNS
+// * 2
+size_t calculate_ring_pool_size() {
+  size_t total = 0;
+  for (int k = 0; k < BUFFER_SIZES; k++) {
+    total += static_cast<size_t>(FRAME_SIZE) * (1 << k) * NUM_BUFFERS *
+        MAX_CONNS * 2;
+  }
+  return total;
+}
+
+} // namespace
+
 RingGroup::RingGroup(
     int rank,
     int size,
@@ -22,7 +38,9 @@ RingGroup::RingGroup(
                                : left_devices[0]),
       side_channel_(rank_, size_, coordinator_addr),
       left_(create_connections(left_devices)),
-      right_(create_connections(right_devices)) {
+      right_(create_connections(right_devices)),
+      send_pool_(calculate_ring_pool_size()),
+      recv_pool_(calculate_ring_pool_size()) {
   if (left_.size() > MAX_CONNS || right_.size() > MAX_CONNS) {
     std::ostringstream msg;
     msg << "[jaccl] Up to " << MAX_CONNS << " per direction supported but "
@@ -95,39 +113,27 @@ void RingGroup::allocate_buffers() {
   send_buffers_.clear();
   recv_buffers_.clear();
 
-  // Allocate the memory
+  // Register send pool with right PDs (we send to right neighbors)
+  // and left PDs (we send to left neighbors)
+  for (size_t w = 0; w < left_.size(); w++) {
+    send_pool_.register_to_protection_domain(left_[w].protection_domain);
+    send_pool_.register_to_protection_domain(right_[w].protection_domain);
+    recv_pool_.register_to_protection_domain(left_[w].protection_domain);
+    recv_pool_.register_to_protection_domain(right_[w].protection_domain);
+  }
+
+  // Allocate buffers from the pools (single MR each, pointer arithmetic)
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
       for (int j = 0; j < MAX_CONNS * 2; j++) {
-        send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-        recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        send_buffers_.push_back(send_pool_.allocate(FRAME_SIZE * (1 << k)));
+        recv_buffers_.push_back(recv_pool_.allocate(FRAME_SIZE * (1 << k)));
       }
     }
   }
 
-  // Register the buffers with the corresponding connections
-  for (int k = 0; k < BUFFER_SIZES; k++) {
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-      for (int j = 0; j < MAX_CONNS * 2; j++) {
-        int wire = j % MAX_CONNS;
-        int lr = j / MAX_CONNS;
-        if (wire >= left_.size()) {
-          continue;
-        }
-        if (lr) {
-          send_buffers_[k * NUM_BUFFERS * MAX_CONNS * 2 + i * MAX_CONNS * 2 + j]
-              .register_to_protection_domain(left_[wire].protection_domain);
-          recv_buffers_[k * NUM_BUFFERS * MAX_CONNS * 2 + i * MAX_CONNS * 2 + j]
-              .register_to_protection_domain(right_[wire].protection_domain);
-        } else {
-          send_buffers_[k * NUM_BUFFERS * MAX_CONNS * 2 + i * MAX_CONNS * 2 + j]
-              .register_to_protection_domain(right_[wire].protection_domain);
-          recv_buffers_[k * NUM_BUFFERS * MAX_CONNS * 2 + i * MAX_CONNS * 2 + j]
-              .register_to_protection_domain(left_[wire].protection_domain);
-        }
-      }
-    }
-  }
+  // Pool-backed buffers don't need individual registration —
+  // the pool's MR covers all of them.
 }
 
 void RingGroup::all_sum(const array& input, array& output, Stream stream) {

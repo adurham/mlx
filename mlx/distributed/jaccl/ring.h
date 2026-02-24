@@ -172,6 +172,8 @@ class RingGroup : public GroupImpl {
   SideChannel side_channel_;
   std::vector<Connection> left_;
   std::vector<Connection> right_;
+  SharedBufferPool send_pool_;
+  SharedBufferPool recv_pool_;
   std::vector<SharedBuffer> send_buffers_;
   std::vector<SharedBuffer> recv_buffers_;
 };

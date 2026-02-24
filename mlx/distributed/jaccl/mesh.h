@@ -116,6 +116,7 @@ class MeshGroup : public GroupImpl {
   std::vector<std::string> device_names_;
   SideChannel side_channel_;
   std::vector<Connection> connections_;
+  SharedBufferPool pool_;
   std::vector<SharedBuffer> buffers_;
 };
 
