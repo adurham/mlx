@@ -14,7 +14,7 @@ constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
-constexpr int BUFFER_SIZES = 12;
+constexpr int BUFFER_SIZES = 14;
 constexpr int NUM_BUFFERS = 2;
 constexpr int FRAME_SIZE = 4096;
 
