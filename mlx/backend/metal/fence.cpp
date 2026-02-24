@@ -112,6 +112,12 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
       }
 
       f.cpu_value()[0] = count;
+      // DSB SY: Full-system data synchronization barrier.
+      // Ensures the fence counter write is visible to all observers
+      // including the GPU and DMA engines, not just CPU cores.
+      // Without this, ARM64 seq_cst compiles to DMB ISH (inner-shareable
+      // only), and the GPU may spin forever on a stale cache line.
+      __builtin_arm_dsb(0xF);
     });
     return;
   }
