@@ -281,12 +281,30 @@ array eval_impl(std::vector<array> outputs, bool async) {
     bool throttle_by_tasks = scheduler::n_active_tasks() > MAX_ACTIVE_TASKS;
     bool throttle_by_memory = get_active_memory() > get_memory_limit() &&
         scheduler::n_active_tasks() > 0;
-    if (throttle_by_tasks || throttle_by_memory) {
+
+    // Task-count throttle: finalize GPU command buffers to keep them small
+    // (prevents GPU timeout) but DON'T block — let GPU fence-wait naturally
+    // on RDMA completions while we keep queuing ops.
+    if (throttle_by_tasks && !throttle_by_memory) {
       auto t_sched = now();
-      int pre_tasks = scheduler::n_active_tasks();
-      size_t pre_mem = get_active_memory();
-      size_t mem_limit = get_memory_limit();
-      // Commit any open streams
+      for (auto i : open_streams) {
+        auto s = get_stream(i);
+        if (s.device == Device::gpu) {
+          gpu::finalize(s);
+        }
+      }
+      if (eval_debug) {
+        auto sw_ms = ms_since(t_sched);
+        total_sched_wait_ms += sw_ms;
+        sched_waits++;
+        sched_waits_tasks++;
+      }
+    }
+
+    // Memory-pressure throttle: must actually wait for tasks to complete
+    // to free memory before allocating more.
+    if (throttle_by_memory) {
+      auto t_sched = now();
       for (auto i : open_streams) {
         auto s = get_stream(i);
         if (s.device == Device::gpu) {
@@ -302,10 +320,7 @@ array eval_impl(std::vector<array> outputs, bool async) {
         auto sw_ms = ms_since(t_sched);
         total_sched_wait_ms += sw_ms;
         sched_waits++;
-        if (throttle_by_tasks)
-          sched_waits_tasks++;
-        if (throttle_by_memory)
-          sched_waits_memory++;
+        sched_waits_memory++;
       }
     }
 
