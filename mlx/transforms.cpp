@@ -24,7 +24,10 @@
 
 namespace mlx::core {
 
-static constexpr int MAX_ACTIVE_TASKS = 10;
+static int MAX_ACTIVE_TASKS = []() {
+  const char* env = std::getenv("EXO_MAX_ACTIVE_TASKS");
+  return env ? std::atoi(env) : 10;
+}();
 
 /* This class is only meant to be used in eval
  * for synchronizing with the main thread. */
@@ -204,7 +207,8 @@ array eval_impl(std::vector<array> outputs, bool async) {
   static bool eval_debug = std::getenv("EXO_EVAL_DEBUG") != nullptr;
   double total_gpu_ms = 0, total_cpu_ms = 0, total_fence_wait_ms = 0,
          total_fence_update_ms = 0, total_sched_wait_ms = 0;
-  int gpu_ops = 0, cpu_ops = 0, fence_waits = 0, sched_waits = 0;
+  int gpu_ops = 0, cpu_ops = 0, fence_waits = 0, sched_waits = 0,
+      sched_waits_tasks = 0, sched_waits_memory = 0;
   auto now = []() { return std::chrono::high_resolution_clock::now(); };
   auto ms_since = [](auto start) {
     return std::chrono::duration<double, std::milli>(
@@ -274,10 +278,14 @@ array eval_impl(std::vector<array> outputs, bool async) {
       }
     }
 
-    if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
-        (get_active_memory() > get_memory_limit() &&
-         scheduler::n_active_tasks() > 0)) {
+    bool throttle_by_tasks = scheduler::n_active_tasks() > MAX_ACTIVE_TASKS;
+    bool throttle_by_memory = get_active_memory() > get_memory_limit() &&
+        scheduler::n_active_tasks() > 0;
+    if (throttle_by_tasks || throttle_by_memory) {
       auto t_sched = now();
+      int pre_tasks = scheduler::n_active_tasks();
+      size_t pre_mem = get_active_memory();
+      size_t mem_limit = get_memory_limit();
       // Commit any open streams
       for (auto i : open_streams) {
         auto s = get_stream(i);
@@ -294,6 +302,10 @@ array eval_impl(std::vector<array> outputs, bool async) {
         auto sw_ms = ms_since(t_sched);
         total_sched_wait_ms += sw_ms;
         sched_waits++;
+        if (throttle_by_tasks)
+          sched_waits_tasks++;
+        if (throttle_by_memory)
+          sched_waits_memory++;
       }
     }
 
@@ -330,8 +342,8 @@ array eval_impl(std::vector<array> outputs, bool async) {
         stderr,
         "[EVAL_DEBUG] total=%.1fms gpu_eval=%.1fms(%d ops) "
         "cpu_eval=%.1fms(%d ops) fence_wait=%.1fms(%d) "
-        "fence_update=%.1fms sched_wait=%.1fms(%d) "
-        "tape_size=%zu needs_fence=%zu\n",
+        "fence_update=%.1fms sched_wait=%.1fms(%d: %d task/%d mem) "
+        "tape_size=%zu needs_fence=%zu max_active=%d\n",
         total_ms,
         total_gpu_ms,
         gpu_ops,
@@ -342,8 +354,11 @@ array eval_impl(std::vector<array> outputs, bool async) {
         total_fence_update_ms,
         total_sched_wait_ms,
         sched_waits,
+        sched_waits_tasks,
+        sched_waits_memory,
         open_streams.size(),
-        needs_fence.size());
+        needs_fence.size(),
+        MAX_ACTIVE_TASKS);
   }
 
   // Signal the event in its stream
