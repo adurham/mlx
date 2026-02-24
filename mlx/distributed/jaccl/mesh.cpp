@@ -374,9 +374,23 @@ void MeshGroup::all_reduce(
     int completed_recv_end[MAX_PEERS] = {0};
 
     // Prefill the pipeline
+    //
+    // IMPORTANT: With UC (unreliable connection), we must post ALL recvs
+    // before ANY sends. If a send arrives before the matching recv is
+    // posted, the message is silently dropped, causing a deadlock.
     int buff = 0;
-    while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(sz, buff);
+    int prefill_count = 0;
+    int64_t prefill_offset = read_offset;
+
+    // Phase 1: Post all recvs
+    while (prefill_offset < total && prefill_count < PIPELINE) {
+      post_recv_all(sz, prefill_count);
+      prefill_count++;
+      prefill_offset += N;
+    }
+
+    // Phase 2: Copy data and post all sends
+    while (read_offset < total && buff < prefill_count) {
       std::copy(
           data + read_offset,
           data + std::min(read_offset + N, total),
