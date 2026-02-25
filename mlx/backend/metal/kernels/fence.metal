@@ -40,7 +40,7 @@ constexpr constant metal::thread_scope thread_scope_system =
 [[kernel]] void fence_wait(
     volatile coherent(system) device uint* timestamp [[buffer(0)]],
     constant uint& value [[buffer(1)]]) {
-  for (uint i = 0; i < 100; i++) {
+  for (uint i = 0; i < 30; i++) {
     // Fast path: volatile reads through GPU cache + system-scope fence
     for (uint i = 0; i < 1000000; i++) {
       metal::atomic_thread_fence(
