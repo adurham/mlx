@@ -1,5 +1,5 @@
 #include "mlx/backend/metal/device.h"
-#include "mlx/primitives.h"
+#include "mlx/distributed/primitives.h"
 #include "mlx/utils.h"
 
 namespace mlx::core::distributed {
@@ -7,7 +7,7 @@ namespace mlx::core::distributed {
 void AllReduce::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (metal_fast_synch()) {
+  if (env::metal_fast_synch()) {
     eval_cpu(inputs, outputs);
   } else {
     throw std::runtime_error("[AllReduce::eval_gpu] has no GPU implementation.");
@@ -17,7 +17,7 @@ void AllReduce::eval_gpu(
 void AllGather::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (metal_fast_synch()) {
+  if (env::metal_fast_synch()) {
     eval_cpu(inputs, outputs);
   } else {
     throw std::runtime_error("[AllGather::eval_gpu] has no GPU implementation.");
@@ -27,7 +27,7 @@ void AllGather::eval_gpu(
 void Send::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (metal_fast_synch()) {
+  if (env::metal_fast_synch()) {
     eval_cpu(inputs, outputs);
   } else {
     throw std::runtime_error("[Send::eval_gpu] has no GPU implementation.");
@@ -37,7 +37,7 @@ void Send::eval_gpu(
 void Recv::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (metal_fast_synch()) {
+  if (env::metal_fast_synch()) {
     eval_cpu(inputs, outputs);
   } else {
     throw std::runtime_error("[Recv::eval_gpu] has no GPU implementation.");
@@ -47,7 +47,7 @@ void Recv::eval_gpu(
 void ReduceScatter::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (metal_fast_synch()) {
+  if (env::metal_fast_synch()) {
     eval_cpu(inputs, outputs);
   } else {
     throw std::runtime_error("[ReduceScatter::eval_gpu] has no GPU implementation.");
