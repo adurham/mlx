@@ -4,6 +4,8 @@
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
+#include <arm_acle.h>
+
 namespace mlx::core {
 
 struct FenceImpl {
@@ -111,12 +113,10 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
         return;
       }
 
-      f.cpu_value()[0] = count;
-      // DSB SY: Full-system data synchronization barrier.
-      // Ensures the fence counter write is visible to all observers
-      // including the GPU and DMA engines, not just CPU cores.
-      // Without this, ARM64 seq_cst compiles to DMB ISH (inner-shareable
-      // only), and the GPU may spin forever on a stale cache line.
+      // seq_cst compiles to DMB ISH (inner-shareable) on ARM64,
+      // which is not visible to the GPU. Use DSB SY (full system)
+      // to force the store to the point of coherence.
+      f.cpu_value()->store(count, std::memory_order_seq_cst);
       __builtin_arm_dsb(0xF);
     });
     return;

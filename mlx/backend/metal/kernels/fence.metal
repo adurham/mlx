@@ -42,30 +42,24 @@ constexpr constant metal::thread_scope thread_scope_system =
 [[kernel]] void fence_wait(
     volatile coherent(system) device uint* timestamp [[buffer(0)]],
     constant uint& value [[buffer(1)]]) {
-  constexpr uint fast_path_limit = 1000000;
-  uint iters = 0;
-  while (1) {
-    metal::atomic_thread_fence(
-        metal::mem_flags::mem_device,
-        metal::memory_order_seq_cst,
-        metal::thread_scope_system);
-    if (timestamp[0] >= value) {
-      break;
-    }
-    iters++;
-    if (iters >= fast_path_limit) {
-      // Reinterpret the buffer as atomic and perform an atomic load.
-      // This forces the GPU to re-fetch from the coherence point rather
-      // than reading a potentially stale cached copy.
-      device metal::atomic_uint* atomic_ts =
-          (device metal::atomic_uint*)timestamp;
-      uint val = atomic_load_explicit(
-          atomic_ts, metal::memory_order_relaxed);
-      if (val >= value) {
-        break;
+  for (uint i = 0; i < 30; i++) {
+    // Fast path: volatile reads through GPU cache + system-scope fence
+    for (uint i = 0; i < 1000000; i++) {
+      metal::atomic_thread_fence(
+          metal::mem_flags::mem_device,
+          metal::memory_order_seq_cst,
+          metal::thread_scope_system);
+      if (timestamp[0] >= value) {
+        return;
       }
-      // Reset counter to avoid overflow and retry the fast path briefly
-      iters = 0;
+    }
+    // System-scope atomic load to force GPU cache refresh from SLC
+    uint cur = __metal_atomic_load_explicit(
+        timestamp,
+        int(metal::memory_order_relaxed),
+        __METAL_MEMORY_SCOPE_SYSTEM__);
+    if (cur >= value) {
+      return;
     }
   }
 }
