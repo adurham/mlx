@@ -29,11 +29,9 @@ static int MAX_ACTIVE_TASKS = []() {
   return env ? std::atoi(env) : 10;
 }();
 
-// Higher limit for decode (small evals) where memory pressure is low.
-// Falls back to MAX_ACTIVE_TASKS if not set.
-static int MAX_ACTIVE_TASKS_DECODE = []() {
-  const char* env = std::getenv("EXO_MAX_ACTIVE_TASKS_DECODE");
-  return env ? std::atoi(env) : 100;
+static bool ADAPTIVE_THROTTLE = []() {
+  const char* env = std::getenv("EXO_ADAPTIVE_THROTTLE");
+  return env ? (std::string(env) == "1" || std::string(env) == "true" || std::string(env) == "on") : false;
 }();
 
 /* This class is only meant to be used in eval
@@ -82,9 +80,10 @@ array eval_impl(std::vector<array> outputs, bool async) {
   for (const auto& o : outputs) {
     total_output_elements += o.size();
   }
-  int active_task_limit = (total_output_elements < 1000000)
-      ? MAX_ACTIVE_TASKS_DECODE
-      : MAX_ACTIVE_TASKS;
+  int active_task_limit = MAX_ACTIVE_TASKS;
+  if (ADAPTIVE_THROTTLE) {
+      active_task_limit = (total_output_elements < 1000000) ? 100 : 30;
+  }
 
   auto synchronizer = array(
       {}, bool_, std::make_shared<Synchronizer>(stream), std::move(outputs));
