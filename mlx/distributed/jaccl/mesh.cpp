@@ -172,7 +172,7 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
     char* data = out_ptr;
     char* our_data = out_ptr + rank_ * n_bytes;
     auto [sz, N] = buffer_size_from_message(n_bytes);
-    int pipeline = std::min(num_buffers_, 2);
+    int pipeline = num_buffers_;
     int wc_num = pipeline * MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(n_bytes);
     int num_peers = size_ - 1;
@@ -251,7 +251,7 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, dst, this]() {
-    int pipeline = std::min(num_buffers_, 2);
+    int pipeline = num_buffers_;
     int wc_num = pipeline;
     auto [sz, N] = buffer_size_from_message(n_bytes);
 
@@ -307,7 +307,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, src, this]() {
-    int pipeline = std::min(num_buffers_, 2);
+    int pipeline = num_buffers_;
     int wc_num = pipeline;
     auto [sz, N] = buffer_size_from_message(n_bytes);
 

@@ -16,7 +16,7 @@ constexpr int MAX_SEND_WR = 256;
 constexpr int MAX_RECV_WR = 256;
 constexpr int BUFFER_SIZES = 8;
 constexpr int DEFAULT_NUM_BUFFERS = 8;
-constexpr int FRAME_SIZE = 4096;
+constexpr int FRAME_SIZE = 65536;
 
 namespace detail = mlx::core::distributed::detail;
 

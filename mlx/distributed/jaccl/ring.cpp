@@ -182,7 +182,7 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
-    int pipeline = std::min(num_buffers_, 4);
+    int pipeline = num_buffers_;
     int wc_num = pipeline * MAX_CONNS * 2 * 2;
     int n_wires = left_.size();
     size_t n_bytes_per_wire = (n_bytes + (2 * n_wires) - 1) / (2 * n_wires);
@@ -305,7 +305,7 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
     auto& conns = (dst == left) ? left_ : right_;
     int dir = dst == left;
 
-    int pipeline = std::min(num_buffers_, 4);
+    int pipeline = num_buffers_;
     int wc_num = pipeline * MAX_CONNS;
 
     int n_wires = conns.size();
@@ -386,7 +386,7 @@ void RingGroup::recv(array& out, int src, Stream stream) {
     auto& conns = (src == right) ? right_ : left_;
     int dir = src == right;
 
-    int pipeline = std::min(num_buffers_, 4);
+    int pipeline = num_buffers_;
     int wc_num = pipeline * MAX_CONNS;
 
     int n_wires = conns.size();
