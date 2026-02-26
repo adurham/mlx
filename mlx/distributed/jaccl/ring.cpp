@@ -11,15 +11,26 @@ namespace mlx::core::distributed::jaccl {
 namespace {
 
 // Calculate total bytes needed for ring send or recv buffers.
-// Sum over k=0..BUFFER_SIZES-1: FRAME_SIZE * (1 << k) * NUM_BUFFERS * MAX_CONNS
+// Sum over k=0..BUFFER_SIZES-1: FRAME_SIZE * (1 << k) * num_buffers * MAX_CONNS
 // * 2
-size_t calculate_ring_pool_size() {
+size_t calculate_ring_pool_size(int num_buffers) {
   size_t total = 0;
   for (int k = 0; k < BUFFER_SIZES; k++) {
-    total += static_cast<size_t>(FRAME_SIZE) * (1 << k) * NUM_BUFFERS *
+    total += static_cast<size_t>(FRAME_SIZE) * (1 << k) * num_buffers *
         MAX_CONNS * 2;
   }
   return total;
+}
+
+int get_num_buffers() {
+  const char* val = std::getenv("MLX_JACCL_NUM_BUFFERS");
+  if (val) {
+    int n = std::atoi(val);
+    if (n > 0 && n <= 64) {
+      return n;
+    }
+  }
+  return DEFAULT_NUM_BUFFERS;
 }
 
 } // namespace
@@ -32,6 +43,7 @@ RingGroup::RingGroup(
     const char* coordinator_addr)
     : rank_(rank),
       size_(size),
+      num_buffers_(get_num_buffers()),
       coordinator_addr_(coordinator_addr),
       device_name_(
           left_devices.empty() ? (right_devices.empty() ? "" : right_devices[0])
@@ -39,14 +51,16 @@ RingGroup::RingGroup(
       side_channel_(rank_, size_, coordinator_addr),
       left_(create_connections(left_devices)),
       right_(create_connections(right_devices)),
-      send_pool_(calculate_ring_pool_size()),
-      recv_pool_(calculate_ring_pool_size()) {
+      send_pool_(calculate_ring_pool_size(num_buffers_)),
+      recv_pool_(calculate_ring_pool_size(num_buffers_)) {
   if (left_.size() > MAX_CONNS || right_.size() > MAX_CONNS) {
     std::ostringstream msg;
     msg << "[jaccl] Up to " << MAX_CONNS << " per direction supported but "
         << left_.size() << " were provided.";
     throw std::runtime_error(msg.str());
   }
+  
+  std::cerr << "[jaccl] RingGroup initialized with num_buffers=" << num_buffers_ << std::endl;
 
   // Initialize all the connections and allocate buffers
   initialize();
@@ -124,7 +138,7 @@ void RingGroup::allocate_buffers() {
 
   // Allocate buffers from the pools (single MR each, pointer arithmetic)
   for (int k = 0; k < BUFFER_SIZES; k++) {
-    for (int i = 0; i < NUM_BUFFERS; i++) {
+    for (int i = 0; i < num_buffers_; i++) {
       for (int j = 0; j < MAX_CONNS * 2; j++) {
         send_buffers_.push_back(send_pool_.allocate(FRAME_SIZE * (1 << k)));
         recv_buffers_.push_back(recv_pool_.allocate(FRAME_SIZE * (1 << k)));
@@ -168,8 +182,8 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
-    constexpr int PIPELINE = 4;
-    constexpr int WC_NUM = PIPELINE * MAX_CONNS * 2 * 2;
+    int pipeline = std::min(num_buffers_, 4);
+    int wc_num = pipeline * MAX_CONNS * 2 * 2;
     int n_wires = left_.size();
     size_t n_bytes_per_wire = (n_bytes + (2 * n_wires) - 1) / (2 * n_wires);
     size_t out_bytes = n_bytes * size_;
@@ -194,7 +208,7 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
     for (int k = 0; k < size_ - 1; k++) {
       // Prefill the pipeline
       int buff = 0;
-      while (buff < n_steps && buff < PIPELINE) {
+      while (buff < n_steps && buff < pipeline) {
         post_recv_all(sz, buff);
         for (int lr = 0; lr < 2; lr++) {
           for (int lw = 0; lw < n_wires; lw++) {
@@ -219,8 +233,8 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
       //
       // Keep going until we have no longer data in flight.
       while (in_flight > 0) {
-        ibv_wc wc[WC_NUM];
-        int n = poll(left_, right_, WC_NUM, wc);
+        ibv_wc wc[256];
+        int n = poll(left_, right_, std::min(wc_num, 256), wc);
         for (int i = 0; i < n; i++) {
           int work_type = wc[i].wr_id >> 16;
           int buff = (wc[i].wr_id >> 8) & 0xff;
@@ -252,7 +266,7 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
                     std::max<int64_t>(0, std::min(N, limits[lr] - offset)),
                 out_ptr + recv_offset[lr] + offset);
             recv_count[wire]++;
-            if (recv_count[wire] + (PIPELINE - 1) < n_steps) {
+            if (recv_count[wire] + (pipeline - 1) < n_steps) {
               recv_from(sz, buff, lr, lw);
               in_flight++;
             }
@@ -291,8 +305,8 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
     auto& conns = (dst == left) ? left_ : right_;
     int dir = dst == left;
 
-    constexpr int PIPELINE = 4;
-    constexpr int WC_NUM = PIPELINE * MAX_CONNS;
+    int pipeline = std::min(num_buffers_, 4);
+    int wc_num = pipeline * MAX_CONNS;
 
     int n_wires = conns.size();
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
@@ -309,7 +323,7 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
     // Prefill the pipeline
     for (int lw = 0; lw < n_wires; lw++) {
       int buff = 0;
-      while (read_offset[lw] < limits[lw] && buff < PIPELINE) {
+      while (read_offset[lw] < limits[lw] && buff < pipeline) {
         std::copy(
             data + read_offset[lw],
             data + std::min(read_offset[lw] + N, limits[lw]),
@@ -328,8 +342,8 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
       //
       // If a send was completed and we have more data to send then go ahead
       // and send them.
-      ibv_wc wc[WC_NUM];
-      int n = poll(conns, WC_NUM, wc);
+      ibv_wc wc[128];
+      int n = poll(conns, std::min(wc_num, 128), wc);
       for (int i = 0; i < n; i++) {
         int buff = (wc[i].wr_id >> 8) & 0xff;
         int wire = wc[i].wr_id & 0xff;
@@ -372,8 +386,8 @@ void RingGroup::recv(array& out, int src, Stream stream) {
     auto& conns = (src == right) ? right_ : left_;
     int dir = src == right;
 
-    constexpr int PIPELINE = 4;
-    constexpr int WC_NUM = PIPELINE * MAX_CONNS;
+    int pipeline = std::min(num_buffers_, 4);
+    int wc_num = pipeline * MAX_CONNS;
 
     int n_wires = conns.size();
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
@@ -390,7 +404,7 @@ void RingGroup::recv(array& out, int src, Stream stream) {
     // Prefill the pipeline
     for (int lw = 0; lw < n_wires; lw++) {
       int buff = 0;
-      while (N * buff < limits[lw] && buff < PIPELINE) {
+      while (N * buff < limits[lw] && buff < pipeline) {
         recv_from(sz, buff, dir, lw);
 
         buff++;
@@ -404,8 +418,8 @@ void RingGroup::recv(array& out, int src, Stream stream) {
       //
       // If a recv was completed copy it to the output and if we have more
       // data to fetch post another recv.
-      ibv_wc wc[WC_NUM];
-      int n = poll(conns, WC_NUM, wc);
+      ibv_wc wc[128];
+      int n = poll(conns, std::min(wc_num, 128), wc);
       for (int i = 0; i < n; i++) {
         int buff = (wc[i].wr_id >> 8) & 0xff;
         int wire = wc[i].wr_id & 0xff;
@@ -421,7 +435,7 @@ void RingGroup::recv(array& out, int src, Stream stream) {
             data + write_offset[lw]);
         write_offset[lw] += N;
 
-        if (write_offset[lw] + (PIPELINE - 1) * N < limits[lw]) {
+        if (write_offset[lw] + (pipeline - 1) * N < limits[lw]) {
           recv_from(sz, buff, dir, lw);
 
           in_flight++;
@@ -465,8 +479,8 @@ void RingGroup::all_reduce_impl(
     std::memcpy(out_ptr, in_ptr, size * sizeof(T));
   }
 
-  constexpr int PIPELINE = 4;
-  constexpr int WC_NUM = PIPELINE * MAX_CONNS * 2 * MAX_DIR;
+  int pipeline = num_buffers_;
+  int wc_num = pipeline * MAX_CONNS * 2 * MAX_DIR;
   int64_t chunk_size = (size + size_ - 1) / size_;
   int64_t size_per_wire =
       (chunk_size + (MAX_DIR * n_wires) - 1) / (MAX_DIR * n_wires);
@@ -481,8 +495,8 @@ void RingGroup::all_reduce_impl(
   int64_t recv_offset[MAX_DIR];
   int64_t send_limits[MAX_DIR];
   int64_t recv_limits[MAX_DIR];
-  int send_count[MAX_DIR * MAX_CONNS] = {0};
-  int recv_count[MAX_DIR * MAX_CONNS] = {0};
+  std::vector<int> send_count(MAX_DIR * MAX_CONNS, 0);
+  std::vector<int> recv_count(MAX_DIR * MAX_CONNS, 0);
   send_offset[0] = rank_ * chunk_size;
   recv_offset[0] = ((rank_ + size_ - 1) % size_) * chunk_size;
   if constexpr (MAX_DIR == 2) {
@@ -510,7 +524,7 @@ void RingGroup::all_reduce_impl(
   for (int k = 0; k < size_ - 1; k++) {
     // Prefill the pipeline
     int buff = 0;
-    while (buff < n_steps && buff < PIPELINE) {
+    while (buff < n_steps && buff < pipeline) {
       post_recv_all<MAX_DIR>(sz, buff, n_wires);
       for (int lr = 0; lr < MAX_DIR; lr++) {
         for (int lw = 0; lw < n_wires; lw++) {
@@ -535,8 +549,8 @@ void RingGroup::all_reduce_impl(
     //
     // Keep going until we have no longer data in flight.
     while (in_flight > 0) {
-      ibv_wc wc[WC_NUM];
-      int n = poll(left_, right_, WC_NUM, wc);
+      ibv_wc wc[256];
+      int n = poll(left_, right_, std::min(wc_num, 256), wc);
       for (int i = 0; i < n; i++) {
         int work_type = wc[i].wr_id >> 16;
         int buff = (wc[i].wr_id >> 8) & 0xff;
@@ -567,7 +581,7 @@ void RingGroup::all_reduce_impl(
               out_ptr + recv_offset[lr] + offset,
               std::max<int64_t>(0, std::min(N, recv_limits[lr] - offset)));
           recv_count[wire]++;
-          if (recv_count[wire] + (PIPELINE - 1) < n_steps) {
+          if (recv_count[wire] + (pipeline - 1) < n_steps) {
             recv_from(sz, buff, lr, lw);
             in_flight++;
           }
@@ -607,7 +621,7 @@ void RingGroup::all_reduce_impl(
   for (int k = 0; k < size_ - 1; k++) {
     // Prefill the pipeline
     int buff = 0;
-    while (buff < n_steps && buff < PIPELINE) {
+    while (buff < n_steps && buff < pipeline) {
       post_recv_all<MAX_DIR>(sz, buff, n_wires);
       for (int lr = 0; lr < MAX_DIR; lr++) {
         for (int lw = 0; lw < n_wires; lw++) {
@@ -632,8 +646,8 @@ void RingGroup::all_reduce_impl(
     //
     // Keep going until we have no longer data in flight.
     while (in_flight > 0) {
-      ibv_wc wc[WC_NUM];
-      int n = poll(left_, right_, WC_NUM, wc);
+      ibv_wc wc[256];
+      int n = poll(left_, right_, std::min(wc_num, 256), wc);
       for (int i = 0; i < n; i++) {
         int work_type = wc[i].wr_id >> 16;
         int buff = (wc[i].wr_id >> 8) & 0xff;
@@ -665,7 +679,7 @@ void RingGroup::all_reduce_impl(
                   std::max<int64_t>(0, std::min(N, recv_limits[lr] - offset)),
               out_ptr + recv_offset[lr] + offset);
           recv_count[wire]++;
-          if (recv_count[wire] + (PIPELINE - 1) < n_steps) {
+          if (recv_count[wire] + (pipeline - 1) < n_steps) {
             recv_from(sz, buff, lr, lw);
             in_flight++;
           }

@@ -107,35 +107,35 @@ class RingGroup : public GroupImpl {
 
   SharedBuffer& send_buffer_right(int sz, int buff, int wire) {
     return send_buffers_
-        [sz * NUM_BUFFERS * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + wire];
+        [sz * num_buffers_ * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + wire];
   }
 
   SharedBuffer& send_buffer_left(int sz, int buff, int wire) {
     return send_buffers_
-        [sz * NUM_BUFFERS * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + MAX_CONNS +
+        [sz * num_buffers_ * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + MAX_CONNS +
          wire];
   }
 
   SharedBuffer& send_buffer(int sz, int buff, int left_right, int wire) {
     return send_buffers_
-        [sz * NUM_BUFFERS * MAX_CONNS * 2 + buff * MAX_CONNS * 2 +
+        [sz * num_buffers_ * MAX_CONNS * 2 + buff * MAX_CONNS * 2 +
          left_right * MAX_CONNS + wire];
   }
 
   SharedBuffer& recv_buffer_left(int sz, int buff, int wire) {
     return recv_buffers_
-        [sz * NUM_BUFFERS * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + wire];
+        [sz * num_buffers_ * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + wire];
   }
 
   SharedBuffer& recv_buffer_right(int sz, int buff, int wire) {
     return recv_buffers_
-        [sz * NUM_BUFFERS * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + MAX_CONNS +
+        [sz * num_buffers_ * MAX_CONNS * 2 + buff * MAX_CONNS * 2 + MAX_CONNS +
          wire];
   }
 
   SharedBuffer& recv_buffer(int sz, int buff, int left_right, int wire) {
     return recv_buffers_
-        [sz * NUM_BUFFERS * MAX_CONNS * 2 + buff * MAX_CONNS * 2 +
+        [sz * num_buffers_ * MAX_CONNS * 2 + buff * MAX_CONNS * 2 +
          left_right * MAX_CONNS + wire];
   }
 
@@ -167,6 +167,7 @@ class RingGroup : public GroupImpl {
 
   int rank_;
   int size_;
+  int num_buffers_;
   std::string coordinator_addr_;
   std::string device_name_; // representative RDMA device for split
   SideChannel side_channel_;

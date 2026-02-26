@@ -14,14 +14,25 @@ namespace mlx::core::distributed::jaccl {
 namespace {
 
 // Calculate total bytes needed for all JACCL buffers.
-// Sum over k=0..BUFFER_SIZES-1: FRAME_SIZE * (1 << k) * NUM_BUFFERS * num_peers
-size_t calculate_pool_size(int num_peers) {
+// Sum over k=0..BUFFER_SIZES-1: FRAME_SIZE * (1 << k) * num_buffers * num_peers
+size_t calculate_pool_size(int num_peers, int num_buffers) {
   size_t total = 0;
   for (int k = 0; k < BUFFER_SIZES; k++) {
     total +=
-        static_cast<size_t>(FRAME_SIZE) * (1 << k) * NUM_BUFFERS * num_peers;
+        static_cast<size_t>(FRAME_SIZE) * (1 << k) * num_buffers * num_peers;
   }
   return total;
+}
+
+int get_num_buffers() {
+  const char* val = std::getenv("MLX_JACCL_NUM_BUFFERS");
+  if (val) {
+    int n = std::atoi(val);
+    if (n > 0 && n <= 64) {
+      return n;
+    }
+  }
+  return DEFAULT_NUM_BUFFERS;
 }
 
 } // namespace
@@ -32,17 +43,20 @@ MeshGroup::MeshGroup(
     const char* coordinator_addr)
     : rank_(rank),
       size_(device_names.size()),
+      num_buffers_(get_num_buffers()),
       coordinator_addr_(coordinator_addr),
       device_names_(device_names),
       side_channel_(rank_, size_, coordinator_addr),
       connections_(create_connections(device_names)),
-      pool_(calculate_pool_size(device_names.size())) {
+      pool_(calculate_pool_size(device_names.size(), num_buffers_)) {
   if (size_ > MAX_PEERS) {
     std::ostringstream msg;
     msg << "[jaccl] The JACCL mesh supports up to " << MAX_PEERS
         << " peers but " << size_ << " were provided.";
     throw std::runtime_error(msg.str());
   }
+  
+  std::cerr << "[jaccl] MeshGroup initialized with num_buffers=" << num_buffers_ << std::endl;
 
   // Initialize all the connections and allocate buffers
   initialize();
@@ -110,7 +124,7 @@ void MeshGroup::allocate_buffers() {
 
   // Allocate buffers from the pool (single MR, pointer arithmetic)
   for (int k = 0; k < BUFFER_SIZES; k++) {
-    for (int i = 0; i < NUM_BUFFERS; i++) {
+    for (int i = 0; i < num_buffers_; i++) {
       for (int j = 0; j < size_; j++) {
         buffers_.push_back(pool_.allocate(FRAME_SIZE * (1 << k)));
       }
@@ -158,20 +172,20 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
     char* data = out_ptr;
     char* our_data = out_ptr + rank_ * n_bytes;
     auto [sz, N] = buffer_size_from_message(n_bytes);
-    constexpr int PIPELINE = 2;
-    constexpr int WC_NUM = PIPELINE * MAX_PEERS * 2;
+    int pipeline = std::min(num_buffers_, 2);
+    int wc_num = pipeline * MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(n_bytes);
     int num_peers = size_ - 1;
 
     // Counters to maintain the state of transfers
     int in_flight = 0;
     int read_offset = 0;
-    int completed_send_count[PIPELINE] = {0};
+    std::vector<int> completed_send_count(pipeline, 0);
     int write_offset[MAX_PEERS] = {0};
 
     // Prefill the pipeline
     int buff = 0;
-    while (read_offset < total && buff < PIPELINE) {
+    while (read_offset < total && buff < pipeline) {
       post_recv_all(sz, buff);
       std::copy(
           our_data + read_offset,
@@ -188,8 +202,8 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
     //
     // Keep going until we have no longer data in flight.
     while (in_flight > 0) {
-      ibv_wc wc[WC_NUM];
-      int n = poll(connections_, WC_NUM, wc);
+      ibv_wc wc[256]; // Use a safe large constant for stack allocation
+      int n = poll(connections_, std::min(wc_num, 256), wc);
       for (int i = 0; i < n; i++) {
         int work_type = wc[i].wr_id >> 16;
         int buff = (wc[i].wr_id >> 8) & 0xff;
@@ -221,7 +235,7 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
                   std::min(N, total - write_offset[rank]),
               data + rank * n_bytes + write_offset[rank]);
           write_offset[rank] += N;
-          if (write_offset[rank] + N * (PIPELINE - 1) < total) {
+          if (write_offset[rank] + N * (pipeline - 1) < total) {
             recv_from(sz, rank, buff);
             in_flight++;
           }
@@ -237,8 +251,8 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, dst, this]() {
-    constexpr int PIPELINE = 2;
-    constexpr int WC_NUM = PIPELINE;
+    int pipeline = std::min(num_buffers_, 2);
+    int wc_num = pipeline;
     auto [sz, N] = buffer_size_from_message(n_bytes);
 
     int in_flight = 0;
@@ -246,7 +260,7 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
 
     // Prefill the pipeline
     int buff = 0;
-    while (read_offset < n_bytes && buff < PIPELINE) {
+    while (read_offset < n_bytes && buff < pipeline) {
       std::copy(
           data + read_offset,
           data + std::min(read_offset + N, n_bytes),
@@ -264,8 +278,8 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
       //
       // If a send was completed and we have more data to send then go ahead
       // and send them.
-      ibv_wc wc[WC_NUM];
-      int n = connections_[dst].poll(WC_NUM, wc);
+      ibv_wc wc[64];
+      int n = connections_[dst].poll(std::min(wc_num, 64), wc);
       for (int i = 0; i < n; i++) {
         int buff = (wc[i].wr_id >> 8) & 0xff;
         int rank = wc[i].wr_id & 0xff;
@@ -293,8 +307,8 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, src, this]() {
-    constexpr int PIPELINE = 2;
-    constexpr int WC_NUM = PIPELINE;
+    int pipeline = std::min(num_buffers_, 2);
+    int wc_num = pipeline;
     auto [sz, N] = buffer_size_from_message(n_bytes);
 
     int in_flight = 0;
@@ -302,7 +316,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
 
     // Prefill the pipeline
     int buff = 0;
-    while (N * buff < n_bytes && buff < PIPELINE) {
+    while (N * buff < n_bytes && buff < pipeline) {
       recv_from(sz, src, buff);
 
       in_flight++;
@@ -315,8 +329,8 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
       //
       // If a recv was completed copy it to the output and if we have more
       // data to fetch post another recv.
-      ibv_wc wc[WC_NUM];
-      int n = connections_[src].poll(WC_NUM, wc);
+      ibv_wc wc[64];
+      int n = connections_[src].poll(std::min(wc_num, 64), wc);
       for (int i = 0; i < n; i++) {
         int buff = (wc[i].wr_id >> 8) & 0xff;
         int rank = wc[i].wr_id & 0xff;
@@ -330,7 +344,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
             data + write_offset);
         write_offset += N;
 
-        if (write_offset + (PIPELINE - 1) * N < n_bytes) {
+        if (write_offset + (pipeline - 1) * N < n_bytes) {
           recv_from(sz, src, buff);
 
           in_flight++;
@@ -361,15 +375,15 @@ void MeshGroup::all_reduce(
     T* data = out_ptr;
     auto [sz, buffer_size] = buffer_size_from_message(size * sizeof(T));
     int64_t N = buffer_size / sizeof(T);
-    constexpr int PIPELINE = NUM_BUFFERS;
-    constexpr int WC_NUM = PIPELINE * MAX_PEERS * 2;
+    int pipeline = num_buffers_;
+    int wc_num = pipeline * MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(size);
     int num_peers = size_ - 1;
 
     // Counters to maintain the state of transfers
     int in_flight = 0;
     int64_t read_offset = 0;
-    int completed_send_count[PIPELINE] = {0};
+    std::vector<int> completed_send_count(pipeline, 0);
     int completed_recv_begin[MAX_PEERS] = {0};
     int completed_recv_end[MAX_PEERS] = {0};
 
@@ -383,7 +397,7 @@ void MeshGroup::all_reduce(
     int64_t prefill_offset = read_offset;
 
     // Phase 1: Post all recvs
-    while (prefill_offset < total && prefill_count < PIPELINE) {
+    while (prefill_offset < total && prefill_count < pipeline) {
       post_recv_all(sz, prefill_count);
       prefill_count++;
       prefill_offset += N;
@@ -414,8 +428,8 @@ void MeshGroup::all_reduce(
       //
       // If a receive is completed then advance the pointer of completed
       // receives.
-      ibv_wc wc[WC_NUM];
-      int n = poll(connections_, WC_NUM, wc);
+      ibv_wc wc[256];
+      int n = poll(connections_, std::min(wc_num, 256), wc);
       for (int i = 0; i < n; i++) {
         int work_type = wc[i].wr_id >> 16;
         int buff = (wc[i].wr_id >> 8) & 0xff;
@@ -456,14 +470,14 @@ void MeshGroup::all_reduce(
         int e = completed_recv_end[r];
         int w = s * N;
         while (w < read_offset && e - s > 0) {
-          int buff = s % PIPELINE;
+          int buff = s % pipeline;
           reduce_op(
               recv_buffer(sz, buff, r).begin<T>(),
               data + w,
               std::min(N, total - w));
           w += N;
           s++;
-          if (w + (PIPELINE - 1) * N < total) {
+          if (w + (pipeline - 1) * N < total) {
             recv_from(sz, r, buff);
             in_flight++;
           }

@@ -81,11 +81,11 @@ class MeshGroup : public GroupImpl {
   }
 
   SharedBuffer& send_buffer(int sz, int buff) {
-    return buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank_];
+    return buffers_[sz * num_buffers_ * size_ + buff * size_ + rank_];
   }
 
   SharedBuffer& recv_buffer(int sz, int buff, int rank) {
-    return buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank];
+    return buffers_[sz * num_buffers_ * size_ + buff * size_ + rank];
   }
 
   void post_send_all(int sz, int buff) {
@@ -100,7 +100,7 @@ class MeshGroup : public GroupImpl {
   }
 
   void post_recv_all(int sz, int buff) {
-    int b = sz * NUM_BUFFERS * size_ + buff * size_;
+    int b = sz * num_buffers_ * size_ + buff * size_;
     int wr_id = RECV_WR << 16 | buff << 8;
     for (int i = 0; i < size_; i++) {
       if (i == rank_) {
@@ -112,6 +112,7 @@ class MeshGroup : public GroupImpl {
 
   int rank_;
   int size_;
+  int num_buffers_;
   std::string coordinator_addr_;
   std::vector<std::string> device_names_;
   SideChannel side_channel_;
