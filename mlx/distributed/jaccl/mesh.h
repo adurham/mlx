@@ -84,6 +84,12 @@ class MeshGroup : public GroupImpl {
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;
 
+  // Pre-registered buffers for sub-group (split) operations.
+  // Indexed as [k * NUM_BUFFERS + i] — one send and one recv per
+  // (size_class, pipeline_slot). Registered before QP transitions to RTS.
+  std::vector<SharedBuffer> sub_send_buffers_;
+  std::vector<SharedBuffer> sub_recv_buffers_;
+
   MeshImpl mesh_;
   RingImpl ring_;
 };
@@ -139,10 +145,13 @@ class SubMeshGroup : public GroupImpl {
       Stream stream,
       ReduceOp reduce_op);
 
-  // Use parent's pre-registered buffers (registered before QP transitions to
-  // RTS). JACCL requires memory registration before QP is in RTS state.
-  SharedBuffer& send_buffer(int sz, int buff);
-  SharedBuffer& recv_buffer(int sz, int buff, int global_peer_rank);
+  SharedBuffer& send_buffer(int sz, int buff) {
+    return parent_->sub_send_buffers_[sz * NUM_BUFFERS + buff];
+  }
+
+  SharedBuffer& recv_buffer(int sz, int buff) {
+    return parent_->sub_recv_buffers_[sz * NUM_BUFFERS + buff];
+  }
 
   int sub_rank_;
   int sub_size_;
