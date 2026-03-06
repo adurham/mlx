@@ -13,11 +13,11 @@
 constexpr const char* IBV_TAG = "[jaccl]";
 constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
-constexpr int MAX_SEND_WR = 32;
-constexpr int MAX_RECV_WR = 32;
-constexpr int BUFFER_SIZES = 8;
-constexpr int NUM_BUFFERS = 2;
-constexpr int FRAME_SIZE = 4096;
+constexpr int MAX_SEND_WR = 256;
+constexpr int MAX_RECV_WR = 256;
+constexpr int BUFFER_SIZES = 6;
+constexpr int NUM_BUFFERS = 8;
+constexpr int FRAME_SIZE = 65536;
 
 namespace detail = mlx::core::distributed::detail;
 
