@@ -844,6 +844,121 @@ array scaled_dot_product_attention(
   return fallback(std::move(inputs))[0];
 }
 
+array quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& k_data,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_data,
+    const array& v_scales,
+    const array& v_biases,
+    const float scale,
+    const int group_size,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    StreamOrDevice s /* = {}*/) {
+  if (queries.ndim() != 4) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] queries expected rank 4");
+  }
+  for (const auto& t :
+       {k_data, k_scales, k_biases, v_data, v_scales, v_biases}) {
+    if (t.ndim() != 4) {
+      throw std::invalid_argument(
+          "[quantized_scaled_dot_product_attention] K/V inputs expected rank 4");
+    }
+  }
+  if (k_data.dtype() != uint32) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] k_data must be uint32");
+  }
+  if (v_data.dtype() != uint32) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] v_data must be uint32");
+  }
+
+  bool do_causal = false;
+  bool has_mask = false;
+  bool has_arr_mask = false;
+
+  if (mask_mode == "causal") {
+    has_mask = true;
+    do_causal = true;
+  } else if (mask_arr) {
+    has_mask = true;
+    has_arr_mask = true;
+  } else if (mask_mode != "") {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] Invalid mask_mode");
+  }
+
+  auto final_type = queries.dtype();
+
+  int D = queries.shape(-1);
+  int pack_factor = 4; // 8-bit: 4 values per uint32
+  int V_DIM = v_data.shape(-1) * pack_factor;
+  int n_q_heads = queries.shape(1);
+  int n_kv_heads = k_data.shape(1);
+  int q_len = queries.shape(2);
+  int N = k_data.shape(2);
+
+  if (D != V_DIM) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] query head_dim must equal "
+        "value head_dim");
+  }
+  if (D != 64 && D != 96 && D != 128 && D != 256) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] unsupported head_dim");
+  }
+  if (q_len > 8) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] query length must be <= 8 "
+        "(decode only)");
+  }
+  if (n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        "[quantized_scaled_dot_product_attention] n_q_heads must be a "
+        "multiple of n_kv_heads");
+  }
+
+  auto fallback =
+      [scale, group_size, do_causal, has_arr_mask, s](
+          const std::vector<array>& inputs) {
+        auto& q = inputs[0];
+        auto& kd = inputs[1];
+        auto& ks = inputs[2];
+        auto& kb = inputs[3];
+        auto& vd = inputs[4];
+        auto& vs = inputs[5];
+        auto& vb = inputs[6];
+        auto k = dequantize(kd, ks, kb, group_size, 8, "affine", std::nullopt, std::nullopt, s);
+        auto v = dequantize(vd, vs, vb, group_size, 8, "affine", std::nullopt, std::nullopt, s);
+        std::string mask_str = do_causal ? "causal" : "";
+        std::optional<array> mask =
+            has_arr_mask ? std::optional<array>{inputs[7]} : std::nullopt;
+        auto out = scaled_dot_product_attention(
+            q, k, v, scale, mask_str, mask, std::nullopt, s);
+        return std::vector<array>{out};
+      };
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {
+      queries, k_data, k_scales, k_biases, v_data, v_scales, v_biases};
+
+  if (has_arr_mask) {
+    auto mask_shape = queries.shape();
+    mask_shape.back() = N;
+    inputs.push_back(broadcast_to(*mask_arr, mask_shape, stream));
+  }
+
+  Shape out_shape{queries.shape(0), n_q_heads, q_len, V_DIM};
+  auto primitive = std::make_shared<QuantizedScaledDotProductAttention>(
+      stream, fallback, scale, do_causal, group_size);
+  return array(
+      std::move(out_shape), final_type, primitive, std::move(inputs));
+}
+
 std::vector<array> ScaledDotProductAttention::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -896,6 +1011,14 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
       output_logsumexp_ == a_other.output_logsumexp_;
+}
+
+bool QuantizedScaledDotProductAttention::is_equivalent(
+    const Primitive& other) const {
+  const QuantizedScaledDotProductAttention& a_other =
+      static_cast<const QuantizedScaledDotProductAttention&>(other);
+  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
+      group_size_ == a_other.group_size_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {

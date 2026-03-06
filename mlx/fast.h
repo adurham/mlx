@@ -54,6 +54,21 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+/** Fused quantized SDPA: reads int8-quantized K/V with on-the-fly dequant. **/
+MLX_API array quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& k_data,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_data,
+    const array& v_scales,
+    const array& v_biases,
+    const float scale,
+    const int group_size,
+    const std::string& mask_mode = "",
+    std::optional<array> mask_arr = {},
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

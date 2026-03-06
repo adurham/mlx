@@ -297,6 +297,89 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "quantized_scaled_dot_product_attention",
+      [](const mx::array& queries,
+         const mx::array& k_data,
+         const mx::array& k_scales,
+         const mx::array& k_biases,
+         const mx::array& v_data,
+         const mx::array& v_scales,
+         const mx::array& v_biases,
+         const float scale,
+         const int group_size,
+         const std::variant<std::monostate, std::string, mx::array>& mask,
+         mx::StreamOrDevice s) {
+        bool has_mask = !std::holds_alternative<std::monostate>(mask);
+        bool has_str_mask =
+            has_mask && std::holds_alternative<std::string>(mask);
+        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
+
+        if (has_mask) {
+          if (has_str_mask) {
+            auto mask_str = std::get<std::string>(mask);
+            if (mask_str != "causal") {
+              throw std::invalid_argument(
+                  "[quantized_scaled_dot_product_attention] invalid mask '"
+                  + mask_str + "'. Must be 'causal', or an array.");
+            }
+            return mx::fast::quantized_scaled_dot_product_attention(
+                queries, k_data, k_scales, k_biases,
+                v_data, v_scales, v_biases,
+                scale, group_size, mask_str, std::nullopt, s);
+          } else {
+            auto mask_arr = std::get<mx::array>(mask);
+            return mx::fast::quantized_scaled_dot_product_attention(
+                queries, k_data, k_scales, k_biases,
+                v_data, v_scales, v_biases,
+                scale, group_size, "", mask_arr, s);
+          }
+        } else {
+          return mx::fast::quantized_scaled_dot_product_attention(
+              queries, k_data, k_scales, k_biases,
+              v_data, v_scales, v_biases,
+              scale, group_size, "", {}, s);
+        }
+      },
+      "q"_a,
+      "k_data"_a,
+      "k_scales"_a,
+      "k_biases"_a,
+      "v_data"_a,
+      "v_scales"_a,
+      "v_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "group_size"_a = 64,
+      "mask"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def quantized_scaled_dot_product_attention(q: array, k_data: array, k_scales: array, k_biases: array, v_data: array, v_scales: array, v_biases: array, *, scale: float, group_size: int = 64, mask: Union[None, str, array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused quantized scaled dot product attention.
+
+        Reads int8-quantized K/V caches with on-the-fly dequantization in a
+        single fused Metal kernel. This avoids the 3-kernel overhead of the
+        unfused ``quantized_matmul`` approach.
+
+        Only supports decode (query length <= 8) and 8-bit quantization.
+
+        Args:
+            q (array): Queries with shape ``[B, N_q, T_q, D]``.
+            k_data (array): Quantized key data ``[B, N_kv, T_kv, D//4]`` (uint32).
+            k_scales (array): Key scales ``[B, N_kv, T_kv, D//group_size]``.
+            k_biases (array): Key biases ``[B, N_kv, T_kv, D//group_size]``.
+            v_data (array): Quantized value data ``[B, N_kv, T_kv, D//4]`` (uint32).
+            v_scales (array): Value scales ``[B, N_kv, T_kv, D//group_size]``.
+            v_biases (array): Value biases ``[B, N_kv, T_kv, D//group_size]``.
+            scale (float): Scale for queries (typically ``1.0 / sqrt(D)``).
+            group_size (int): Quantization group size. Default: ``64``.
+            mask (str or array, optional): ``"causal"`` or an additive mask array.
+
+        Returns:
+            array: The output array with shape ``[B, N_q, T_q, D]``.
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

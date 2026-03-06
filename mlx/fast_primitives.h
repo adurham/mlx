@@ -260,6 +260,41 @@ class ScaledDotProductAttention : public Custom {
   bool output_logsumexp_;
 };
 
+class QuantizedScaledDotProductAttention : public Custom {
+ public:
+  QuantizedScaledDotProductAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      bool do_causal,
+      int group_size)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        do_causal_(do_causal),
+        group_size_(group_size) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(QuantizedScaledDotProductAttention);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, scale_, do_causal_, group_size_);
+  }
+
+ private:
+  float scale_;
+  bool do_causal_;
+  int group_size_;
+};
+
 class ScaledDotProductAttentionVJP : public Custom {
  public:
   ScaledDotProductAttentionVJP(
