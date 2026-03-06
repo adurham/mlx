@@ -215,4 +215,351 @@ void MeshGroup::all_reduce(
   });
 }
 
+// --- MeshGroup::split ---
+
+std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
+  // Gather (color, key, global_rank) from all peers via the side channel.
+  // Using the side channel is safe here because split() is called once during
+  // initialization, not on the hot path.
+  struct SplitInfo {
+    int color;
+    int key;
+    int global_rank;
+  };
+  SplitInfo my_info{color, key >= 0 ? key : rank_, rank_};
+
+  // Exchange split info with all peers
+  auto all_info = side_channel_.all_gather(my_info);
+
+  // Collect members of our color, sorted by key (then by global rank for ties)
+  std::vector<std::pair<int, int>> members; // (sort_key, global_rank)
+  for (auto& info : all_info) {
+    if (info.color == color) {
+      members.emplace_back(info.key, info.global_rank);
+    }
+  }
+  std::sort(members.begin(), members.end());
+
+  std::vector<int> global_ranks;
+  int sub_rank = -1;
+  for (int i = 0; i < static_cast<int>(members.size()); i++) {
+    global_ranks.push_back(members[i].second);
+    if (members[i].second == rank_) {
+      sub_rank = i;
+    }
+  }
+
+  if (sub_rank < 0) {
+    throw std::runtime_error("[jaccl] split: this rank not found in sub-group");
+  }
+
+  int sub_size = static_cast<int>(global_ranks.size());
+  return std::make_shared<SubMeshGroup>(sub_rank, sub_size, std::move(global_ranks), this);
+}
+
+// --- SubMeshGroup ---
+
+SubMeshGroup::SubMeshGroup(
+    int sub_rank,
+    int sub_size,
+    std::vector<int> global_ranks,
+    MeshGroup* parent)
+    : sub_rank_(sub_rank),
+      sub_size_(sub_size),
+      global_ranks_(std::move(global_ranks)),
+      parent_(parent) {
+  // Build peer connection pointers (skip self)
+  for (int i = 0; i < sub_size_; i++) {
+    if (i == sub_rank_) {
+      peer_connections_.push_back(nullptr);
+    } else {
+      peer_connections_.push_back(&parent_->connections_[global_ranks_[i]]);
+    }
+  }
+
+  // Allocate and register buffers for sub-group communication
+  if (sub_size_ > 1) {
+    allocate_buffers();
+  }
+}
+
+void SubMeshGroup::allocate_buffers() {
+  send_buffers_.clear();
+  recv_buffers_.clear();
+
+  // Allocate send and recv buffers for each size class and pipeline slot
+  for (int k = 0; k < BUFFER_SIZES; k++) {
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+      send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+      recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+    }
+  }
+
+  // Register buffers to all peer protection domains
+  for (int i = 0; i < sub_size_; i++) {
+    if (i == sub_rank_) {
+      continue;
+    }
+    ibv_pd* pd = peer_connections_[i]->protection_domain;
+    for (auto& buf : send_buffers_) {
+      buf.register_to_protection_domain(pd);
+    }
+    for (auto& buf : recv_buffers_) {
+      buf.register_to_protection_domain(pd);
+    }
+  }
+}
+
+void SubMeshGroup::all_sum(const array& input, array& output, Stream stream) {
+  dispatch_all_types(output.dtype(), [&](auto type_tag) {
+    using T = MLX_GET_TYPE(type_tag);
+    all_reduce<T>(input, output, stream, detail::SumOp<T>{});
+  });
+}
+
+void SubMeshGroup::all_max(const array& input, array& output, Stream stream) {
+  dispatch_all_types(output.dtype(), [&](auto type_tag) {
+    using T = MLX_GET_TYPE(type_tag);
+    all_reduce<T>(input, output, stream, detail::MaxOp<T>{});
+  });
+}
+
+void SubMeshGroup::all_min(const array& input, array& output, Stream stream) {
+  dispatch_all_types(output.dtype(), [&](auto type_tag) {
+    using T = MLX_GET_TYPE(type_tag);
+    all_reduce<T>(input, output, stream, detail::MinOp<T>{});
+  });
+}
+
+template <typename T, typename ReduceOp>
+void SubMeshGroup::all_reduce(
+    const array& input,
+    array& output,
+    Stream stream,
+    ReduceOp reduce_op) {
+  if (sub_size_ == 1) {
+    // Single-node sub-group: just copy
+    auto in_ptr = input.data<T>();
+    auto out_ptr = output.data<T>();
+    int64_t count = input.size();
+    auto& encoder = cpu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    encoder.dispatch([in_ptr, out_ptr, count]() {
+      if (in_ptr != out_ptr) {
+        std::memcpy(out_ptr, in_ptr, count * sizeof(T));
+      }
+    });
+    return;
+  }
+
+  auto in_ptr = input.data<T>();
+  auto out_ptr = output.data<T>();
+  int64_t count = input.size();
+  auto& encoder = cpu::get_command_encoder(stream);
+  encoder.set_input_array(input);
+  encoder.set_output_array(output);
+  encoder.dispatch([in_ptr, out_ptr, count, reduce_op, this]() {
+    // Copy input to output (accumulator)
+    if (in_ptr != out_ptr) {
+      std::memcpy(out_ptr, in_ptr, count * sizeof(T));
+    }
+
+    auto [sz, buffer_size] = buffer_size_from_message(count * sizeof(T));
+    int64_t N = buffer_size / sizeof(T);
+    constexpr int PIPELINE = 2;
+    int64_t total = count;
+
+    // Exchange with each peer and reduce
+    for (int p = 0; p < sub_size_; p++) {
+      if (p == sub_rank_) {
+        continue;
+      }
+      Connection* peer = peer_connections_[p];
+
+      int in_flight = 0;
+      int64_t read_offset = 0;
+      int completed_recv_begin = 0;
+      int completed_recv_end = 0;
+
+      // Prefill pipeline
+      int buff = 0;
+      while (read_offset < total && buff < PIPELINE) {
+        peer->post_recv(
+            recv_buffer(sz, buff), RECV_WR << 16 | buff << 8);
+        std::copy(
+            out_ptr + read_offset,
+            out_ptr + std::min(read_offset + N, total),
+            send_buffer(sz, buff).begin<T>());
+        peer->post_send(
+            send_buffer(sz, buff), SEND_WR << 16 | buff << 8);
+        buff++;
+        in_flight += 2;
+        read_offset += N;
+      }
+
+      // Main loop
+      while (in_flight > 0) {
+        ibv_wc wc[PIPELINE * 2];
+        int n = peer->poll(PIPELINE * 2, wc);
+        for (int i = 0; i < n; i++) {
+          int work_type = wc[i].wr_id >> 16;
+          int b = (wc[i].wr_id >> 8) & 0xff;
+          in_flight--;
+
+          if (work_type == SEND_WR && read_offset < total) {
+            std::copy(
+                out_ptr + read_offset,
+                out_ptr + std::min(read_offset + N, total),
+                send_buffer(sz, b).begin<T>());
+            peer->post_send(
+                send_buffer(sz, b), SEND_WR << 16 | b << 8);
+            in_flight++;
+            read_offset += N;
+          } else if (work_type == RECV_WR) {
+            completed_recv_end++;
+          }
+        }
+
+        // Process completed receives
+        int64_t w = static_cast<int64_t>(completed_recv_begin) * N;
+        while (w < read_offset && completed_recv_end > completed_recv_begin) {
+          int b = completed_recv_begin % PIPELINE;
+          reduce_op(
+              recv_buffer(sz, b).begin<T>(),
+              out_ptr + w,
+              std::min(N, total - w));
+          w += N;
+          completed_recv_begin++;
+          if (w + (PIPELINE - 1) * N < total) {
+            peer->post_recv(
+                recv_buffer(sz, b), RECV_WR << 16 | b << 8);
+            in_flight++;
+          }
+        }
+      }
+    }
+  });
+}
+
+void SubMeshGroup::all_gather(
+    const array& input,
+    array& output,
+    Stream stream) {
+  if (sub_size_ == 1) {
+    auto in_ptr = input.data<char>();
+    auto out_ptr = output.data<char>();
+    size_t n_bytes = input.nbytes();
+    auto& encoder = cpu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    encoder.dispatch([in_ptr, out_ptr, n_bytes]() {
+      std::memcpy(out_ptr, in_ptr, n_bytes);
+    });
+    return;
+  }
+
+  auto in_ptr = input.data<char>();
+  auto out_ptr = output.data<char>();
+  size_t n_bytes = input.nbytes();
+  auto& encoder = cpu::get_command_encoder(stream);
+  encoder.set_input_array(input);
+  encoder.set_output_array(output);
+  encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
+    // Copy our data to the appropriate position
+    std::memcpy(out_ptr + sub_rank_ * n_bytes, in_ptr, n_bytes);
+    char* our_data = out_ptr + sub_rank_ * n_bytes;
+
+    auto [sz, N] = buffer_size_from_message(n_bytes);
+    constexpr int PIPELINE = 2;
+    int64_t total = static_cast<int64_t>(n_bytes);
+
+    // Exchange with each peer
+    for (int p = 0; p < sub_size_; p++) {
+      if (p == sub_rank_) {
+        continue;
+      }
+      Connection* peer = peer_connections_[p];
+
+      int in_flight = 0;
+      int64_t read_offset = 0;
+      int64_t write_offset = 0;
+
+      // Prefill pipeline
+      int buff = 0;
+      while (read_offset < total && buff < PIPELINE) {
+        peer->post_recv(
+            recv_buffer(sz, buff), RECV_WR << 16 | buff << 8);
+        std::copy(
+            our_data + read_offset,
+            our_data + std::min(read_offset + static_cast<int64_t>(N), total),
+            send_buffer(sz, buff).begin<char>());
+        peer->post_send(
+            send_buffer(sz, buff), SEND_WR << 16 | buff << 8);
+        buff++;
+        in_flight += 2;
+        read_offset += N;
+      }
+
+      // Main loop
+      while (in_flight > 0) {
+        ibv_wc wc[PIPELINE * 2];
+        int n = peer->poll(PIPELINE * 2, wc);
+        for (int i = 0; i < n; i++) {
+          int work_type = wc[i].wr_id >> 16;
+          int b = (wc[i].wr_id >> 8) & 0xff;
+          in_flight--;
+
+          if (work_type == SEND_WR && read_offset < total) {
+            std::copy(
+                our_data + read_offset,
+                our_data + std::min(
+                    read_offset + static_cast<int64_t>(N), total),
+                send_buffer(sz, b).begin<char>());
+            peer->post_send(
+                send_buffer(sz, b), SEND_WR << 16 | b << 8);
+            in_flight++;
+            read_offset += N;
+          } else if (work_type == RECV_WR) {
+            std::copy(
+                recv_buffer(sz, b).begin<char>(),
+                recv_buffer(sz, b).begin<char>() +
+                    std::min(
+                        static_cast<int64_t>(N), total - write_offset),
+                out_ptr + p * n_bytes + write_offset);
+            write_offset += N;
+            if (write_offset + (PIPELINE - 1) * N < total) {
+              peer->post_recv(
+                  recv_buffer(sz, b), RECV_WR << 16 | b << 8);
+              in_flight++;
+            }
+          }
+        }
+      }
+    }
+  });
+}
+
+void SubMeshGroup::send(const array& input, int dst, Stream stream) {
+  int global_dst = global_ranks_[dst];
+  auto data = input.data<char>();
+  int64_t n_bytes = input.nbytes();
+  auto& encoder = cpu::get_command_encoder(stream);
+  encoder.set_input_array(input);
+  encoder.dispatch([data, n_bytes, global_dst, this]() {
+    parent_->mesh_.send(data, n_bytes, global_dst);
+  });
+}
+
+void SubMeshGroup::recv(array& out, int src, Stream stream) {
+  int global_src = global_ranks_[src];
+  auto data = out.data<char>();
+  int64_t n_bytes = out.nbytes();
+  auto& encoder = cpu::get_command_encoder(stream);
+  encoder.set_output_array(out);
+  encoder.dispatch([data, n_bytes, global_src, this]() {
+    parent_->mesh_.recv(data, n_bytes, global_src);
+  });
+}
+
 } // namespace mlx::core::distributed::jaccl

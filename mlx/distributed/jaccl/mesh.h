@@ -11,6 +11,8 @@ using GroupImpl = mlx::core::distributed::detail::GroupImpl;
 
 namespace mlx::core::distributed::jaccl {
 
+class SubMeshGroup;
+
 /**
  * The JACCL communication group for a fully connected mesh. We expect one
  * connection per peer and it should be the lowest latency communication group
@@ -50,11 +52,11 @@ class MeshGroup : public GroupImpl {
     throw std::runtime_error("[jaccl] sum_scatter not supported.");
   }
 
-  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[jaccl] Group split not supported.");
-  }
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override;
 
  private:
+  friend class SubMeshGroup;
+
   template <typename T, typename ReduceOp>
   void all_reduce(
       const array& input,
@@ -84,6 +86,76 @@ class MeshGroup : public GroupImpl {
 
   MeshImpl mesh_;
   RingImpl ring_;
+};
+
+/**
+ * A sub-group created by MeshGroup::split(). Reuses the parent's RDMA
+ * connections but allocates its own buffers. Implements collective operations
+ * (all_sum, all_gather) directly via point-to-point RDMA on the peer
+ * connections rather than delegating to MeshImpl.
+ *
+ * For a 1-node sub-group all operations are identity/no-ops.
+ */
+class SubMeshGroup : public GroupImpl {
+ public:
+  SubMeshGroup(
+      int sub_rank,
+      int sub_size,
+      std::vector<int> global_ranks,
+      MeshGroup* parent);
+
+  Stream communication_stream(StreamOrDevice s) override {
+    return to_stream(s, Device::cpu);
+  }
+
+  int rank() override {
+    return sub_rank_;
+  }
+
+  int size() override {
+    return sub_size_;
+  }
+
+  void all_sum(const array& input, array& output, Stream stream) override;
+  void all_max(const array& input, array& output, Stream stream) override;
+  void all_min(const array& input, array& output, Stream stream) override;
+  void all_gather(const array& input, array& output, Stream stream) override;
+  void send(const array& input, int dst, Stream stream) override;
+  void recv(array& out, int src, Stream stream) override;
+
+  void sum_scatter(const array& input, array& output, Stream stream) override {
+    throw std::runtime_error("[jaccl] SubMeshGroup sum_scatter not supported.");
+  }
+
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
+    throw std::runtime_error("[jaccl] Nested group split not supported.");
+  }
+
+ private:
+  template <typename T, typename ReduceOp>
+  void all_reduce(
+      const array& input,
+      array& output,
+      Stream stream,
+      ReduceOp reduce_op);
+
+  void allocate_buffers();
+
+  SharedBuffer& send_buffer(int sz, int buff) {
+    return send_buffers_[sz * NUM_BUFFERS + buff];
+  }
+
+  SharedBuffer& recv_buffer(int sz, int buff) {
+    return recv_buffers_[sz * NUM_BUFFERS + buff];
+  }
+
+  int sub_rank_;
+  int sub_size_;
+  std::vector<int> global_ranks_;
+  MeshGroup* parent_;
+  std::vector<Connection*> peer_connections_;
+  std::vector<SharedBuffer> send_buffers_;
+  std::vector<SharedBuffer> recv_buffers_;
 };
 
 } // namespace mlx::core::distributed::jaccl
