@@ -139,23 +139,16 @@ class SubMeshGroup : public GroupImpl {
       Stream stream,
       ReduceOp reduce_op);
 
-  void allocate_buffers();
-
-  SharedBuffer& send_buffer(int sz, int buff) {
-    return send_buffers_[sz * NUM_BUFFERS + buff];
-  }
-
-  SharedBuffer& recv_buffer(int sz, int buff) {
-    return recv_buffers_[sz * NUM_BUFFERS + buff];
-  }
+  // Use parent's pre-registered buffers (registered before QP transitions to
+  // RTS). JACCL requires memory registration before QP is in RTS state.
+  SharedBuffer& send_buffer(int sz, int buff);
+  SharedBuffer& recv_buffer(int sz, int buff, int global_peer_rank);
 
   int sub_rank_;
   int sub_size_;
   std::vector<int> global_ranks_;
   MeshGroup* parent_;
   std::vector<Connection*> peer_connections_;
-  std::vector<SharedBuffer> send_buffers_;
-  std::vector<SharedBuffer> recv_buffers_;
 };
 
 } // namespace mlx::core::distributed::jaccl

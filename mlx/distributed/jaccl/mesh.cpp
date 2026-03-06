@@ -300,38 +300,24 @@ SubMeshGroup::SubMeshGroup(
       peer_connections_.push_back(&parent_->connections_[global_ranks_[i]]);
     }
   }
-
-  // Allocate and register buffers for sub-group communication
-  if (sub_size_ > 1) {
-    allocate_buffers();
-  }
+  // No separate buffer allocation — we reuse parent's pre-registered buffers.
+  // JACCL requires ibv_reg_mr before QP transitions to RTS; parent's buffers
+  // satisfy this constraint.
 }
 
-void SubMeshGroup::allocate_buffers() {
-  send_buffers_.clear();
-  recv_buffers_.clear();
+SharedBuffer& SubMeshGroup::send_buffer(int sz, int buff) {
+  // Parent's send buffer (at rank_ index) is registered to ALL peer PDs.
+  return parent_->buffers_[sz * NUM_BUFFERS * parent_->size_ +
+                           buff * parent_->size_ + parent_->rank_];
+}
 
-  // Allocate send and recv buffers for each size class and pipeline slot
-  for (int k = 0; k < BUFFER_SIZES; k++) {
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-      send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-      recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-    }
-  }
-
-  // Register buffers to all peer protection domains
-  for (int i = 0; i < sub_size_; i++) {
-    if (i == sub_rank_) {
-      continue;
-    }
-    ibv_pd* pd = peer_connections_[i]->protection_domain;
-    for (auto& buf : send_buffers_) {
-      buf.register_to_protection_domain(pd);
-    }
-    for (auto& buf : recv_buffers_) {
-      buf.register_to_protection_domain(pd);
-    }
-  }
+SharedBuffer& SubMeshGroup::recv_buffer(
+    int sz,
+    int buff,
+    int global_peer_rank) {
+  // Parent's recv buffer from global_peer_rank, registered to that peer's PD.
+  return parent_->buffers_[sz * NUM_BUFFERS * parent_->size_ +
+                           buff * parent_->size_ + global_peer_rank];
 }
 
 void SubMeshGroup::all_sum(const array& input, array& output, Stream stream) {
@@ -427,7 +413,7 @@ void SubMeshGroup::all_reduce(
       int buff = 0;
       while (read_offset < total && buff < PIPELINE) {
         peer->post_recv(
-            recv_buffer(sz, buff), RECV_WR << 16 | buff << 8);
+            recv_buffer(sz, buff, global_ranks_[p]), RECV_WR << 16 | buff << 8);
         std::copy(
             out_ptr + read_offset,
             out_ptr + std::min(read_offset + N, total),
@@ -501,14 +487,14 @@ void SubMeshGroup::all_reduce(
         while (w < read_offset && completed_recv_end > completed_recv_begin) {
           int b = completed_recv_begin % PIPELINE;
           reduce_op(
-              recv_buffer(sz, b).begin<T>(),
+              recv_buffer(sz, b, global_ranks_[p]).begin<T>(),
               out_ptr + w,
               std::min(N, total - w));
           w += N;
           completed_recv_begin++;
           if (w + (PIPELINE - 1) * N < total) {
             peer->post_recv(
-                recv_buffer(sz, b), RECV_WR << 16 | b << 8);
+                recv_buffer(sz, b, global_ranks_[p]), RECV_WR << 16 | b << 8);
             in_flight++;
           }
         }
@@ -590,7 +576,7 @@ void SubMeshGroup::all_gather(
       int buff = 0;
       while (read_offset < total && buff < PIPELINE) {
         peer->post_recv(
-            recv_buffer(sz, buff), RECV_WR << 16 | buff << 8);
+            recv_buffer(sz, buff, global_ranks_[p]), RECV_WR << 16 | buff << 8);
         std::copy(
             our_data + read_offset,
             our_data + std::min(read_offset + static_cast<int64_t>(N), total),
@@ -657,15 +643,15 @@ void SubMeshGroup::all_gather(
             read_offset += N;
           } else if (work_type == RECV_WR) {
             std::copy(
-                recv_buffer(sz, b).begin<char>(),
-                recv_buffer(sz, b).begin<char>() +
+                recv_buffer(sz, b, global_ranks_[p]).begin<char>(),
+                recv_buffer(sz, b, global_ranks_[p]).begin<char>() +
                     std::min(
                         static_cast<int64_t>(N), total - write_offset),
                 out_ptr + p * n_bytes + write_offset);
             write_offset += N;
             if (write_offset + (PIPELINE - 1) * N < total) {
               peer->post_recv(
-                  recv_buffer(sz, b), RECV_WR << 16 | b << 8);
+                  recv_buffer(sz, b, global_ranks_[p]), RECV_WR << 16 | b << 8);
               in_flight++;
             }
           }
