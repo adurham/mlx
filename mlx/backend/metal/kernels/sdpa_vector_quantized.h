@@ -81,7 +81,8 @@ template <typename T, int D, int V_DIM = D>
   constexpr int v_per_thread = V_DIM / BD;
   // For 8-bit quant: 4 values packed per uint32
   constexpr int pack_factor = 4;
-  constexpr int qk_packed_per_thread = (qk_per_thread + pack_factor - 1) / pack_factor;
+  constexpr int qk_packed_per_thread = qk_per_thread / pack_factor;
+  constexpr int v_packed_per_thread = v_per_thread / pack_factor;
 
   typedef float U;
 
@@ -113,7 +114,7 @@ template <typename T, int D, int V_DIM = D>
 
   // V data pointers
   const device uint32_t* v_d = v_data + kv_head_idx * v_head_stride +
-      simd_gid * v_seq_stride + simd_lid * (v_per_thread / pack_factor);
+      simd_gid * v_seq_stride + simd_lid * v_packed_per_thread;
   const device T* v_s = v_scales + kv_head_idx * vs_head_stride +
       simd_gid * vs_seq_stride;
   const device T* v_b = v_biases + kv_head_idx * vs_head_stride +
@@ -162,17 +163,17 @@ template <typename T, int D, int V_DIM = D>
       use_key = (fmask[0] >= -1e38);
     }
     if (use_key) {
-      // Prefetch both K and V packed data — overlaps memory latency
-      auto k_packed = k_d[0];
-      auto v_packed = v_d[0];
-
-      // Dequantize key
-      int k_group = elem_start / group_size;
-      U ks = static_cast<U>(k_s[k_group]);
-      U kb = static_cast<U>(k_b[k_group]);
-      auto kv = dequant4(k_packed, ks, kb);
-
-      U score = q[0] * kv.v0 + q[1] * kv.v1 + q[2] * kv.v2 + q[3] * kv.v3;
+      // Compute Q·K score across all packed words
+      U score = 0;
+      for (int p = 0; p < qk_packed_per_thread; p++) {
+        auto k_packed = k_d[p];
+        int k_group = (elem_start + p * pack_factor) / group_size;
+        U ks = static_cast<U>(k_s[k_group]);
+        U kb = static_cast<U>(k_b[k_group]);
+        auto kv = dequant4(k_packed, ks, kb);
+        int qi = p * pack_factor;
+        score += q[qi] * kv.v0 + q[qi+1] * kv.v1 + q[qi+2] * kv.v2 + q[qi+3] * kv.v3;
+      }
       score = simd_sum(score);
       if (q_float_mask) {
         score += static_cast<U>(fmask[0]);
@@ -186,16 +187,19 @@ template <typename T, int D, int V_DIM = D>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Dequantize value (using prefetched data)
-      int v_group = v_elem_start / group_size;
-      U vs_val = static_cast<U>(v_s[v_group]);
-      U vb_val = static_cast<U>(v_b[v_group]);
-      auto vv = dequant4(v_packed, vs_val, vb_val);
-
-      o[0] = o[0] * factor + exp_score * vv.v0;
-      o[1] = o[1] * factor + exp_score * vv.v1;
-      o[2] = o[2] * factor + exp_score * vv.v2;
-      o[3] = o[3] * factor + exp_score * vv.v3;
+      // Accumulate V across all packed words
+      for (int p = 0; p < v_packed_per_thread; p++) {
+        auto v_packed = v_d[p];
+        int v_group = (v_elem_start + p * pack_factor) / group_size;
+        U vs_val = static_cast<U>(v_s[v_group]);
+        U vb_val = static_cast<U>(v_b[v_group]);
+        auto vv = dequant4(v_packed, vs_val, vb_val);
+        int oi = p * pack_factor;
+        o[oi]   = o[oi]   * factor + exp_score * vv.v0;
+        o[oi+1] = o[oi+1] * factor + exp_score * vv.v1;
+        o[oi+2] = o[oi+2] * factor + exp_score * vv.v2;
+        o[oi+3] = o[oi+3] * factor + exp_score * vv.v3;
+      }
     }
 
     // Move the pointers to the next kv
@@ -285,7 +289,8 @@ template <typename T, int D, int V_DIM = D>
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V_DIM / BD;
   constexpr int pack_factor = 4;
-  constexpr int qk_packed_per_thread = (qk_per_thread + pack_factor - 1) / pack_factor;
+  constexpr int qk_packed_per_thread = qk_per_thread / pack_factor;
+  constexpr int v_packed_per_thread = v_per_thread / pack_factor;
 
   typedef float U;
 
@@ -321,7 +326,7 @@ template <typename T, int D, int V_DIM = D>
 
   // V data pointers
   const device uint32_t* v_d = v_data + kv_batch_head_idx * v_head_stride +
-      block_idx * v_seq_stride + simd_lid * (v_per_thread / pack_factor);
+      block_idx * v_seq_stride + simd_lid * v_packed_per_thread;
   const device T* v_s = v_scales + kv_batch_head_idx * vs_head_stride +
       block_idx * vs_seq_stride;
   const device T* v_b = v_biases + kv_batch_head_idx * vs_head_stride +
@@ -362,17 +367,17 @@ template <typename T, int D, int V_DIM = D>
       use_key = (fmask[0] >= -1e38);
     }
     if (use_key) {
-      // Prefetch both K and V packed data — overlaps memory latency
-      auto k_packed = k_d[0];
-      auto v_packed = v_d[0];
-
-      // Dequantize key
-      int k_group = elem_start / group_size;
-      U ks = static_cast<U>(k_s[k_group]);
-      U kb = static_cast<U>(k_b[k_group]);
-      auto kv = dequant4(k_packed, ks, kb);
-
-      U score = q[0] * kv.v0 + q[1] * kv.v1 + q[2] * kv.v2 + q[3] * kv.v3;
+      // Compute Q·K score across all packed words
+      U score = 0;
+      for (int p = 0; p < qk_packed_per_thread; p++) {
+        auto k_packed = k_d[p];
+        int k_group = (elem_start + p * pack_factor) / group_size;
+        U ks = static_cast<U>(k_s[k_group]);
+        U kb = static_cast<U>(k_b[k_group]);
+        auto kv = dequant4(k_packed, ks, kb);
+        int qi = p * pack_factor;
+        score += q[qi] * kv.v0 + q[qi+1] * kv.v1 + q[qi+2] * kv.v2 + q[qi+3] * kv.v3;
+      }
       score = simd_sum(score);
 
       if (q_float_mask) {
@@ -387,16 +392,19 @@ template <typename T, int D, int V_DIM = D>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Dequantize value (using prefetched data)
-      int v_group = v_elem_start / group_size;
-      U vs_val = static_cast<U>(v_s[v_group]);
-      U vb_val = static_cast<U>(v_b[v_group]);
-      auto vv = dequant4(v_packed, vs_val, vb_val);
-
-      o[0] = o[0] * factor + exp_score * vv.v0;
-      o[1] = o[1] * factor + exp_score * vv.v1;
-      o[2] = o[2] * factor + exp_score * vv.v2;
-      o[3] = o[3] * factor + exp_score * vv.v3;
+      // Accumulate V across all packed words
+      for (int p = 0; p < v_packed_per_thread; p++) {
+        auto v_packed = v_d[p];
+        int v_group = (v_elem_start + p * pack_factor) / group_size;
+        U vs_val = static_cast<U>(v_s[v_group]);
+        U vb_val = static_cast<U>(v_b[v_group]);
+        auto vv = dequant4(v_packed, vs_val, vb_val);
+        int oi = p * pack_factor;
+        o[oi]   = o[oi]   * factor + exp_score * vv.v0;
+        o[oi+1] = o[oi+1] * factor + exp_score * vv.v1;
+        o[oi+2] = o[oi+2] * factor + exp_score * vv.v2;
+        o[oi+3] = o[oi+3] * factor + exp_score * vv.v3;
+      }
     }
 
     // Move to next block position

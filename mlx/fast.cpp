@@ -907,7 +907,7 @@ array quantized_scaled_dot_product_attention(
         "[quantized_scaled_dot_product_attention] query head_dim must equal "
         "value head_dim");
   }
-  if (D != 64 && D != 96 && D != 128 && D != 256) {
+  if (D != 64 && D != 96 && D != 128 && D != 256 && D != 512) {
     throw std::invalid_argument(
         "[quantized_scaled_dot_product_attention] unsupported head_dim");
   }
