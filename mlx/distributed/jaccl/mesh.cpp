@@ -179,8 +179,20 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   int64_t n_bytes = input.nbytes();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
-  encoder.dispatch(
-      [data, n_bytes, dst, this]() { mesh_.send(data, n_bytes, dst); });
+  encoder.dispatch([data, n_bytes, dst, this]() {
+    fprintf(
+        stderr,
+        "[MeshGroup::send R%d] sending %lld bytes to dst=%d\n",
+        rank_,
+        (long long)n_bytes,
+        dst);
+    mesh_.send(data, n_bytes, dst);
+    fprintf(
+        stderr,
+        "[MeshGroup::send R%d] send complete to dst=%d\n",
+        rank_,
+        dst);
+  });
 }
 
 void MeshGroup::recv(array& out, int src, Stream stream) {
@@ -188,8 +200,20 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   int64_t n_bytes = out.nbytes();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
-  encoder.dispatch(
-      [data, n_bytes, src, this]() { mesh_.recv(data, n_bytes, src); });
+  encoder.dispatch([data, n_bytes, src, this]() {
+    fprintf(
+        stderr,
+        "[MeshGroup::recv R%d] receiving %lld bytes from src=%d\n",
+        rank_,
+        (long long)n_bytes,
+        src);
+    mesh_.recv(data, n_bytes, src);
+    fprintf(
+        stderr,
+        "[MeshGroup::recv R%d] recv complete from src=%d\n",
+        rank_,
+        src);
+  });
 }
 
 template <typename T, typename ReduceOp>
@@ -370,12 +394,29 @@ void SubMeshGroup::all_reduce(
     constexpr int PIPELINE = 2;
     int64_t total = count;
 
+    fprintf(
+        stderr,
+        "[SubMeshGroup::all_reduce R%d] count=%lld sz=%d N=%lld total=%lld sub_size=%d\n",
+        sub_rank_,
+        (long long)count,
+        sz,
+        (long long)N,
+        (long long)total,
+        sub_size_);
+
     // Exchange with each peer and reduce
     for (int p = 0; p < sub_size_; p++) {
       if (p == sub_rank_) {
         continue;
       }
       Connection* peer = peer_connections_[p];
+
+      fprintf(
+          stderr,
+          "[SubMeshGroup::all_reduce R%d] exchanging with peer %d (global %d)\n",
+          sub_rank_,
+          p,
+          global_ranks_[p]);
 
       int in_flight = 0;
       int64_t read_offset = 0;
@@ -398,14 +439,48 @@ void SubMeshGroup::all_reduce(
         read_offset += N;
       }
 
+      fprintf(
+          stderr,
+          "[SubMeshGroup::all_reduce R%d] prefill done: in_flight=%d read_offset=%lld\n",
+          sub_rank_,
+          in_flight,
+          (long long)read_offset);
+
       // Main loop
+      int poll_count = 0;
       while (in_flight > 0) {
         ibv_wc wc[PIPELINE * 2];
         int n = peer->poll(PIPELINE * 2, wc);
+        if (n > 0) {
+          fprintf(
+              stderr,
+              "[SubMeshGroup::all_reduce R%d] poll returned %d completions, in_flight=%d\n",
+              sub_rank_,
+              n,
+              in_flight);
+        }
+        poll_count++;
+        if (poll_count == 1000000 && n == 0) {
+          fprintf(
+              stderr,
+              "[SubMeshGroup::all_reduce R%d] WARNING: 1M polls with no completions, in_flight=%d\n",
+              sub_rank_,
+              in_flight);
+          poll_count = 0;
+        }
         for (int i = 0; i < n; i++) {
           int work_type = wc[i].wr_id >> 16;
           int b = (wc[i].wr_id >> 8) & 0xff;
           in_flight--;
+
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(
+                stderr,
+                "[SubMeshGroup::all_reduce R%d] ERROR: wc status=%d for wr_id=%llu\n",
+                sub_rank_,
+                wc[i].status,
+                (unsigned long long)wc[i].wr_id);
+          }
 
           if (work_type == SEND_WR && read_offset < total) {
             std::copy(
@@ -438,7 +513,16 @@ void SubMeshGroup::all_reduce(
           }
         }
       }
+      fprintf(
+          stderr,
+          "[SubMeshGroup::all_reduce R%d] peer %d exchange complete\n",
+          sub_rank_,
+          p);
     }
+    fprintf(
+        stderr,
+        "[SubMeshGroup::all_reduce R%d] all_reduce complete\n",
+        sub_rank_);
   });
 }
 
@@ -474,12 +558,29 @@ void SubMeshGroup::all_gather(
     constexpr int PIPELINE = 2;
     int64_t total = static_cast<int64_t>(n_bytes);
 
+    fprintf(
+        stderr,
+        "[SubMeshGroup::all_gather R%d] n_bytes=%zu sz=%d N=%lld total=%lld sub_size=%d\n",
+        sub_rank_,
+        n_bytes,
+        sz,
+        (long long)N,
+        (long long)total,
+        sub_size_);
+
     // Exchange with each peer
     for (int p = 0; p < sub_size_; p++) {
       if (p == sub_rank_) {
         continue;
       }
       Connection* peer = peer_connections_[p];
+
+      fprintf(
+          stderr,
+          "[SubMeshGroup::all_gather R%d] exchanging with peer %d (global %d)\n",
+          sub_rank_,
+          p,
+          global_ranks_[p]);
 
       int in_flight = 0;
       int64_t read_offset = 0;
@@ -501,14 +602,48 @@ void SubMeshGroup::all_gather(
         read_offset += N;
       }
 
+      fprintf(
+          stderr,
+          "[SubMeshGroup::all_gather R%d] prefill done: in_flight=%d read_offset=%lld\n",
+          sub_rank_,
+          in_flight,
+          (long long)read_offset);
+
       // Main loop
+      int poll_count = 0;
       while (in_flight > 0) {
         ibv_wc wc[PIPELINE * 2];
         int n = peer->poll(PIPELINE * 2, wc);
+        if (n > 0) {
+          fprintf(
+              stderr,
+              "[SubMeshGroup::all_gather R%d] poll returned %d completions, in_flight=%d\n",
+              sub_rank_,
+              n,
+              in_flight);
+        }
+        poll_count++;
+        if (poll_count == 1000000 && n == 0) {
+          fprintf(
+              stderr,
+              "[SubMeshGroup::all_gather R%d] WARNING: 1M polls with no completions, in_flight=%d\n",
+              sub_rank_,
+              in_flight);
+          poll_count = 0;
+        }
         for (int i = 0; i < n; i++) {
           int work_type = wc[i].wr_id >> 16;
           int b = (wc[i].wr_id >> 8) & 0xff;
           in_flight--;
+
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(
+                stderr,
+                "[SubMeshGroup::all_gather R%d] ERROR: wc status=%d for wr_id=%llu\n",
+                sub_rank_,
+                wc[i].status,
+                (unsigned long long)wc[i].wr_id);
+          }
 
           if (work_type == SEND_WR && read_offset < total) {
             std::copy(
@@ -536,7 +671,16 @@ void SubMeshGroup::all_gather(
           }
         }
       }
+      fprintf(
+          stderr,
+          "[SubMeshGroup::all_gather R%d] peer %d exchange complete\n",
+          sub_rank_,
+          p);
     }
+    fprintf(
+        stderr,
+        "[SubMeshGroup::all_gather R%d] all_gather complete\n",
+        sub_rank_);
   });
 }
 
@@ -546,8 +690,20 @@ void SubMeshGroup::send(const array& input, int dst, Stream stream) {
   int64_t n_bytes = input.nbytes();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
-  encoder.dispatch([data, n_bytes, global_dst, this]() {
+  encoder.dispatch([data, n_bytes, global_dst, dst, this]() {
+    fprintf(
+        stderr,
+        "[SubMeshGroup::send R%d] sending %lld bytes to sub_dst=%d global_dst=%d\n",
+        sub_rank_,
+        (long long)n_bytes,
+        dst,
+        global_dst);
     parent_->mesh_.send(data, n_bytes, global_dst);
+    fprintf(
+        stderr,
+        "[SubMeshGroup::send R%d] send complete to global_dst=%d\n",
+        sub_rank_,
+        global_dst);
   });
 }
 
@@ -557,8 +713,20 @@ void SubMeshGroup::recv(array& out, int src, Stream stream) {
   int64_t n_bytes = out.nbytes();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
-  encoder.dispatch([data, n_bytes, global_src, this]() {
+  encoder.dispatch([data, n_bytes, global_src, src, this]() {
+    fprintf(
+        stderr,
+        "[SubMeshGroup::recv R%d] receiving %lld bytes from sub_src=%d global_src=%d\n",
+        sub_rank_,
+        (long long)n_bytes,
+        src,
+        global_src);
     parent_->mesh_.recv(data, n_bytes, global_src);
+    fprintf(
+        stderr,
+        "[SubMeshGroup::recv R%d] recv complete from global_src=%d\n",
+        sub_rank_,
+        global_src);
   });
 }
 
