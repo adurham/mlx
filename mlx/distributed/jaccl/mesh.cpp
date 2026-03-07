@@ -201,7 +201,16 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
+    auto t0 = std::chrono::steady_clock::now();
     mesh_.all_gather(in_ptr, out_ptr, n_bytes);
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    fprintf(
+        stderr,
+        "[MeshGroup::all_gather R%d] %zu bytes in %.2fms\n",
+        rank_,
+        n_bytes,
+        us / 1000.0);
   });
 }
 
@@ -211,6 +220,7 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, dst, this]() {
+    auto t0 = std::chrono::steady_clock::now();
     fprintf(
         stderr,
         "[MeshGroup::send R%d] sending %lld bytes to dst=%d\n",
@@ -218,11 +228,14 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
         (long long)n_bytes,
         dst);
     mesh_.send(data, n_bytes, dst);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
     fprintf(
         stderr,
-        "[MeshGroup::send R%d] send complete to dst=%d\n",
+        "[MeshGroup::send R%d] send complete to dst=%d in %.2fms\n",
         rank_,
-        dst);
+        dst,
+        us / 1000.0);
   });
 }
 
@@ -232,6 +245,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, src, this]() {
+    auto t0 = std::chrono::steady_clock::now();
     fprintf(
         stderr,
         "[MeshGroup::recv R%d] receiving %lld bytes from src=%d\n",
@@ -239,11 +253,14 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
         (long long)n_bytes,
         src);
     mesh_.recv(data, n_bytes, src);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
     fprintf(
         stderr,
-        "[MeshGroup::recv R%d] recv complete from src=%d\n",
+        "[MeshGroup::recv R%d] recv complete from src=%d in %.2fms\n",
         rank_,
-        src);
+        src,
+        us / 1000.0);
   });
 }
 
@@ -260,6 +277,7 @@ void MeshGroup::all_reduce(
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, size, this, reduce_op]() {
+    auto t0 = std::chrono::steady_clock::now();
     if (size_ > 2 &&
         ((std::is_same_v<T, bfloat16_t> && size > 65536) ||
          size >= 8 * 1024 * 1024 / sizeof(T))) {
@@ -267,6 +285,15 @@ void MeshGroup::all_reduce(
     } else {
       mesh_.all_reduce(in_ptr, out_ptr, size, reduce_op);
     }
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    fprintf(
+        stderr,
+        "[MeshGroup::all_reduce R%d] %lld elems (%lld bytes) in %.2fms\n",
+        rank_,
+        (long long)size,
+        (long long)(size * sizeof(T)),
+        us / 1000.0);
   });
 }
 
@@ -396,6 +423,7 @@ void SubMeshGroup::all_reduce(
     int64_t N = buffer_size / sizeof(T);
     constexpr int PIPELINE = 2;
     int64_t total = count;
+    auto t_all_reduce_start = std::chrono::steady_clock::now();
 
     fprintf(
         stderr,
@@ -532,10 +560,15 @@ void SubMeshGroup::all_reduce(
           sub_rank_,
           p);
     }
+    auto t_all_reduce_end = std::chrono::steady_clock::now();
+    auto all_reduce_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        t_all_reduce_end - t_all_reduce_start).count();
     fprintf(
         stderr,
-        "[SubMeshGroup::all_reduce R%d] all_reduce complete\n",
-        sub_rank_);
+        "[SubMeshGroup::all_reduce R%d] complete %lld bytes in %.2fms\n",
+        sub_rank_,
+        (long long)(count * sizeof(T)),
+        all_reduce_us / 1000.0);
   });
 }
 
@@ -563,6 +596,7 @@ void SubMeshGroup::all_gather(
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
+    auto t_gather_start = std::chrono::steady_clock::now();
     // Copy our data to the appropriate position
     std::memcpy(out_ptr + sub_rank_ * n_bytes, in_ptr, n_bytes);
     char* our_data = out_ptr + sub_rank_ * n_bytes;
@@ -700,10 +734,15 @@ void SubMeshGroup::all_gather(
           sub_rank_,
           p);
     }
+    auto t_gather_end = std::chrono::steady_clock::now();
+    auto gather_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        t_gather_end - t_gather_start).count();
     fprintf(
         stderr,
-        "[SubMeshGroup::all_gather R%d] all_gather complete\n",
-        sub_rank_);
+        "[SubMeshGroup::all_gather R%d] complete %zu bytes in %.2fms\n",
+        sub_rank_,
+        n_bytes,
+        gather_us / 1000.0);
   });
 }
 
@@ -714,6 +753,7 @@ void SubMeshGroup::send(const array& input, int dst, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, global_dst, dst, this]() {
+    auto t0 = std::chrono::steady_clock::now();
     fprintf(
         stderr,
         "[SubMeshGroup::send R%d] sending %lld bytes to sub_dst=%d global_dst=%d\n",
@@ -722,11 +762,14 @@ void SubMeshGroup::send(const array& input, int dst, Stream stream) {
         dst,
         global_dst);
     parent_->mesh_.send(data, n_bytes, global_dst);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
     fprintf(
         stderr,
-        "[SubMeshGroup::send R%d] send complete to global_dst=%d\n",
+        "[SubMeshGroup::send R%d] send complete to global_dst=%d in %.2fms\n",
         sub_rank_,
-        global_dst);
+        global_dst,
+        us / 1000.0);
   });
 }
 
@@ -737,6 +780,7 @@ void SubMeshGroup::recv(array& out, int src, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, global_src, src, this]() {
+    auto t0 = std::chrono::steady_clock::now();
     fprintf(
         stderr,
         "[SubMeshGroup::recv R%d] receiving %lld bytes from sub_src=%d global_src=%d\n",
@@ -745,11 +789,14 @@ void SubMeshGroup::recv(array& out, int src, Stream stream) {
         src,
         global_src);
     parent_->mesh_.recv(data, n_bytes, global_src);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
     fprintf(
         stderr,
-        "[SubMeshGroup::recv R%d] recv complete from global_src=%d\n",
+        "[SubMeshGroup::recv R%d] recv complete from global_src=%d in %.2fms\n",
         sub_rank_,
-        global_src);
+        global_src,
+        us / 1000.0);
   });
 }
 
