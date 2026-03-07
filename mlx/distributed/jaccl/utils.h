@@ -4,6 +4,7 @@
 
 #include <infiniband/verbs.h>
 
+#include <cstdlib>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -16,8 +17,14 @@ constexpr int RECV_WR = 2;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;
-constexpr int NUM_BUFFERS = 2;
-constexpr int FRAME_SIZE = 4096;
+
+inline int env_int(const char* name, int fallback) {
+  const char* v = std::getenv(name);
+  return v ? std::atoi(v) : fallback;
+}
+
+inline const int NUM_BUFFERS = env_int("MLX_JACCL_NUM_BUFFERS", 2);
+inline const int FRAME_SIZE = env_int("MLX_JACCL_FRAME_SIZE", 4096);
 
 namespace detail = mlx::core::distributed::detail;
 
