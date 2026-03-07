@@ -5,7 +5,16 @@
 #include "mlx/distributed/reduction_ops.h"
 #include "mlx/dtype_utils.h"
 
+#include <chrono>
+
 namespace mlx::core::distributed::jaccl {
+
+// Ensure stderr is unbuffered so RDMA diagnostic logs are visible
+// even when stderr is redirected to a file.
+static bool _stderr_unbuffered = [] {
+  setvbuf(stderr, nullptr, _IONBF, 0);
+  return true;
+}();
 
 MeshGroup::MeshGroup(
     int rank,
@@ -101,9 +110,13 @@ void MeshGroup::allocate_buffers() {
         ring_send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
         ring_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
       }
-      // Sub-group buffers (for split() sub-groups)
-      sub_send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-      sub_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+      // Sub-group buffers (for split() sub-groups).
+      // Only needed for 3+ node meshes (hybrid TP+PP).
+      // Skipped for size_ <= 2 to stay within per-PD MR limits.
+      if (size_ > 2) {
+        sub_send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        sub_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+      }
     }
   }
 
@@ -144,13 +157,15 @@ void MeshGroup::allocate_buffers() {
           .register_to_protection_domain(connections_[right].protection_domain);
 
       // Sub-group buffers: register to ALL peer PDs so any sub-group
-      // configuration can use them.
-      for (auto& conn : connections_) {
-        if (conn.ctx != nullptr) {
-          sub_send_buffers_[k * NUM_BUFFERS + i]
-              .register_to_protection_domain(conn.protection_domain);
-          sub_recv_buffers_[k * NUM_BUFFERS + i]
-              .register_to_protection_domain(conn.protection_domain);
+      // configuration can use them. Only allocated for 3+ node meshes.
+      if (size_ > 2) {
+        for (auto& conn : connections_) {
+          if (conn.ctx != nullptr) {
+            sub_send_buffers_[k * NUM_BUFFERS + i]
+                .register_to_protection_domain(conn.protection_domain);
+            sub_recv_buffers_[k * NUM_BUFFERS + i]
+                .register_to_protection_domain(conn.protection_domain);
+          }
         }
       }
     }
@@ -435,26 +450,36 @@ void SubMeshGroup::all_reduce(
           (long long)read_offset);
 
       // Main loop
-      int poll_count = 0;
+      auto stall_start = std::chrono::steady_clock::now();
+      bool stall_logged = false;
       while (in_flight > 0) {
         ibv_wc wc[PIPELINE * 2];
         int n = peer->poll(PIPELINE * 2, wc);
         if (n > 0) {
+          stall_start = std::chrono::steady_clock::now();
+          stall_logged = false;
           fprintf(
               stderr,
               "[SubMeshGroup::all_reduce R%d] poll returned %d completions, in_flight=%d\n",
               sub_rank_,
               n,
               in_flight);
-        }
-        poll_count++;
-        if (poll_count == 1000000 && n == 0) {
-          fprintf(
-              stderr,
-              "[SubMeshGroup::all_reduce R%d] WARNING: 1M polls with no completions, in_flight=%d\n",
-              sub_rank_,
-              in_flight);
-          poll_count = 0;
+        } else {
+          auto now = std::chrono::steady_clock::now();
+          auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - stall_start).count();
+          if (stall_ms >= 5000 && !stall_logged) {
+            stall_logged = true;
+            fprintf(
+                stderr,
+                "[SubMeshGroup::all_reduce R%d] STALL: no completions for %lldms, "
+                "in_flight=%d, read_offset=%lld/%lld\n",
+                sub_rank_,
+                (long long)stall_ms,
+                in_flight,
+                (long long)read_offset,
+                (long long)total);
+          }
         }
         for (int i = 0; i < n; i++) {
           int work_type = wc[i].wr_id >> 16;
@@ -598,26 +623,36 @@ void SubMeshGroup::all_gather(
           (long long)read_offset);
 
       // Main loop
-      int poll_count = 0;
+      auto stall_start = std::chrono::steady_clock::now();
+      bool stall_logged = false;
       while (in_flight > 0) {
         ibv_wc wc[PIPELINE * 2];
         int n = peer->poll(PIPELINE * 2, wc);
         if (n > 0) {
+          stall_start = std::chrono::steady_clock::now();
+          stall_logged = false;
           fprintf(
               stderr,
               "[SubMeshGroup::all_gather R%d] poll returned %d completions, in_flight=%d\n",
               sub_rank_,
               n,
               in_flight);
-        }
-        poll_count++;
-        if (poll_count == 1000000 && n == 0) {
-          fprintf(
-              stderr,
-              "[SubMeshGroup::all_gather R%d] WARNING: 1M polls with no completions, in_flight=%d\n",
-              sub_rank_,
-              in_flight);
-          poll_count = 0;
+        } else {
+          auto now = std::chrono::steady_clock::now();
+          auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - stall_start).count();
+          if (stall_ms >= 5000 && !stall_logged) {
+            stall_logged = true;
+            fprintf(
+                stderr,
+                "[SubMeshGroup::all_gather R%d] STALL: no completions for %lldms, "
+                "in_flight=%d, read_offset=%lld/%lld\n",
+                sub_rank_,
+                (long long)stall_ms,
+                in_flight,
+                (long long)read_offset,
+                (long long)total);
+          }
         }
         for (int i = 0; i < n; i++) {
           int work_type = wc[i].wr_id >> 16;
