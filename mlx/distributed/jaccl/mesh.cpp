@@ -16,6 +16,14 @@ static bool _stderr_unbuffered = [] {
   return true;
 }();
 
+// Gate verbose RDMA tracing behind EXO_TRACING_ENABLED=true
+static bool _jaccl_trace = [] {
+  const char* v = std::getenv("EXO_TRACING_ENABLED");
+  return v && (std::string(v) == "true" || std::string(v) == "1");
+}();
+
+#define JACCL_TRACE(...) do { if (_jaccl_trace) fprintf(stderr, __VA_ARGS__); } while(0)
+
 MeshGroup::MeshGroup(
     int rank,
     const std::vector<std::string>& device_names,
@@ -205,8 +213,7 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
     mesh_.all_gather(in_ptr, out_ptr, n_bytes);
     auto t1 = std::chrono::steady_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[MeshGroup::all_gather R%d] %zu bytes in %.2fms\n",
         rank_,
         n_bytes,
@@ -221,8 +228,7 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, dst, this]() {
     auto t0 = std::chrono::steady_clock::now();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[MeshGroup::send R%d] sending %lld bytes to dst=%d\n",
         rank_,
         (long long)n_bytes,
@@ -230,8 +236,7 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
     mesh_.send(data, n_bytes, dst);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[MeshGroup::send R%d] send complete to dst=%d in %.2fms\n",
         rank_,
         dst,
@@ -246,8 +251,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, src, this]() {
     auto t0 = std::chrono::steady_clock::now();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[MeshGroup::recv R%d] receiving %lld bytes from src=%d\n",
         rank_,
         (long long)n_bytes,
@@ -255,8 +259,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
     mesh_.recv(data, n_bytes, src);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[MeshGroup::recv R%d] recv complete from src=%d in %.2fms\n",
         rank_,
         src,
@@ -287,8 +290,7 @@ void MeshGroup::all_reduce(
     }
     auto t1 = std::chrono::steady_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[MeshGroup::all_reduce R%d] %lld elems (%lld bytes) in %.2fms\n",
         rank_,
         (long long)size,
@@ -425,8 +427,7 @@ void SubMeshGroup::all_reduce(
     int64_t total = count;
     auto t_all_reduce_start = std::chrono::steady_clock::now();
 
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::all_reduce R%d] count=%lld sz=%d N=%lld total=%lld sub_size=%d\n",
         sub_rank_,
         (long long)count,
@@ -442,8 +443,7 @@ void SubMeshGroup::all_reduce(
       }
       Connection* peer = peer_connections_[p];
 
-      fprintf(
-          stderr,
+      JACCL_TRACE(
           "[SubMeshGroup::all_reduce R%d] exchanging with peer %d (global %d)\n",
           sub_rank_,
           p,
@@ -470,8 +470,7 @@ void SubMeshGroup::all_reduce(
         read_offset += N;
       }
 
-      fprintf(
-          stderr,
+      JACCL_TRACE(
           "[SubMeshGroup::all_reduce R%d] prefill done: in_flight=%d read_offset=%lld\n",
           sub_rank_,
           in_flight,
@@ -486,8 +485,7 @@ void SubMeshGroup::all_reduce(
         if (n > 0) {
           stall_start = std::chrono::steady_clock::now();
           stall_logged = false;
-          fprintf(
-              stderr,
+          JACCL_TRACE(
               "[SubMeshGroup::all_reduce R%d] poll returned %d completions, in_flight=%d\n",
               sub_rank_,
               n,
@@ -554,8 +552,7 @@ void SubMeshGroup::all_reduce(
           }
         }
       }
-      fprintf(
-          stderr,
+      JACCL_TRACE(
           "[SubMeshGroup::all_reduce R%d] peer %d exchange complete\n",
           sub_rank_,
           p);
@@ -563,8 +560,7 @@ void SubMeshGroup::all_reduce(
     auto t_all_reduce_end = std::chrono::steady_clock::now();
     auto all_reduce_us = std::chrono::duration_cast<std::chrono::microseconds>(
         t_all_reduce_end - t_all_reduce_start).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::all_reduce R%d] complete %lld bytes in %.2fms\n",
         sub_rank_,
         (long long)(count * sizeof(T)),
@@ -605,8 +601,7 @@ void SubMeshGroup::all_gather(
     constexpr int PIPELINE = 2;
     int64_t total = static_cast<int64_t>(n_bytes);
 
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::all_gather R%d] n_bytes=%zu sz=%d N=%lld total=%lld sub_size=%d\n",
         sub_rank_,
         n_bytes,
@@ -622,8 +617,7 @@ void SubMeshGroup::all_gather(
       }
       Connection* peer = peer_connections_[p];
 
-      fprintf(
-          stderr,
+      JACCL_TRACE(
           "[SubMeshGroup::all_gather R%d] exchanging with peer %d (global %d)\n",
           sub_rank_,
           p,
@@ -649,8 +643,7 @@ void SubMeshGroup::all_gather(
         read_offset += N;
       }
 
-      fprintf(
-          stderr,
+      JACCL_TRACE(
           "[SubMeshGroup::all_gather R%d] prefill done: in_flight=%d read_offset=%lld\n",
           sub_rank_,
           in_flight,
@@ -665,8 +658,7 @@ void SubMeshGroup::all_gather(
         if (n > 0) {
           stall_start = std::chrono::steady_clock::now();
           stall_logged = false;
-          fprintf(
-              stderr,
+          JACCL_TRACE(
               "[SubMeshGroup::all_gather R%d] poll returned %d completions, in_flight=%d\n",
               sub_rank_,
               n,
@@ -728,8 +720,7 @@ void SubMeshGroup::all_gather(
           }
         }
       }
-      fprintf(
-          stderr,
+      JACCL_TRACE(
           "[SubMeshGroup::all_gather R%d] peer %d exchange complete\n",
           sub_rank_,
           p);
@@ -737,8 +728,7 @@ void SubMeshGroup::all_gather(
     auto t_gather_end = std::chrono::steady_clock::now();
     auto gather_us = std::chrono::duration_cast<std::chrono::microseconds>(
         t_gather_end - t_gather_start).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::all_gather R%d] complete %zu bytes in %.2fms\n",
         sub_rank_,
         n_bytes,
@@ -754,8 +744,7 @@ void SubMeshGroup::send(const array& input, int dst, Stream stream) {
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, global_dst, dst, this]() {
     auto t0 = std::chrono::steady_clock::now();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::send R%d] sending %lld bytes to sub_dst=%d global_dst=%d\n",
         sub_rank_,
         (long long)n_bytes,
@@ -764,8 +753,7 @@ void SubMeshGroup::send(const array& input, int dst, Stream stream) {
     parent_->mesh_.send(data, n_bytes, global_dst);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::send R%d] send complete to global_dst=%d in %.2fms\n",
         sub_rank_,
         global_dst,
@@ -781,8 +769,7 @@ void SubMeshGroup::recv(array& out, int src, Stream stream) {
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, global_src, src, this]() {
     auto t0 = std::chrono::steady_clock::now();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::recv R%d] receiving %lld bytes from sub_src=%d global_src=%d\n",
         sub_rank_,
         (long long)n_bytes,
@@ -791,8 +778,7 @@ void SubMeshGroup::recv(array& out, int src, Stream stream) {
     parent_->mesh_.recv(data, n_bytes, global_src);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    fprintf(
-        stderr,
+    JACCL_TRACE(
         "[SubMeshGroup::recv R%d] recv complete from global_src=%d in %.2fms\n",
         sub_rank_,
         global_src,
