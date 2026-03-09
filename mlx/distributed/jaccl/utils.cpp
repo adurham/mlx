@@ -228,14 +228,14 @@ void Connection::queue_pair_rtr(const Destination& dst) {
   memset(&attr, 0, sizeof(attr));
   attr.qp_state = IBV_QPS_RTR;
 
-  // Query the port's active MTU instead of hardcoding IBV_MTU_1024.
-  // Different Thunderbolt generations (TB4 vs TB5) may negotiate different MTUs,
-  // and using an unsupported MTU causes EINVAL on ibv_modify_qp.
+  // Use the port's active MTU but cap at IBV_MTU_1024.
+  // Some TB5↔TB5 links report active_mtu=4096 but reject it in
+  // ibv_modify_qp when GRH (is_global=1) is enabled.
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
   auto mtu = port_attr.active_mtu;
-  if (mtu == 0 || mtu > IBV_MTU_4096) {
-    mtu = IBV_MTU_1024; // Fallback to safe default
+  if (mtu == 0 || mtu > IBV_MTU_1024) {
+    mtu = IBV_MTU_1024;
   }
   attr.path_mtu = static_cast<ibv_mtu>(mtu);
 
