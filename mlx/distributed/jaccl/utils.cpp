@@ -208,20 +208,11 @@ const Destination& Connection::info() {
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
 
-  // Try GID index 1, fall back to index 0 if empty.
-  // Some RDMA devices (e.g. Studio↔Studio TB5 links) only populate index 0.
+  // Always use GID index 0 (link-local, guaranteed populated for active links).
+  // Different devices may have different GID types at index 1 (IPv4-mapped vs
+  // zero), causing GID type mismatch and EINVAL from ibv_modify_qp RTR.
   ibv_gid gid;
-  ibv().query_gid(ctx, 1, 1, &gid);
-  bool gid_is_zero = true;
-  for (int i = 0; i < 16; i++) {
-    if (gid.raw[i]) {
-      gid_is_zero = false;
-      break;
-    }
-  }
-  if (gid_is_zero) {
-    ibv().query_gid(ctx, 1, 0, &gid);
-  }
+  ibv().query_gid(ctx, 1, 0, &gid);
 
   src.local_id = port_attr.lid;
   src.queue_pair_number = queue_pair->qp_num;
@@ -278,17 +269,8 @@ void Connection::queue_pair_rtr(const Destination& dst) {
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = dst.global_identifier;
 
-    // Determine local sgid_index: use index 1 if valid, else fall back to 0.
-    ibv_gid local_gid;
-    ibv().query_gid(ctx, 1, 1, &local_gid);
-    bool local_gid1_zero = true;
-    for (int i = 0; i < 16; i++) {
-      if (local_gid.raw[i]) {
-        local_gid1_zero = false;
-        break;
-      }
-    }
-    attr.ah_attr.grh.sgid_index = local_gid1_zero ? 0 : 1;
+    // Always use GID index 0 to match info() and avoid GID type mismatch.
+    attr.ah_attr.grh.sgid_index = 0;
   }
 
   // Diagnostic: log RTR parameters
