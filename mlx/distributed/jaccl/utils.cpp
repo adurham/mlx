@@ -230,12 +230,34 @@ void Connection::queue_pair_rtr(const Destination& dst) {
     attr.ah_attr.grh.sgid_index = 1;
   }
 
+  // Diagnostic: log RTR parameters
+  {
+    auto& g = dst.global_identifier;
+    std::ostringstream diag;
+    diag << "[jaccl-diag] RTR: dst_lid=" << dst.local_id
+         << " dst_qpn=" << dst.queue_pair_number
+         << " dst_psn=" << dst.packet_sequence_number
+         << " is_global=" << attr.ah_attr.is_global
+         << " src_lid=" << src.local_id
+         << " src_qpn=" << (queue_pair ? queue_pair->qp_num : -1)
+         << " gid=";
+    for (int i = 0; i < 16; i++) {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%02x", g.raw[i]);
+      diag << buf;
+    }
+    std::cerr << diag.str() << std::endl;
+  }
+
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
       IBV_QP_RQ_PSN;
 
   if (int status = ibv().modify_qp(queue_pair, &attr, mask); status != 0) {
     std::ostringstream msg;
-    msg << "[jaccl] Changing queue pair to RTR failed with errno " << status;
+    msg << "[jaccl] Changing queue pair to RTR failed with errno " << status
+        << " dst_lid=" << dst.local_id
+        << " dst_qpn=" << dst.queue_pair_number
+        << " is_global=" << attr.ah_attr.is_global;
     throw std::invalid_argument(msg.str());
   }
 }

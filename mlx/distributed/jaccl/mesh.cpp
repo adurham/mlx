@@ -6,6 +6,7 @@
 #include "mlx/dtype_utils.h"
 
 #include <chrono>
+#include <iostream>
 
 namespace mlx::core::distributed::jaccl {
 
@@ -93,6 +94,8 @@ void MeshGroup::initialize() {
       continue;
     }
     auto peer_info = all_infos[peer][rank_];
+    std::cerr << "[jaccl-diag] rank=" << rank_ << " transitioning peer=" << peer
+              << " (size=" << size_ << ")" << std::endl;
     connections_[peer].queue_pair_rtr(peer_info);
     connections_[peer].queue_pair_rts();
   }
