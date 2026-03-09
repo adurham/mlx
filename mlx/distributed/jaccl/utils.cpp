@@ -208,11 +208,21 @@ const Destination& Connection::info() {
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
 
-  // Always use GID index 0 (link-local, guaranteed populated for active links).
-  // Different devices may have different GID types at index 1 (IPv4-mapped vs
-  // zero), causing GID type mismatch and EINVAL from ibv_modify_qp RTR.
+  // Try GID index 1 (IPv4-mapped, routable) first. If zero, fall back to
+  // index 0 (link-local). The RTR code uses LID-only addressing for
+  // link-local GIDs since Apple's TB5 RDMA stack doesn't support GRH with them.
   ibv_gid gid;
-  ibv().query_gid(ctx, 1, 0, &gid);
+  ibv().query_gid(ctx, 1, 1, &gid);
+  bool gid_is_zero = true;
+  for (int i = 0; i < 16; i++) {
+    if (gid.raw[i]) {
+      gid_is_zero = false;
+      break;
+    }
+  }
+  if (gid_is_zero) {
+    ibv().query_gid(ctx, 1, 0, &gid);
+  }
 
   src.local_id = port_attr.lid;
   src.queue_pair_number = queue_pair->qp_num;
@@ -264,13 +274,20 @@ void Connection::queue_pair_rtr(const Destination& dst) {
   attr.ah_attr.port_num = 1;
   attr.ah_attr.is_global = 0;
 
+  // Enable GRH only if the remote endpoint has a routable (non-link-local) GID.
+  // Apple's TB5 RDMA stack times out with GRH + link-local fe80:: GIDs.
+  // IPv4-mapped GIDs (from GID index 1) work; link-local GIDs (index 0) don't.
+  // When GID index 1 is zero (no routable GID), use LID-only addressing.
   if (dst.global_identifier.global.interface_id) {
-    attr.ah_attr.is_global = 1;
-    attr.ah_attr.grh.hop_limit = 1;
-    attr.ah_attr.grh.dgid = dst.global_identifier;
-
-    // Always use GID index 0 to match info() and avoid GID type mismatch.
-    attr.ah_attr.grh.sgid_index = 0;
+    // Check if this is a link-local GID (fe80::) — first 2 bytes = 0xfe80
+    bool is_link_local = (dst.global_identifier.raw[0] == 0xfe &&
+                          dst.global_identifier.raw[1] == 0x80);
+    if (!is_link_local) {
+      attr.ah_attr.is_global = 1;
+      attr.ah_attr.grh.hop_limit = 1;
+      attr.ah_attr.grh.dgid = dst.global_identifier;
+      attr.ah_attr.grh.sgid_index = 1;
+    }
   }
 
   // Diagnostic: log RTR parameters
