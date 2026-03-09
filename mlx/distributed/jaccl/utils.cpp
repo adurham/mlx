@@ -181,8 +181,21 @@ const Destination& Connection::info() {
 
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
+
+  // Try GID index 1, fall back to index 0 if empty.
+  // Some RDMA devices (e.g. Studio↔Studio TB5 links) only populate index 0.
   ibv_gid gid;
   ibv().query_gid(ctx, 1, 1, &gid);
+  bool gid_is_zero = true;
+  for (int i = 0; i < 16; i++) {
+    if (gid.raw[i]) {
+      gid_is_zero = false;
+      break;
+    }
+  }
+  if (gid_is_zero) {
+    ibv().query_gid(ctx, 1, 0, &gid);
+  }
 
   src.local_id = port_attr.lid;
   src.queue_pair_number = queue_pair->qp_num;
@@ -238,7 +251,18 @@ void Connection::queue_pair_rtr(const Destination& dst) {
     attr.ah_attr.is_global = 1;
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = dst.global_identifier;
-    attr.ah_attr.grh.sgid_index = 1;
+
+    // Determine local sgid_index: use index 1 if valid, else fall back to 0.
+    ibv_gid local_gid;
+    ibv().query_gid(ctx, 1, 1, &local_gid);
+    bool local_gid1_zero = true;
+    for (int i = 0; i < 16; i++) {
+      if (local_gid.raw[i]) {
+        local_gid1_zero = false;
+        break;
+      }
+    }
+    attr.ah_attr.grh.sgid_index = local_gid1_zero ? 0 : 1;
   }
 
   // Diagnostic: log RTR parameters
@@ -247,13 +271,12 @@ void Connection::queue_pair_rtr(const Destination& dst) {
     std::ostringstream diag;
     diag << "[jaccl-diag] RTR: dst_lid=" << dst.local_id
          << " dst_qpn=" << dst.queue_pair_number
-         << " dst_psn=" << dst.packet_sequence_number
-         << " is_global=" << attr.ah_attr.is_global
+         << " is_global=" << static_cast<int>(attr.ah_attr.is_global)
+         << " sgid_idx=" << static_cast<int>(attr.ah_attr.grh.sgid_index)
          << " mtu=" << static_cast<int>(attr.path_mtu)
-         << " port_active_mtu=" << static_cast<int>(port_attr.active_mtu)
          << " src_lid=" << src.local_id
          << " src_qpn=" << (queue_pair ? queue_pair->qp_num : -1)
-         << " gid=";
+         << " dst_gid=";
     for (int i = 0; i < 16; i++) {
       char buf[4];
       snprintf(buf, sizeof(buf), "%02x", g.raw[i]);
