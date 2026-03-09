@@ -59,46 +59,45 @@ MeshGroup::MeshGroup(
 }
 
 void MeshGroup::initialize() {
-  // Initialize connections one peer at a time.
-  // Apple's RDMA stack on TB5 rejects ibv_modify_qp RTR when multiple
-  // device contexts have QPs created simultaneously. Work around this by
-  // doing the full PD/CQ/QP/INIT->RTR->RTS cycle for each peer sequentially,
-  // with an all_gather barrier between each phase.
-  for (int target_peer = 0; target_peer < size_; target_peer++) {
-    if (target_peer == rank_) {
+  // Create the queue pairs
+  for (auto& conn : connections_) {
+    if (conn.device_name.empty()) {
       continue;
     }
-
-    auto& conn = connections_[target_peer];
-    if (!conn.device_name.empty() && conn.queue_pair == nullptr) {
-      conn.open();
-      conn.allocate_protection_domain();
-      conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
-      conn.create_queue_pair();
-      conn.queue_pair_init();
-    }
-
-    // Gather info -- all nodes participate even if they don't have this peer.
-    // Each node shares its current connection info (zeros for uninitialized).
-    std::vector<Destination> info;
-    for (auto& c : connections_) {
-      info.emplace_back(c.info());
-    }
-    auto all_infos = side_channel_.all_gather(info);
-
-    if (conn.queue_pair != nullptr) {
-      auto peer_info = all_infos[target_peer][rank_];
-      std::cerr << "[jaccl-diag] rank=" << rank_ << " transitioning peer="
-                << target_peer << " (size=" << size_ << ")" << std::endl;
-      conn.queue_pair_rtr(peer_info);
-      conn.queue_pair_rts();
-    }
+    conn.open();
+    conn.allocate_protection_domain();
+    conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
+    conn.create_queue_pair();
   }
 
   allocate_buffers();
 
-  // Make sure every node has reached here before continuing
-  side_channel_.all_gather<int>(0);
+  // First init all connections
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    connections_[peer].queue_pair_init();
+  }
+
+  // Gather the information to be exchanged, this also serves as a barrier so
+  // that all peers have initialized their connections before attempting to
+  // transition to RTS.
+  std::vector<Destination> info;
+  for (auto& conn : connections_) {
+    info.emplace_back(conn.info());
+  }
+  auto all_infos = side_channel_.all_gather(info);
+
+  // Transition queue pairs to RTS
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    auto peer_info = all_infos[peer][rank_];
+    connections_[peer].queue_pair_rtr(peer_info);
+    connections_[peer].queue_pair_rts();
+  }
 }
 
 void MeshGroup::allocate_buffers() {
