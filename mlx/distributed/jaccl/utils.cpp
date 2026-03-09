@@ -175,7 +175,11 @@ void Connection::create_queue_pair() {
 }
 
 const Destination& Connection::info() {
-  if (queue_pair == nullptr || src.local_id >= 0) {
+  if (queue_pair == nullptr) {
+    return src;
+  }
+  // Return cached info if already queried (queue_pair_number > 0 means populated)
+  if (src.queue_pair_number > 0) {
     return src;
   }
 
