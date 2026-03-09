@@ -214,7 +214,18 @@ void Connection::queue_pair_rtr(const Destination& dst) {
   ibv_qp_attr attr = {};
   memset(&attr, 0, sizeof(attr));
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = IBV_MTU_1024;
+
+  // Query the port's active MTU instead of hardcoding IBV_MTU_1024.
+  // Different Thunderbolt generations (TB4 vs TB5) may negotiate different MTUs,
+  // and using an unsupported MTU causes EINVAL on ibv_modify_qp.
+  ibv_port_attr port_attr;
+  ibv().query_port(ctx, 1, &port_attr);
+  auto mtu = port_attr.active_mtu;
+  if (mtu == 0 || mtu > IBV_MTU_4096) {
+    mtu = IBV_MTU_1024; // Fallback to safe default
+  }
+  attr.path_mtu = static_cast<ibv_mtu>(mtu);
+
   attr.rq_psn = dst.packet_sequence_number;
   attr.dest_qp_num = dst.queue_pair_number;
   attr.ah_attr.dlid = dst.local_id;
@@ -238,6 +249,8 @@ void Connection::queue_pair_rtr(const Destination& dst) {
          << " dst_qpn=" << dst.queue_pair_number
          << " dst_psn=" << dst.packet_sequence_number
          << " is_global=" << attr.ah_attr.is_global
+         << " mtu=" << static_cast<int>(attr.path_mtu)
+         << " port_active_mtu=" << static_cast<int>(port_attr.active_mtu)
          << " src_lid=" << src.local_id
          << " src_qpn=" << (queue_pair ? queue_pair->qp_num : -1)
          << " gid=";
@@ -257,7 +270,8 @@ void Connection::queue_pair_rtr(const Destination& dst) {
     msg << "[jaccl] Changing queue pair to RTR failed with errno " << status
         << " dst_lid=" << dst.local_id
         << " dst_qpn=" << dst.queue_pair_number
-        << " is_global=" << attr.ah_attr.is_global;
+        << " is_global=" << attr.ah_attr.is_global
+        << " mtu=" << static_cast<int>(attr.path_mtu);
     throw std::invalid_argument(msg.str());
   }
 }
