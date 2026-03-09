@@ -121,6 +121,28 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(completion_queue, c.completion_queue);
   std::swap(queue_pair, c.queue_pair);
   std::swap(src, c.src);
+  std::swap(device_name, c.device_name);
+}
+
+void Connection::open() {
+  if (ctx != nullptr || device_name.empty()) {
+    return;
+  }
+  int num_devices = 0;
+  ibv_device** devices = ibv().get_device_list(&num_devices);
+  for (int i = 0; i < num_devices; i++) {
+    if (device_name == ibv().get_device_name(devices[i])) {
+      ctx = ibv().open_device(devices[i]);
+      if (ctx == nullptr) {
+        ibv().free_device_list(devices);
+        std::ostringstream msg;
+        msg << "[jaccl] Could not open device " << device_name;
+        throw std::runtime_error(msg.str());
+      }
+      break;
+    }
+  }
+  ibv().free_device_list(devices);
 }
 
 Connection::~Connection() {
@@ -320,31 +342,13 @@ void Connection::queue_pair_rts() {
 std::vector<Connection> create_connections(
     const std::vector<std::string>& device_names) {
   std::vector<Connection> connections;
-  int num_devices = 0;
-  ibv_device** devices = ibv().get_device_list(&num_devices);
   for (auto& name : device_names) {
-    // Empty so add a nullptr context
-    if (name.empty()) {
-      connections.emplace_back(nullptr);
-      continue;
-    }
-
-    // Search for the name and try to open the device
-    for (int i = 0; i < num_devices; i++) {
-      if (name == ibv().get_device_name(devices[i])) {
-        auto ctx = ibv().open_device(devices[i]);
-        if (ctx == nullptr) {
-          std::ostringstream msg;
-          msg << "[jaccl] Could not open device " << name;
-          throw std::runtime_error(msg.str());
-        }
-        connections.emplace_back(ctx);
-        break;
-      }
-    }
+    // Create deferred connections — devices opened lazily via open().
+    // Apple's TB5 RDMA stack fails ibv_modify_qp when multiple device
+    // contexts are open simultaneously.
+    connections.emplace_back(nullptr);
+    connections.back().device_name = name;
   }
-  ibv().free_device_list(devices);
-
   return connections;
 }
 

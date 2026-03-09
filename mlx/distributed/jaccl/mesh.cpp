@@ -70,7 +70,8 @@ void MeshGroup::initialize() {
     }
 
     auto& conn = connections_[target_peer];
-    if (conn.ctx != nullptr && conn.queue_pair == nullptr) {
+    if (!conn.device_name.empty() && conn.queue_pair == nullptr) {
+      conn.open();
       conn.allocate_protection_domain();
       conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
       conn.create_queue_pair();
@@ -85,7 +86,7 @@ void MeshGroup::initialize() {
     }
     auto all_infos = side_channel_.all_gather(info);
 
-    if (conn.ctx != nullptr && conn.queue_pair != nullptr) {
+    if (conn.queue_pair != nullptr) {
       auto peer_info = all_infos[target_peer][rank_];
       std::cerr << "[jaccl-diag] rank=" << rank_ << " transitioning peer="
                 << target_peer << " (size=" << size_ << ")" << std::endl;

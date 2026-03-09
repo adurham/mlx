@@ -165,6 +165,7 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
+  std::string device_name; // for deferred opening
 
   Connection(ibv_context* ctx_);
   Connection(Connection&& c);
@@ -173,6 +174,7 @@ struct Connection {
   Connection& operator=(Connection&) = delete;
 
   ~Connection();
+  void open(); // open the device by device_name (deferred)
   void allocate_protection_domain();
   void create_completion_queue(int num_entries);
   void create_queue_pair();
