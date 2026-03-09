@@ -208,17 +208,29 @@ const Destination& Connection::info() {
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
 
-  // Try GID index 1 (IPv4-mapped, routable) first. If zero, fall back to
-  // index 0 (link-local). The RTR code uses LID-only addressing for
-  // link-local GIDs since Apple's TB5 RDMA stack doesn't support GRH with them.
+  // Search for an IPv4-mapped GID (::ffff:x.x.x.x) in the GID table.
+  // The index varies between devices/machines (e.g. index 1 on one Studio,
+  // index 2 on another). IPv4-mapped GIDs are required for GRH on Apple RDMA.
+  // Fall back to GID[0] (link-local) if no IPv4-mapped GID is found.
   ibv_gid gid;
-  ibv().query_gid(ctx, 1, 1, &gid);
-  bool gid_is_zero = true;
-  for (int i = 0; i < 16; i++) {
-    if (gid.raw[i]) {
-      gid_is_zero = false;
+  memset(&gid, 0, sizeof(gid));
+  for (int idx = 0; idx < 8; idx++) {
+    ibv_gid candidate;
+    ibv().query_gid(ctx, 1, idx, &candidate);
+    // IPv4-mapped: first 10 bytes zero, bytes 10-11 = 0xff 0xff
+    bool is_ipv4_mapped = true;
+    for (int i = 0; i < 10; i++) {
+      if (candidate.raw[i]) { is_ipv4_mapped = false; break; }
+    }
+    if (is_ipv4_mapped && candidate.raw[10] == 0xff && candidate.raw[11] == 0xff) {
+      gid = candidate;
       break;
     }
+  }
+  // If no IPv4-mapped GID found, use GID[0] (link-local)
+  bool gid_is_zero = true;
+  for (int i = 0; i < 16; i++) {
+    if (gid.raw[i]) { gid_is_zero = false; break; }
   }
   if (gid_is_zero) {
     ibv().query_gid(ctx, 1, 0, &gid);
@@ -274,19 +286,40 @@ void Connection::queue_pair_rtr(const Destination& dst) {
   attr.ah_attr.port_num = 1;
   attr.ah_attr.is_global = 0;
 
-  // Enable GRH only if the remote endpoint has a routable (non-link-local) GID.
-  // Apple's TB5 RDMA stack times out with GRH + link-local fe80:: GIDs.
-  // IPv4-mapped GIDs (from GID index 1) work; link-local GIDs (index 0) don't.
-  // When GID index 1 is zero (no routable GID), use LID-only addressing.
+  // Enable GRH if the remote endpoint has an IPv4-mapped GID.
+  // Apple's TB5 RDMA stack requires IPv4-mapped GIDs for GRH; link-local
+  // fe80:: GIDs time out. Find the local IPv4-mapped GID index to match.
   if (dst.global_identifier.global.interface_id) {
-    // Check if this is a link-local GID (fe80::) — first 2 bytes = 0xfe80
-    bool is_link_local = (dst.global_identifier.raw[0] == 0xfe &&
-                          dst.global_identifier.raw[1] == 0x80);
-    if (!is_link_local) {
-      attr.ah_attr.is_global = 1;
-      attr.ah_attr.grh.hop_limit = 1;
-      attr.ah_attr.grh.dgid = dst.global_identifier;
-      attr.ah_attr.grh.sgid_index = 1;
+    bool dst_is_ipv4_mapped = true;
+    for (int i = 0; i < 10; i++) {
+      if (dst.global_identifier.raw[i]) { dst_is_ipv4_mapped = false; break; }
+    }
+    dst_is_ipv4_mapped = dst_is_ipv4_mapped &&
+        dst.global_identifier.raw[10] == 0xff &&
+        dst.global_identifier.raw[11] == 0xff;
+
+    if (dst_is_ipv4_mapped) {
+      // Find local IPv4-mapped GID index (varies between devices)
+      int local_sgid_index = -1;
+      for (int idx = 0; idx < 8; idx++) {
+        ibv_gid local_gid;
+        ibv().query_gid(ctx, 1, idx, &local_gid);
+        bool is_v4 = true;
+        for (int i = 0; i < 10; i++) {
+          if (local_gid.raw[i]) { is_v4 = false; break; }
+        }
+        if (is_v4 && local_gid.raw[10] == 0xff && local_gid.raw[11] == 0xff) {
+          local_sgid_index = idx;
+          break;
+        }
+      }
+
+      if (local_sgid_index >= 0) {
+        attr.ah_attr.is_global = 1;
+        attr.ah_attr.grh.hop_limit = 1;
+        attr.ah_attr.grh.dgid = dst.global_identifier;
+        attr.ah_attr.grh.sgid_index = local_sgid_index;
+      }
     }
   }
 
