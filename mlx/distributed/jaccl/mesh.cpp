@@ -69,7 +69,9 @@ void MeshGroup::initialize() {
     conn.create_queue_pair();
   }
 
-  allocate_buffers();
+  // NOTE: allocate_buffers() moved AFTER QP transitions.
+  // Registering memory regions to multiple PDs before RTR caused EINVAL
+  // on Apple's RDMA stack when multiple devices are open simultaneously.
 
   // First init all connections
   for (int peer = 0; peer < size_; peer++) {
@@ -99,6 +101,12 @@ void MeshGroup::initialize() {
     connections_[peer].queue_pair_rtr(peer_info);
     connections_[peer].queue_pair_rts();
   }
+
+  // Allocate and register buffers after QP transitions are complete.
+  allocate_buffers();
+
+  // Make sure every node has reached here before continuing
+  side_channel_.all_gather<int>(0);
 }
 
 void MeshGroup::allocate_buffers() {
