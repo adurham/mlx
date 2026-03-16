@@ -230,19 +230,27 @@ template <typename T, int D, int V = D>
 
   queries += q_offset * D + simd_lid * qk_per_thread;
 
+  // Each block processes a CONTIGUOUS chunk of the KV sequence instead of
+  // striding by `blocks`. Contiguous access (256-byte stride for bf16 D=128)
+  // enables hardware prefetch and burst transfers, vs the strided pattern
+  // (40KB+ stride) that defeats the prefetcher and causes cache misses.
+  const int chunk_size = (N + blocks - 1) / blocks;
+  const int start_pos = block_idx * chunk_size;
+  const int end_pos = min(start_pos + chunk_size, N);
+
   const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
-  keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
+  keys += kv_batch_head_idx * k_head_stride + start_pos * k_seq_stride +
       simd_lid * qk_per_thread;
-  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
+  values += kv_batch_head_idx * v_head_stride + start_pos * v_seq_stride +
       simd_lid * v_per_thread;
   out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
   if (bool_mask) {
     bmask += q_batch_head_idx * mask_head_stride +
-        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        start_pos * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   if (float_mask) {
     fmask += q_batch_head_idx * mask_head_stride +
-        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        start_pos * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   sums += o_offset * blocks + block_idx;
   maxs += o_offset * blocks + block_idx;
@@ -259,17 +267,11 @@ template <typename T, int D, int V = D>
     sum_exp_score = 1;
   }
 
-  // Pre-load K and V into registers to overlap memory reads with compute.
-  // Loading both K and V at the top of each iteration lets the GPU issue
-  // both reads simultaneously and hide V latency behind the dot product
-  // and softmax computation.
   thread U k[qk_per_thread];
   thread U v[v_per_thread];
-  const int k_advance = blocks * int(k_seq_stride);
-  const int v_advance = blocks * int(v_seq_stride);
 
-  // For each key
-  for (int i = block_idx; i < N; i += blocks) {
+  // Sequential loop through contiguous KV positions (prefetcher-friendly)
+  for (int i = start_pos; i < end_pos; i++) {
     bool use_key = true;
     if (do_causal) {
       use_key = i <= (N - q_seq_len + int(q_seq_idx));
@@ -279,7 +281,7 @@ template <typename T, int D, int V = D>
       use_key = (fmask[0] >= Limits<T>::finite_min);
     }
     if (use_key) {
-      // Load K and V into registers (GPU can issue both reads in parallel)
+      // Load K and V into registers
       for (int j = 0; j < qk_per_thread; j++) {
         k[j] = static_cast<U>(keys[j]);
       }
@@ -287,7 +289,7 @@ template <typename T, int D, int V = D>
         v[j] = static_cast<U>(values[j]);
       }
 
-      // Compute the i-th score from registers
+      // Compute the i-th score
       U score = 0;
       for (int j = 0; j < qk_per_thread; j++) {
         score += q[j] * k[j];
@@ -306,20 +308,20 @@ template <typename T, int D, int V = D>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator from registers (V already loaded)
+      // Update the output accumulator
       for (int j = 0; j < v_per_thread; j++) {
         o[j] = o[j] * factor + exp_score * v[j];
       }
     }
 
-    // Move the pointers to the next kv
-    keys += k_advance;
-    values += v_advance;
+    // Advance to next sequential KV position
+    keys += int(k_seq_stride);
+    values += int(v_seq_stride);
     if (bool_mask) {
-      bmask += blocks * mask_kv_seq_stride;
+      bmask += mask_kv_seq_stride;
     }
     if (float_mask) {
-      fmask += blocks * mask_kv_seq_stride;
+      fmask += mask_kv_seq_stride;
     }
   }
 
