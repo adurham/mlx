@@ -481,6 +481,18 @@ void sdpa_vector_2pass(
         blocks = 1024;
       }
     }
+    // Cap blocks to limit threadgroup scheduling overhead on M3/M4 GPUs.
+    // Each layer dispatches (kv_heads × batch × blocks) threadgroups, but
+    // M4 Max has only 40 GPU cores (M4 Pro: 18, M3 Max: 40). When blocks
+    // scales to 512+ at high context, scheduling 1000+ threadgroups through
+    // 40 cores creates 25+ sequential rounds with the memory bus idle between
+    // them. Capping total threadgroups to ~320 limits to ~8 rounds while
+    // keeping enough iterations per block for full SIMD utilization.
+    int tg_per_block = k.shape(1) * q.shape(0);
+    if (tg_per_block > 0) {
+      int max_blocks = std::max(32, 320 / tg_per_block);
+      blocks = std::min(blocks, max_blocks);
+    }
   }
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
@@ -977,6 +989,13 @@ void sdpa_vector_2pass_quantized_dispatch(
       } else {
         blocks = 1024;
       }
+    }
+    // Cap blocks to limit threadgroup scheduling overhead on M3/M4 GPUs.
+    // See comment in non-quantized 2-pass kernel above for rationale.
+    int tg_per_block = k_data.shape(1) * q.shape(0);
+    if (tg_per_block > 0) {
+      int max_blocks = std::max(32, 320 / tg_per_block);
+      blocks = std::min(blocks, max_blocks);
     }
   }
 
