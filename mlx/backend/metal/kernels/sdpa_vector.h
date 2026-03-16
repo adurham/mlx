@@ -259,6 +259,15 @@ template <typename T, int D, int V = D>
     sum_exp_score = 1;
   }
 
+  // Pre-load K and V into registers to overlap memory reads with compute.
+  // Loading both K and V at the top of each iteration lets the GPU issue
+  // both reads simultaneously and hide V latency behind the dot product
+  // and softmax computation.
+  thread U k[qk_per_thread];
+  thread U v[v_per_thread];
+  const int k_advance = blocks * int(k_seq_stride);
+  const int v_advance = blocks * int(v_seq_stride);
+
   // For each key
   for (int i = block_idx; i < N; i += blocks) {
     bool use_key = true;
@@ -270,10 +279,18 @@ template <typename T, int D, int V = D>
       use_key = (fmask[0] >= Limits<T>::finite_min);
     }
     if (use_key) {
-      // Compute the i-th score
+      // Load K and V into registers (GPU can issue both reads in parallel)
+      for (int j = 0; j < qk_per_thread; j++) {
+        k[j] = static_cast<U>(keys[j]);
+      }
+      for (int j = 0; j < v_per_thread; j++) {
+        v[j] = static_cast<U>(values[j]);
+      }
+
+      // Compute the i-th score from registers
       U score = 0;
-      for (int i = 0; i < qk_per_thread; i++) {
-        score += q[i] * keys[i];
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * k[j];
       }
       score = simd_sum(score);
 
@@ -289,15 +306,15 @@ template <typename T, int D, int V = D>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator
-      for (int i = 0; i < v_per_thread; i++) {
-        o[i] = o[i] * factor + exp_score * values[i];
+      // Update the output accumulator from registers (V already loaded)
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * v[j];
       }
     }
 
     // Move the pointers to the next kv
-    keys += blocks * int(k_seq_stride);
-    values += blocks * int(v_seq_stride);
+    keys += k_advance;
+    values += v_advance;
     if (bool_mask) {
       bmask += blocks * mask_kv_seq_stride;
     }
