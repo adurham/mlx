@@ -553,114 +553,90 @@ void sdpa_vector_2pass(
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
 
-  // Split-pass SDPA: separate score+max pass + streaming V pass.
+  // Two-loop SDPA: single kernel with threadgroup memory for scores.
+  // Loop 1: K read + score + max. Loop 2: V read + exp(score - known_max) * V.
+  // No intermediate device memory, no extra kernel launches.
   if (use_split_pass()) {
-    metal::MTLFCList fc = {
-        {&has_mask, MTL::DataType::DataTypeBool, 20},
-        {&query_transposed, MTL::DataType::DataTypeBool, 21},
-        {&do_causal, MTL::DataType::DataTypeBool, 22},
-        {&bool_mask, MTL::DataType::DataTypeBool, 23},
-        {&float_mask, MTL::DataType::DataTypeBool, 24},
-        {&has_sinks, MTL::DataType::DataTypeBool, 25},
-        {&blocks, MTL::DataType::DataTypeInt, 26},
-    };
+    // Check threadgroup memory fits: gqa_factor * positions_per_block floats
+    int positions_per_block = (N + blocks - 1) / blocks;
+    int smem_floats = gqa_factor * positions_per_block;
+    if (smem_floats <= 8192) {  // 32KB limit
+      // Use 2loop kernel
+      std::string lk = "sdpa_vector_2loop_";
+      lk += get_type_string(q.dtype());
+      lk += "_";
+      lk += std::to_string(q.shape(-1));
+      lk += "_";
+      lk += std::to_string(v.shape(-1));
 
-    // --- Pass A: Score + max ---
-    std::string sk = "sdpa_vector_split_scores_";
-    sk += get_type_string(q.dtype());
-    sk += "_";
-    sk += std::to_string(q.shape(-1));
-    std::string sh = sk + (has_mask ? (bool_mask ? "_bm" : "_fm") : "_nm");
-    sh += query_transposed ? "_qt" : "_qnt";
-    sh += do_causal ? "_c" : "_nc";
-    sh += has_sinks ? "_s_" : "_ns_";
-    sh += std::to_string(blocks);
+      metal::MTLFCList fc = {
+          {&has_mask, MTL::DataType::DataTypeBool, 20},
+          {&query_transposed, MTL::DataType::DataTypeBool, 21},
+          {&do_causal, MTL::DataType::DataTypeBool, 22},
+          {&bool_mask, MTL::DataType::DataTypeBool, 23},
+          {&float_mask, MTL::DataType::DataTypeBool, 24},
+          {&has_sinks, MTL::DataType::DataTypeBool, 25},
+          {&blocks, MTL::DataType::DataTypeInt, 26},
+      };
+      std::string lh = lk;
+      lh += has_mask ? (bool_mask ? "_bm" : "_fm") : "_nm";
+      lh += query_transposed ? "_qt" : "_qnt";
+      lh += do_causal ? "_c" : "_nc";
+      lh += has_sinks ? "_s_" : "_ns_";
+      lh += std::to_string(blocks);
 
-    auto& enc = d.get_command_encoder(s.index);
-    auto kernel = d.get_kernel(sk, sh, fc);
-    check_kernel_threadgroup_size(kernel, group_dims, sh);
-    enc.set_compute_pipeline_state(kernel);
-    enc.set_input_array(q, 0);
-    enc.set_input_array(k, 1);
-    enc.set_output_array(maxs, 2);
-    enc.set_bytes(N, 3);
-    enc.set_bytes(k_head_stride, 4);
-    enc.set_bytes(k_seq_stride, 5);
-    enc.set_bytes(scale, 6);
-    if (has_mask) {
-      auto& m = *mask;
-      enc.set_input_array(m, 7 + float_mask);
-      int32_t kvs = m.shape(3) > 1 ? m.strides(3) : 0;
-      int32_t qs = m.shape(2) > 1 ? m.strides(2) : 0;
-      int32_t hs =
-          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-      enc.set_bytes(kvs, 9);
-      enc.set_bytes(qs, 10);
-      enc.set_bytes(hs, 11);
+      auto& enc = d.get_command_encoder(s.index);
+      auto kernel = d.get_kernel(lk, lh, fc);
+      check_kernel_threadgroup_size(kernel, group_dims, lh);
+
+      enc.set_compute_pipeline_state(kernel);
+      enc.set_input_array(q, 0);
+      enc.set_input_array(k, 1);
+      enc.set_input_array(v, 2);
+      enc.set_output_array(intermediate, 3);
+      enc.set_output_array(sums, 4);
+      enc.set_output_array(maxs, 5);
+      enc.set_bytes(N, 7);
+      enc.set_bytes(k_head_stride, 8);
+      enc.set_bytes(k_seq_stride, 9);
+      enc.set_bytes(v_head_stride, 10);
+      enc.set_bytes(v_seq_stride, 11);
+      enc.set_bytes(scale, 12);
+      if (has_mask) {
+        auto& m = *mask;
+        enc.set_input_array(m, 13 + float_mask);
+        int32_t kv_seq_stride_m = m.shape(3) > 1 ? m.strides(3) : 0;
+        int32_t q_seq_stride_m = m.shape(2) > 1 ? m.strides(2) : 0;
+        int32_t head_stride_m =
+            m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+        enc.set_bytes(kv_seq_stride_m, 15);
+        enc.set_bytes(q_seq_stride_m, 16);
+        enc.set_bytes(head_stride_m, 17);
+      }
+      if (has_sinks) {
+        enc.set_input_array(*sinks, 18);
+      }
+      enc.dispatch_threadgroups(grid_dims, group_dims);
+
+      // Final merge pass (reuse 2pass_2)
+      std::string mk = "sdpa_vector_2pass_2_";
+      mk += get_type_string(q.dtype());
+      mk += "_";
+      mk += std::to_string(v.shape(-1));
+      kernel = d.get_kernel(mk);
+      enc.set_compute_pipeline_state(kernel);
+      enc.set_input_array(intermediate, 0);
+      enc.set_input_array(sums, 1);
+      enc.set_input_array(maxs, 2);
+      enc.set_output_array(out, 3);
+      enc.set_bytes(blocks, 4);
+      MTL::Size mg(1024, 1, 1);
+      MTL::Size mgrid(q.shape(0) * q.shape(1), q.shape(2), 1);
+      check_kernel_threadgroup_size(kernel, mg, mk);
+      enc.dispatch_threadgroups(mgrid, mg);
+      return;
     }
-    if (has_sinks) {
-      enc.set_input_array(*sinks, 12);
-    }
-    enc.dispatch_threadgroups(grid_dims, group_dims);
-
-    // --- Pass B: K re-read + V accumulation with known max ---
-    std::string vk = "sdpa_vector_split_values_";
-    vk += get_type_string(q.dtype());
-    vk += "_";
-    vk += std::to_string(q.shape(-1));
-    vk += "_";
-    vk += std::to_string(v.shape(-1));
-    std::string vh = vk + (has_mask ? (bool_mask ? "_bm" : "_fm") : "_nm");
-    vh += query_transposed ? "_qt" : "_qnt";
-    vh += do_causal ? "_c" : "_nc";
-    vh += has_sinks ? "_s_" : "_ns_";
-    vh += std::to_string(blocks);
-
-    kernel = d.get_kernel(vk, vh, fc);
-    check_kernel_threadgroup_size(kernel, group_dims, vh);
-    enc.set_compute_pipeline_state(kernel);
-    enc.set_input_array(q, 0);
-    enc.set_input_array(k, 1);
-    enc.set_input_array(v, 2);
-    enc.set_output_array(intermediate, 3);
-    enc.set_output_array(sums, 4);
-    enc.set_input_array(maxs, 5);
-    enc.set_bytes(N, 6);
-    enc.set_bytes(k_head_stride, 7);
-    enc.set_bytes(k_seq_stride, 8);
-    enc.set_bytes(v_head_stride, 9);
-    enc.set_bytes(v_seq_stride, 10);
-    enc.set_bytes(scale, 11);
-    if (has_mask) {
-      auto& m = *mask;
-      enc.set_input_array(m, 12 + float_mask);
-      int32_t kvs = m.shape(3) > 1 ? m.strides(3) : 0;
-      int32_t qs = m.shape(2) > 1 ? m.strides(2) : 0;
-      int32_t hs =
-          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-      enc.set_bytes(kvs, 14);
-      enc.set_bytes(qs, 15);
-      enc.set_bytes(hs, 16);
-    }
-    enc.dispatch_threadgroups(grid_dims, group_dims);
-
-    // --- Pass C: Merge blocks (reuse 2pass_2) ---
-    std::string mk = "sdpa_vector_2pass_2_";
-    mk += get_type_string(q.dtype());
-    mk += "_";
-    mk += std::to_string(v.shape(-1));
-    kernel = d.get_kernel(mk);
-    enc.set_compute_pipeline_state(kernel);
-    enc.set_input_array(intermediate, 0);
-    enc.set_input_array(sums, 1);
-    enc.set_input_array(maxs, 2);
-    enc.set_output_array(out, 3);
-    enc.set_bytes(blocks, 4);
-    MTL::Size mg(1024, 1, 1);
-    MTL::Size mgrid(q.shape(0) * q.shape(1), q.shape(2), 1);
-    check_kernel_threadgroup_size(kernel, mg, mk);
-    enc.dispatch_threadgroups(mgrid, mg);
-    return;
+    // Fall through to standard 2pass if threadgroup memory too small
   }
 
   metal::MTLFCList func_consts = {

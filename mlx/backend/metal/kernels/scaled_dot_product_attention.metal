@@ -63,7 +63,22 @@ using namespace metal;
   instantiate_sdpa_split_values(type, 96, 96)    \
   instantiate_sdpa_split_values(type, 128, 128)  \
   instantiate_sdpa_split_values(type, 256, 256)  \
-  instantiate_sdpa_split_values(type, 512, 512)
+  instantiate_sdpa_split_values(type, 512, 512)  \
+  instantiate_kernel(                            \
+      "sdpa_vector_2loop_" #type "_64_64",        \
+      sdpa_vector_2loop, type, 64, 64)            \
+  instantiate_kernel(                            \
+      "sdpa_vector_2loop_" #type "_96_96",        \
+      sdpa_vector_2loop, type, 96, 96)            \
+  instantiate_kernel(                            \
+      "sdpa_vector_2loop_" #type "_128_128",      \
+      sdpa_vector_2loop, type, 128, 128)          \
+  instantiate_kernel(                            \
+      "sdpa_vector_2loop_" #type "_256_256",      \
+      sdpa_vector_2loop, type, 256, 256)          \
+  instantiate_kernel(                            \
+      "sdpa_vector_2loop_" #type "_512_512",      \
+      sdpa_vector_2loop, type, 512, 512)
 
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)

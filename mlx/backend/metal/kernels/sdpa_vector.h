@@ -664,3 +664,212 @@ template <typename T, int D, int V = D>
     out[i] = static_cast<T>(o[i]);
   }
 }
+
+// ============================================================================
+// Single-kernel two-loop SDPA: optimized for Apple Silicon.
+//
+// Uses threadgroup memory to store scores between two loops within ONE kernel:
+//   Loop 1: Read K, compute Q·K scores, store in threadgroup memory, find max.
+//   [threadgroup_barrier]
+//   Loop 2: Read V, load scores from threadgroup memory, compute
+//           exp(score - KNOWN_MAX) * V. No serial dependency.
+//
+// Benefits over online softmax:
+//   - Loop 2 has ZERO serial dependency (max is constant from loop 1)
+//   - Only ONE exp() per position (vs TWO in online softmax)
+//   - No factor rescaling of output accumulators
+//   - No intermediate device memory, no extra kernel launches
+//   - Scores in threadgroup memory = fast L1 access
+//
+// Constraint: positions_per_block must fit in threadgroup memory.
+// At 32KB threadgroup mem, 16 Q heads: max 512 positions per block.
+// With blocks=160 at 65K context: 410 positions — fits.
+// ============================================================================
+
+template <typename T, int D, int V = D>
+[[kernel]] void sdpa_vector_2loop(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(7)]],
+    const constant size_t& k_head_stride [[buffer(8)]],
+    const constant size_t& k_seq_stride [[buffer(9)]],
+    const constant size_t& v_head_stride [[buffer(10)]],
+    const constant size_t& v_seq_stride [[buffer(11)]],
+    const constant float& scale [[buffer(12)]],
+    const device bool* bmask [[buffer(13), function_constant(bool_mask)]],
+    const device T* fmask [[buffer(14), function_constant(float_mask)]],
+    const constant int& mask_kv_seq_stride
+    [[buffer(15), function_constant(has_mask)]],
+    const constant int& mask_q_seq_stride
+    [[buffer(16), function_constant(has_mask)]],
+    const constant int& mask_head_stride
+    [[buffer(17), function_constant(has_mask)]],
+    const device T* sinks [[buffer(18), function_constant(has_sinks)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+  // Max positions per block that fit in threadgroup memory.
+  // 32KB / 4 bytes = 8192 floats. Shared across all SIMD groups (Q heads).
+  constexpr int MAX_POS = 8192;
+
+  typedef float U;
+
+  thread U q[qk_per_thread];
+  thread U o[v_per_thread] = {0};
+
+  // Threadgroup memory for scores: each SIMD group (Q head) stores its scores.
+  // Layout: scores_smem[simd_gid * positions_per_block + pos_idx]
+  // All SIMD groups share the same threadgroup memory pool.
+  threadgroup U scores_smem[MAX_POS];
+
+  // Adjust positions (same as 2pass_1)
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const int block_idx = tid.z;
+  const int gqa_factor = tptg.y;
+  const int q_seq_len = tptg.z;
+  const int q_seq_idx = tidtg.z;
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_batch_head_idx = (batch_idx * num_q_heads + q_head_idx);
+  const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
+  const int q_offset =
+      query_transposed ? num_q_heads * q_seq_idx + q_batch_head_idx : o_offset;
+
+  // Compute positions per block for threadgroup memory indexing
+  int positions_per_block = (N + blocks - 1) / blocks;
+  int smem_offset = simd_gid * positions_per_block;
+
+  queries += q_offset * D + simd_lid * qk_per_thread;
+
+  const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
+  const device T* keys_base = keys + kv_batch_head_idx * k_head_stride +
+      block_idx * k_seq_stride + simd_lid * qk_per_thread;
+  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
+      simd_lid * v_per_thread;
+  out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
+
+  const device bool* bmask_base = nullptr;
+  const device T* fmask_base = nullptr;
+  if (bool_mask) {
+    bmask_base = bmask + q_batch_head_idx * mask_head_stride +
+        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  }
+  if (float_mask) {
+    fmask_base = fmask + q_batch_head_idx * mask_head_stride +
+        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  }
+  sums += o_offset * blocks + block_idx;
+  maxs += o_offset * blocks + block_idx;
+
+  // Read the query
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+
+  // ---- LOOP 1: Score computation + max finding ----
+  // Reads K only. Stores scores in threadgroup memory. Finds block max.
+  U max_score = Limits<U>::finite_min;
+  if (has_sinks && block_idx == 0) {
+    max_score = static_cast<U>(sinks[q_head_idx]);
+  }
+
+  const device T* k_ptr = keys_base;
+  const device bool* bm_ptr = bmask_base;
+  const device T* fm_ptr = fmask_base;
+  int pos_idx = 0;
+  for (int i = block_idx; i < N; i += blocks) {
+    U score = Limits<U>::finite_min;
+    bool use_key = true;
+    if (do_causal) {
+      use_key = i <= (N - q_seq_len + int(q_seq_idx));
+    } else if (bool_mask) {
+      use_key = bm_ptr[0];
+    } else if (float_mask) {
+      use_key = (fm_ptr[0] >= Limits<T>::finite_min);
+    }
+
+    if (use_key) {
+      score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * k_ptr[j];
+      }
+      score = simd_sum(score);
+      if (float_mask) {
+        score += static_cast<U>(fm_ptr[0]);
+      }
+      max_score = max(max_score, score);
+    }
+
+    // Store score in threadgroup memory (only lane 0 writes)
+    if (simd_lid == 0 && (smem_offset + pos_idx) < MAX_POS) {
+      scores_smem[smem_offset + pos_idx] = score;
+    }
+
+    k_ptr += blocks * int(k_seq_stride);
+    if (bool_mask) {
+      bm_ptr += blocks * mask_kv_seq_stride;
+    }
+    if (float_mask) {
+      fm_ptr += blocks * mask_kv_seq_stride;
+    }
+    pos_idx++;
+  }
+
+  // Synchronize: all SIMD groups must finish Loop 1 before Loop 2 starts.
+  // After this barrier, max_score and scores_smem are finalized.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- LOOP 2: V accumulation with KNOWN max ----
+  // max_score is now CONSTANT. No serial dependency.
+  // Each position: exp(score - max) * V → simple accumulation.
+  U sum_exp_score = 0;
+  if (has_sinks && block_idx == 0) {
+    sum_exp_score = 1;
+  }
+
+  pos_idx = 0;
+  for (int i = block_idx; i < N; i += blocks) {
+    // Read score from threadgroup memory (fast L1 access)
+    U score = 0;
+    if (simd_lid == 0 && (smem_offset + pos_idx) < MAX_POS) {
+      score = scores_smem[smem_offset + pos_idx];
+    }
+    score = simd_broadcast_first(score);
+
+    if (score > Limits<U>::finite_min) {
+      // ONE exp() with CONSTANT max — no dependency!
+      U exp_score = fast::exp(score - max_score);
+      sum_exp_score += exp_score;
+
+      // Simple accumulation — no factor rescaling!
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] += exp_score * static_cast<U>(values[j]);
+      }
+    }
+
+    values += blocks * int(v_seq_stride);
+    pos_idx++;
+  }
+
+  // Write the sum, max, and outputs (same format as 2pass_1)
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+
+  for (int i = 0; i < v_per_thread; i++) {
+    out[i] = static_cast<T>(o[i]);
+  }
+}
