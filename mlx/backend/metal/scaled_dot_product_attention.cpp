@@ -555,17 +555,6 @@ void sdpa_vector_2pass(
 
   // Split-pass SDPA: separate score+max pass + streaming V pass.
   if (use_split_pass()) {
-    int positions_per_block = (N + blocks - 1) / blocks;
-    int total_heads = q.shape(0) * q.shape(1);
-    int total_q_seq = q.shape(2);
-
-    // Allocate scores intermediate
-    int64_t scores_size = static_cast<int64_t>(total_heads) * total_q_seq *
-        blocks * positions_per_block;
-    array scores_buf({static_cast<int>(scores_size)}, float32, nullptr, {});
-    scores_buf.set_data(allocator::malloc(scores_buf.nbytes()));
-    d.add_temporary(scores_buf, s.index);
-
     metal::MTLFCList fc = {
         {&has_mask, MTL::DataType::DataTypeBool, 20},
         {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -593,55 +582,66 @@ void sdpa_vector_2pass(
     enc.set_compute_pipeline_state(kernel);
     enc.set_input_array(q, 0);
     enc.set_input_array(k, 1);
-    enc.set_output_array(scores_buf, 2);
-    enc.set_output_array(maxs, 3);
-    enc.set_bytes(N, 4);
-    enc.set_bytes(positions_per_block, 5);
-    enc.set_bytes(k_head_stride, 6);
-    enc.set_bytes(k_seq_stride, 7);
-    enc.set_bytes(scale, 8);
+    enc.set_output_array(maxs, 2);
+    enc.set_bytes(N, 3);
+    enc.set_bytes(k_head_stride, 4);
+    enc.set_bytes(k_seq_stride, 5);
+    enc.set_bytes(scale, 6);
     if (has_mask) {
       auto& m = *mask;
-      enc.set_input_array(m, 9 + float_mask);
+      enc.set_input_array(m, 7 + float_mask);
       int32_t kvs = m.shape(3) > 1 ? m.strides(3) : 0;
       int32_t qs = m.shape(2) > 1 ? m.strides(2) : 0;
       int32_t hs =
           m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-      enc.set_bytes(kvs, 11);
-      enc.set_bytes(qs, 12);
-      enc.set_bytes(hs, 13);
+      enc.set_bytes(kvs, 9);
+      enc.set_bytes(qs, 10);
+      enc.set_bytes(hs, 11);
     }
     if (has_sinks) {
-      enc.set_input_array(*sinks, 14);
+      enc.set_input_array(*sinks, 12);
     }
     enc.dispatch_threadgroups(grid_dims, group_dims);
 
-    // --- Pass B: Streaming V accumulation ---
+    // --- Pass B: K re-read + V accumulation with known max ---
     std::string vk = "sdpa_vector_split_values_";
     vk += get_type_string(q.dtype());
     vk += "_";
     vk += std::to_string(q.shape(-1));
     vk += "_";
     vk += std::to_string(v.shape(-1));
-    std::string vh = vk + (has_sinks ? "_s_" : "_ns_");
+    std::string vh = vk + (has_mask ? (bool_mask ? "_bm" : "_fm") : "_nm");
+    vh += query_transposed ? "_qt" : "_qnt";
+    vh += do_causal ? "_c" : "_nc";
+    vh += has_sinks ? "_s_" : "_ns_";
     vh += std::to_string(blocks);
 
-    metal::MTLFCList vfc = {
-        {&has_sinks, MTL::DataType::DataTypeBool, 25},
-        {&blocks, MTL::DataType::DataTypeInt, 26},
-    };
-    kernel = d.get_kernel(vk, vh, vfc);
+    kernel = d.get_kernel(vk, vh, fc);
     check_kernel_threadgroup_size(kernel, group_dims, vh);
     enc.set_compute_pipeline_state(kernel);
-    enc.set_input_array(scores_buf, 0);
-    enc.set_input_array(v, 1);
-    enc.set_output_array(intermediate, 2);
-    enc.set_output_array(sums, 3);
-    enc.set_input_array(maxs, 4);
-    enc.set_bytes(N, 5);
-    enc.set_bytes(positions_per_block, 6);
-    enc.set_bytes(v_head_stride, 7);
-    enc.set_bytes(v_seq_stride, 8);
+    enc.set_input_array(q, 0);
+    enc.set_input_array(k, 1);
+    enc.set_input_array(v, 2);
+    enc.set_output_array(intermediate, 3);
+    enc.set_output_array(sums, 4);
+    enc.set_input_array(maxs, 5);
+    enc.set_bytes(N, 6);
+    enc.set_bytes(k_head_stride, 7);
+    enc.set_bytes(k_seq_stride, 8);
+    enc.set_bytes(v_head_stride, 9);
+    enc.set_bytes(v_seq_stride, 10);
+    enc.set_bytes(scale, 11);
+    if (has_mask) {
+      auto& m = *mask;
+      enc.set_input_array(m, 12 + float_mask);
+      int32_t kvs = m.shape(3) > 1 ? m.strides(3) : 0;
+      int32_t qs = m.shape(2) > 1 ? m.strides(2) : 0;
+      int32_t hs =
+          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+      enc.set_bytes(kvs, 14);
+      enc.set_bytes(qs, 15);
+      enc.set_bytes(hs, 16);
+    }
     enc.dispatch_threadgroups(grid_dims, group_dims);
 
     // --- Pass C: Merge blocks (reuse 2pass_2) ---
