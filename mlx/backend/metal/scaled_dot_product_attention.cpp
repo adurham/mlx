@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 #include <cstdlib>
 #include <sstream>
+#include <thread>
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -798,128 +799,142 @@ void sdpa_vector_2pass(
     compute_encoder.set_input_array(*sinks, 18);
   }
 
-  // Launch GPU kernel (2pass_1)
+  // Launch GPU kernel (2pass_1) — runs asynchronously on Metal stream
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
+  // CPU-assisted attention: runs in a BACKGROUND THREAD while GPU executes 2pass_1.
+  // Timeline:
+  //   GPU: [===== 2pass_1 (N_gpu positions) =====][=== 2pass_2 ===]
+  //   CPU:    [== convert bf16 + BLAS attention ==]
+  //                                                ^ join thread, dispatch 2pass_2
+  std::thread cpu_thread;
 #ifdef __APPLE__
-  // CPU-assisted attention: process tail positions on CPU while GPU runs 2pass_1.
-  // The GPU processes [0, N_gpu) and the CPU processes [N_gpu, N).
-  // CPU writes its results as an extra block in the intermediate arrays.
-  // The 2pass_2 merge kernel then combines GPU blocks + CPU block.
   if (do_cpu_assist) {
     int num_q_heads_total = q.shape(0) * q.shape(1);
     int D = q.shape(-1);
     int V_dim = v.shape(-1);
-
-    // Convert Q to float32 for CPU BLAS (Q is small — just 1 token)
-    std::vector<float> q_f32(num_q_heads_total * D);
-    if (q.dtype() == float32) {
-      auto* qp = q.data<float>();
-      for (int i = 0; i < num_q_heads_total; i++) {
-        memcpy(q_f32.data() + i * D, qp + i * D, D * sizeof(float));
-      }
-    } else {
-      // bfloat16 → float32 (NEON vectorized)
-      auto* qp = reinterpret_cast<const uint16_t*>(q.data<bfloat16_t>());
-      int total_q = num_q_heads_total * D;
-      int i = 0;
-      for (; i + 3 < total_q; i += 4) {
-        uint16x4_t q16 = vld1_u16(qp + i);
-        uint32x4_t q32 = vshll_n_u16(q16, 16);
-        vst1q_f32(q_f32.data() + i, vreinterpretq_f32_u32(q32));
-      }
-      for (; i < total_q; i++) {
-        uint32_t bits = static_cast<uint32_t>(qp[i]) << 16;
-        memcpy(&q_f32[i], &bits, 4);
-      }
-    }
-
-    // Convert CPU portion of K and V to float32
     int kv_heads = k.shape(1);
-    std::vector<float> k_f32(kv_heads * N_cpu * D);
-    std::vector<float> v_f32(kv_heads * N_cpu * D);
+    int cpu_block = blocks;
 
-    for (int h = 0; h < kv_heads; h++) {
-      if (k.dtype() == float32) {
-        auto* kp = k.data<float>() + h * k_head_stride + N_gpu * k_seq_stride;
-        auto* vp = v.data<float>() + h * v_head_stride + N_gpu * v_seq_stride;
-        for (int pos = 0; pos < N_cpu; pos++) {
-          memcpy(k_f32.data() + h * N_cpu * D + pos * D, kp + pos * k_seq_stride, D * sizeof(float));
-          memcpy(v_f32.data() + h * N_cpu * D + pos * D, vp + pos * v_seq_stride, D * sizeof(float));
-        }
+    // Capture raw pointers for the thread (arrays are alive for the duration)
+    const void* q_raw = q.data<void>();
+    const void* k_raw = k.data<void>();
+    const void* v_raw = v.data<void>();
+    void* int_raw = intermediate.data<void>();
+    float* sums_raw = sums.data<float>();
+    float* maxs_raw = maxs.data<float>();
+    bool is_bf16 = (q.dtype() != float32);
+
+    cpu_thread = std::thread([=]() {
+      // Convert Q to float32
+      std::vector<float> q_f32(num_q_heads_total * D);
+      if (!is_bf16) {
+        memcpy(q_f32.data(), q_raw, num_q_heads_total * D * sizeof(float));
       } else {
-        // bfloat16 → float32 (vectorized: shift uint16 → uint32 << 16)
-        auto* kp = reinterpret_cast<const uint16_t*>(k.data<bfloat16_t>()) + h * k_head_stride + N_gpu * k_seq_stride;
-        auto* vp = reinterpret_cast<const uint16_t*>(v.data<bfloat16_t>()) + h * v_head_stride + N_gpu * v_seq_stride;
-        for (int pos = 0; pos < N_cpu; pos++) {
-          const uint16_t* ks = kp + pos * k_seq_stride;
-          const uint16_t* vs = vp + pos * v_seq_stride;
-          float* kd = k_f32.data() + h * N_cpu * D + pos * D;
-          float* vd = v_f32.data() + h * N_cpu * D + pos * D;
-          // Process 4 bf16 elements at a time using NEON
+        auto* qp = reinterpret_cast<const uint16_t*>(q_raw);
+        int total_q = num_q_heads_total * D;
+        int i = 0;
+#ifdef __ARM_NEON
+        for (; i + 3 < total_q; i += 4) {
+          uint16x4_t q16 = vld1_u16(qp + i);
+          uint32x4_t q32 = vshll_n_u16(q16, 16);
+          vst1q_f32(q_f32.data() + i, vreinterpretq_f32_u32(q32));
+        }
+#endif
+        for (; i < total_q; i++) {
+          uint32_t bits = static_cast<uint32_t>(qp[i]) << 16;
+          memcpy(&q_f32[i], &bits, 4);
+        }
+      }
+
+      // Convert CPU portion of K and V to contiguous float32
+      std::vector<float> k_f32(kv_heads * N_cpu * D);
+      std::vector<float> v_f32(kv_heads * N_cpu * D);
+
+      for (int h = 0; h < kv_heads; h++) {
+        if (!is_bf16) {
+          auto* kp = reinterpret_cast<const float*>(k_raw) + h * k_head_stride + N_gpu * k_seq_stride;
+          auto* vp = reinterpret_cast<const float*>(v_raw) + h * v_head_stride + N_gpu * v_seq_stride;
+          for (int pos = 0; pos < N_cpu; pos++) {
+            memcpy(k_f32.data() + h * N_cpu * D + pos * D, kp + pos * k_seq_stride, D * sizeof(float));
+            memcpy(v_f32.data() + h * N_cpu * D + pos * D, vp + pos * v_seq_stride, D * sizeof(float));
+          }
+        } else {
+          auto* kp = reinterpret_cast<const uint16_t*>(k_raw) + h * k_head_stride + N_gpu * k_seq_stride;
+          auto* vp = reinterpret_cast<const uint16_t*>(v_raw) + h * v_head_stride + N_gpu * v_seq_stride;
+          for (int pos = 0; pos < N_cpu; pos++) {
+            const uint16_t* ks = kp + pos * k_seq_stride;
+            const uint16_t* vs = vp + pos * v_seq_stride;
+            float* kd = k_f32.data() + h * N_cpu * D + pos * D;
+            float* vd = v_f32.data() + h * N_cpu * D + pos * D;
+            int d = 0;
+#ifdef __ARM_NEON
+            for (; d + 3 < D; d += 4) {
+              uint16x4_t k16 = vld1_u16(ks + d);
+              uint16x4_t v16 = vld1_u16(vs + d);
+              vst1q_f32(kd + d, vreinterpretq_f32_u32(vshll_n_u16(k16, 16)));
+              vst1q_f32(vd + d, vreinterpretq_f32_u32(vshll_n_u16(v16, 16)));
+            }
+#endif
+            for (; d < D; d++) {
+              uint32_t kb = static_cast<uint32_t>(ks[d]) << 16;
+              uint32_t vb = static_cast<uint32_t>(vs[d]) << 16;
+              memcpy(&kd[d], &kb, 4);
+              memcpy(&vd[d], &vb, 4);
+            }
+          }
+        }
+      }
+
+      // Run CPU attention via Accelerate BLAS
+      std::vector<float> cpu_out(num_q_heads_total * V_dim, 0.0f);
+      std::vector<float> cpu_maxs_v(num_q_heads_total, -1e38f);
+      std::vector<float> cpu_sums_v(num_q_heads_total, 0.0f);
+
+      cpu_sdpa_block(
+          q_f32.data(), k_f32.data(), v_f32.data(),
+          cpu_out.data(), cpu_sums_v.data(), cpu_maxs_v.data(),
+          num_q_heads_total, kv_heads, N_cpu, D, scale,
+          N_cpu * D, N_cpu * D);
+
+      // Write results to the extra block slot in intermediate arrays
+      for (int qh = 0; qh < num_q_heads_total; qh++) {
+        if (!is_bf16) {
+          float* int_ptr = reinterpret_cast<float*>(int_raw) +
+              qh * total_blocks * V_dim + cpu_block * V_dim;
+          memcpy(int_ptr, cpu_out.data() + qh * V_dim, V_dim * sizeof(float));
+        } else {
+          auto* out_bf16 = reinterpret_cast<uint16_t*>(int_raw) +
+              qh * total_blocks * V_dim + cpu_block * V_dim;
+          const float* src = cpu_out.data() + qh * V_dim;
           int d = 0;
-          for (; d + 3 < D; d += 4) {
-            // Load 4 uint16, zero-extend to uint32, shift left 16
-            uint16x4_t k16 = vld1_u16(ks + d);
-            uint16x4_t v16 = vld1_u16(vs + d);
-            uint32x4_t k32 = vshll_n_u16(k16, 16);
-            uint32x4_t v32 = vshll_n_u16(v16, 16);
-            vst1q_f32(kd + d, vreinterpretq_f32_u32(k32));
-            vst1q_f32(vd + d, vreinterpretq_f32_u32(v32));
+#ifdef __ARM_NEON
+          for (; d + 3 < V_dim; d += 4) {
+            // float32 → bfloat16: take upper 16 bits
+            uint32x4_t f32 = vld1q_u32(reinterpret_cast<const uint32_t*>(src + d));
+            uint16x4_t bf16 = vshrn_n_u32(f32, 16);
+            vst1_u16(out_bf16 + d, bf16);
           }
-          // Remainder
-          for (; d < D; d++) {
-            uint32_t kb = static_cast<uint32_t>(ks[d]) << 16;
-            uint32_t vb = static_cast<uint32_t>(vs[d]) << 16;
-            memcpy(&kd[d], &kb, 4);
-            memcpy(&vd[d], &vb, 4);
+#endif
+          for (; d < V_dim; d++) {
+            uint32_t bits;
+            memcpy(&bits, &src[d], 4);
+            out_bf16[d] = static_cast<uint16_t>(bits >> 16);
           }
         }
+
+        sums_raw[qh * total_blocks + cpu_block] = cpu_sums_v[qh];
+        maxs_raw[qh * total_blocks + cpu_block] = cpu_maxs_v[qh];
       }
-    }
-
-    // Run CPU attention (runs while GPU processes 2pass_1)
-    std::vector<float> cpu_out(num_q_heads_total * V_dim, 0.0f);
-    std::vector<float> cpu_maxs(num_q_heads_total, -1e38f);
-    std::vector<float> cpu_sums(num_q_heads_total, 0.0f);
-
-    cpu_sdpa_block(
-        q_f32.data(), k_f32.data(), v_f32.data(),
-        cpu_out.data(), cpu_sums.data(), cpu_maxs.data(),
-        num_q_heads_total, kv_heads, N_cpu, D, scale,
-        N_cpu * D, N_cpu * D);
-
-    // Write CPU results to the extra block slot in intermediate arrays.
-    // intermediate layout: [batch*q_heads*q_seq, total_blocks, V_dim]
-    // sums/maxs layout: [batch*q_heads*q_seq, total_blocks]
-    int cpu_block = blocks;  // extra block index
-    for (int qh = 0; qh < num_q_heads_total; qh++) {
-      // Write CPU output to intermediate
-      float* int_ptr = intermediate.data<float>() +
-          qh * total_blocks * V_dim + cpu_block * V_dim;
-      // Convert float32 → output dtype if needed
-      if (q.dtype() == float32) {
-        memcpy(int_ptr, cpu_out.data() + qh * V_dim, V_dim * sizeof(float));
-      } else {
-        // float32 → bfloat16
-        auto* out_bf16 = reinterpret_cast<uint16_t*>(
-            intermediate.data<bfloat16_t>()) +
-            qh * total_blocks * V_dim + cpu_block * V_dim;
-        for (int d = 0; d < V_dim; d++) {
-          uint32_t bits;
-          memcpy(&bits, &cpu_out[qh * V_dim + d], 4);
-          out_bf16[d] = static_cast<uint16_t>(bits >> 16);
-        }
-      }
-
-      // Write CPU max and sum_exp
-      float* sums_ptr = sums.data<float>() + qh * total_blocks + cpu_block;
-      float* maxs_ptr = maxs.data<float>() + qh * total_blocks + cpu_block;
-      *sums_ptr = cpu_sums[qh];
-      *maxs_ptr = cpu_maxs[qh];
-    }
+    });
   }
 #endif
+
+  // Wait for CPU thread to finish before dispatching 2pass_2.
+  // The GPU is still running 2pass_1 asynchronously — no idle time.
+  if (cpu_thread.joinable()) {
+    cpu_thread.join();
+  }
 
   // Final pass (2pass_2) — merges all blocks including CPU block
   kname.clear();
