@@ -42,13 +42,10 @@ struct SumOp {
   void operator()(const T* input, T* output, size_t N) const {
     if constexpr (std::is_same_v<T, float>) {
       neon_sum_f32(input, output, N);
-    } else if constexpr (sizeof(T) == 2) {
-      // bfloat16 / float16 — treat as uint16_t for NEON
-      neon_sum_f16(
-          reinterpret_cast<const uint16_t*>(input),
-          reinterpret_cast<uint16_t*>(output),
-          N);
     } else {
+      // bfloat16 and other types use scalar path.
+      // NEON vaddq_f16 is IEEE float16 only — using it on bfloat16
+      // (different bit layout) produces garbage.
       while (N-- > 0) {
         *output += *input;
         input++;
