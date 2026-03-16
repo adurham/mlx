@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -14,6 +15,20 @@
 namespace mlx::core::fast {
 
 namespace {
+
+// Target total threadgroups for M3/M4 SDPA 2-pass kernel.
+// Configurable via MLX_SDPA_MAX_TG environment variable.
+// Default 320 = ~8 rounds on M4 Max (40 cores).
+int sdpa_max_threadgroups() {
+  static int val = [] {
+    if (auto* env = std::getenv("MLX_SDPA_MAX_TG")) {
+      int v = std::atoi(env);
+      return v > 0 ? v : 320;
+    }
+    return 320;
+  }();
+  return val;
+}
 
 void sdpa_full_self_attention_nax(
     const Stream& s,
@@ -490,7 +505,7 @@ void sdpa_vector_2pass(
     // keeping enough iterations per block for full SIMD utilization.
     int tg_per_block = k.shape(1) * q.shape(0);
     if (tg_per_block > 0) {
-      int max_blocks = std::max(32, 320 / tg_per_block);
+      int max_blocks = std::max(32, sdpa_max_threadgroups() / tg_per_block);
       blocks = std::min(blocks, max_blocks);
     }
   }
@@ -994,7 +1009,7 @@ void sdpa_vector_2pass_quantized_dispatch(
     // See comment in non-quantized 2-pass kernel above for rationale.
     int tg_per_block = k_data.shape(1) * q.shape(0);
     if (tg_per_block > 0) {
-      int max_blocks = std::max(32, 320 / tg_per_block);
+      int max_blocks = std::max(32, sdpa_max_threadgroups() / tg_per_block);
       blocks = std::min(blocks, max_blocks);
     }
   }
