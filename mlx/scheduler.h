@@ -34,11 +34,47 @@ struct StreamThread {
   }
 
   void thread_fn() {
+    // Spin-wait duration before falling back to condvar sleep.
+    // During decode, RDMA tasks arrive in rapid succession (~188 per token).
+    // Spinning avoids the ~10-30μs kernel context switch cost of condvar wake.
+    // MLX_STREAM_SPIN_US=0 disables spinning (original behavior).
+    static int spin_us = [] {
+      if (auto* env = std::getenv("MLX_STREAM_SPIN_US")) {
+        return std::atoi(env);
+      }
+      return 200; // Default: spin for 200μs before sleeping
+    }();
+
     while (true) {
       std::function<void()> task;
       {
         std::unique_lock<std::mutex> lk(mtx);
-        cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+        if (q.empty() && spin_us > 0) {
+          // Spin-wait: check queue frequently without sleeping
+          lk.unlock();
+          auto deadline = std::chrono::steady_clock::now() +
+              std::chrono::microseconds(spin_us);
+          bool found = false;
+          while (std::chrono::steady_clock::now() < deadline) {
+            // Brief pause to avoid hammering the mutex
+            for (int i = 0; i < 32; i++) {
+              __builtin_arm_yield(); // ARM yield hint
+            }
+            lk.lock();
+            if (!q.empty() || stop) {
+              found = true;
+              break;
+            }
+            lk.unlock();
+          }
+          if (!found) {
+            lk.lock();
+            // Fall back to condvar sleep if still empty after spin
+            cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+          }
+        } else if (q.empty()) {
+          cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+        }
         if (q.empty() && stop) {
           return;
         }
