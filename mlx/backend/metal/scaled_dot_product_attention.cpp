@@ -43,6 +43,94 @@ bool use_split_pass() {
   return val;
 }
 
+// CPU-assisted SDPA: fraction of KV positions to process on CPU.
+// 0.0 = disabled, 0.1 = 10% of positions on CPU.
+float cpu_assist_fraction() {
+  static float val = [] {
+    if (auto* env = std::getenv("MLX_SDPA_CPU_FRACTION")) {
+      float v = std::atof(env);
+      return (v > 0.0f && v < 1.0f) ? v : 0.0f;
+    }
+    return 0.0f;
+  }();
+  return val;
+}
+
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+
+// CPU attention using Accelerate BLAS.
+// Processes a contiguous range of KV positions on CPU while GPU handles the rest.
+// Results are written into the block slot at `block_idx` in the intermediate arrays.
+void cpu_sdpa_block(
+    const float* q_data,       // (num_q_heads, D) — queries as float32
+    const float* k_data,       // (N_cpu, D) per KV head — contiguous float32 K
+    const float* v_data,       // (N_cpu, D) per KV head — contiguous float32 V
+    float* out_data,           // output slot: (num_q_heads, D)
+    float* sums_data,          // sum_exp slot: (num_q_heads,)
+    float* maxs_data,          // max_score slot: (num_q_heads,)
+    int num_q_heads,
+    int num_kv_heads,
+    int N_cpu,
+    int D,
+    float scale,
+    size_t k_head_stride,
+    size_t v_head_stride) {
+
+  int gqa = num_q_heads / num_kv_heads;
+
+  // Temp buffers for scores and exp
+  float* scores = (float*)malloc(gqa * N_cpu * sizeof(float));
+  float* exp_buf = (float*)malloc(gqa * N_cpu * sizeof(float));
+
+  for (int kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+    const float* k_head = k_data + kv_h * k_head_stride;
+    const float* v_head = v_data + kv_h * v_head_stride;
+    const float* q_group = q_data + kv_h * gqa * D;
+    float* out_group = out_data + kv_h * gqa * D;
+    float* max_group = maxs_data + kv_h * gqa;
+    float* sum_group = sums_data + kv_h * gqa;
+
+    // Scores = Q @ K^T: (gqa, D) × (D, N_cpu) → (gqa, N_cpu)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                gqa, N_cpu, D,
+                scale, q_group, D,
+                k_head, D,
+                0.0f, scores, N_cpu);
+
+    // Per-Q-head softmax
+    for (int qi = 0; qi < gqa; qi++) {
+      float* s = scores + qi * N_cpu;
+      float* e = exp_buf + qi * N_cpu;
+
+      float max_s;
+      vDSP_maxv(s, 1, &max_s, N_cpu);
+
+      float neg_max = -max_s;
+      vDSP_vsadd(s, 1, &neg_max, e, 1, N_cpu);
+      int n_int = N_cpu;
+      vvexpf(e, e, &n_int);
+
+      float sum_e;
+      vDSP_sve(e, 1, &sum_e, N_cpu);
+
+      max_group[qi] = max_s;
+      sum_group[qi] = sum_e;
+    }
+
+    // Output = exp_scores @ V: (gqa, N_cpu) × (N_cpu, D) → (gqa, D)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                gqa, D, N_cpu,
+                1.0f, exp_buf, N_cpu,
+                v_head, D,
+                0.0f, out_group, D);
+  }
+
+  free(scores);
+  free(exp_buf);
+}
+#endif // __APPLE__
+
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -526,15 +614,32 @@ void sdpa_vector_2pass(
   size_t k_seq_stride = k.strides()[2];
   size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
   size_t v_seq_stride = v.strides()[2];
+
+  // CPU-assisted SDPA: reduce GPU's N and add a CPU block for the tail positions.
+  float cpu_frac = cpu_assist_fraction();
+  int N_gpu = N;
+  int N_cpu = 0;
+  bool do_cpu_assist = false;
+#ifdef __APPLE__
+  if (cpu_frac > 0.0f && N > 1024 && q.shape(2) == 1 && !mask.has_value()) {
+    N_cpu = std::max(64, static_cast<int>(N * cpu_frac));
+    N_gpu = N - N_cpu;
+    do_cpu_assist = true;
+  }
+#endif
+
+  // When CPU-assisted, allocate blocks+1 for the extra CPU block
+  int total_blocks = do_cpu_assist ? blocks + 1 : blocks;
+
   MTL::Size group_dims(32, gqa_factor, q.shape(2));
   MTL::Size grid_dims(k.shape(1), q.shape(0), blocks);
 
-  // Allocate the intermediates
+  // Allocate the intermediates (with extra block slot if CPU-assisted)
   Shape intermediate_shape;
   intermediate_shape.reserve(out.ndim() + 1);
   intermediate_shape.insert(
       intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
-  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(total_blocks);
   intermediate_shape.push_back(out.shape().back());
   array intermediate(intermediate_shape, q.dtype(), nullptr, {});
   intermediate_shape.pop_back();
@@ -669,7 +774,7 @@ void sdpa_vector_2pass(
   compute_encoder.set_output_array(intermediate, 3);
   compute_encoder.set_output_array(sums, 4);
   compute_encoder.set_output_array(maxs, 5);
-  compute_encoder.set_bytes(N, 7);
+  compute_encoder.set_bytes(N_gpu, 7);
   compute_encoder.set_bytes(k_head_stride, 8);
   compute_encoder.set_bytes(k_seq_stride, 9);
   compute_encoder.set_bytes(v_head_stride, 10);
@@ -690,10 +795,107 @@ void sdpa_vector_2pass(
     compute_encoder.set_input_array(*sinks, 18);
   }
 
-  // Launch
+  // Launch GPU kernel (2pass_1)
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
-  // Final pass
+#ifdef __APPLE__
+  // CPU-assisted attention: process tail positions on CPU while GPU runs 2pass_1.
+  // The GPU processes [0, N_gpu) and the CPU processes [N_gpu, N).
+  // CPU writes its results as an extra block in the intermediate arrays.
+  // The 2pass_2 merge kernel then combines GPU blocks + CPU block.
+  if (do_cpu_assist) {
+    int num_q_heads_total = q.shape(0) * q.shape(1);
+    int D = q.shape(-1);
+    int V_dim = v.shape(-1);
+
+    // Convert Q to float32 for CPU BLAS (Q is small — just 1 token)
+    std::vector<float> q_f32(num_q_heads_total * D);
+    if (q.dtype() == float32) {
+      auto* qp = q.data<float>();
+      for (int i = 0; i < num_q_heads_total; i++) {
+        memcpy(q_f32.data() + i * D, qp + i * D, D * sizeof(float));
+      }
+    } else {
+      // bfloat16 → float32
+      auto* qp = reinterpret_cast<const uint16_t*>(q.data<bfloat16_t>());
+      for (int i = 0; i < num_q_heads_total * D; i++) {
+        uint32_t bits = static_cast<uint32_t>(qp[i]) << 16;
+        memcpy(&q_f32[i], &bits, 4);
+      }
+    }
+
+    // Convert CPU portion of K and V to float32
+    int kv_heads = k.shape(1);
+    std::vector<float> k_f32(kv_heads * N_cpu * D);
+    std::vector<float> v_f32(kv_heads * N_cpu * D);
+
+    for (int h = 0; h < kv_heads; h++) {
+      if (k.dtype() == float32) {
+        auto* kp = k.data<float>() + h * k_head_stride + N_gpu * k_seq_stride;
+        auto* vp = v.data<float>() + h * v_head_stride + N_gpu * v_seq_stride;
+        for (int pos = 0; pos < N_cpu; pos++) {
+          memcpy(k_f32.data() + h * N_cpu * D + pos * D, kp + pos * k_seq_stride, D * sizeof(float));
+          memcpy(v_f32.data() + h * N_cpu * D + pos * D, vp + pos * v_seq_stride, D * sizeof(float));
+        }
+      } else {
+        // bfloat16 → float32
+        auto* kp = reinterpret_cast<const uint16_t*>(k.data<bfloat16_t>()) + h * k_head_stride + N_gpu * k_seq_stride;
+        auto* vp = reinterpret_cast<const uint16_t*>(v.data<bfloat16_t>()) + h * v_head_stride + N_gpu * v_seq_stride;
+        for (int pos = 0; pos < N_cpu; pos++) {
+          for (int d = 0; d < D; d++) {
+            uint32_t kb = static_cast<uint32_t>(kp[pos * k_seq_stride + d]) << 16;
+            uint32_t vb = static_cast<uint32_t>(vp[pos * v_seq_stride + d]) << 16;
+            memcpy(&k_f32[h * N_cpu * D + pos * D + d], &kb, 4);
+            memcpy(&v_f32[h * N_cpu * D + pos * D + d], &vb, 4);
+          }
+        }
+      }
+    }
+
+    // Run CPU attention (runs while GPU processes 2pass_1)
+    std::vector<float> cpu_out(num_q_heads_total * V_dim, 0.0f);
+    std::vector<float> cpu_maxs(num_q_heads_total, -1e38f);
+    std::vector<float> cpu_sums(num_q_heads_total, 0.0f);
+
+    cpu_sdpa_block(
+        q_f32.data(), k_f32.data(), v_f32.data(),
+        cpu_out.data(), cpu_sums.data(), cpu_maxs.data(),
+        num_q_heads_total, kv_heads, N_cpu, D, scale,
+        N_cpu * D, N_cpu * D);
+
+    // Write CPU results to the extra block slot in intermediate arrays.
+    // intermediate layout: [batch*q_heads*q_seq, total_blocks, V_dim]
+    // sums/maxs layout: [batch*q_heads*q_seq, total_blocks]
+    int cpu_block = blocks;  // extra block index
+    for (int qh = 0; qh < num_q_heads_total; qh++) {
+      // Write CPU output to intermediate
+      float* int_ptr = intermediate.data<float>() +
+          qh * total_blocks * V_dim + cpu_block * V_dim;
+      // Convert float32 → output dtype if needed
+      if (q.dtype() == float32) {
+        memcpy(int_ptr, cpu_out.data() + qh * V_dim, V_dim * sizeof(float));
+      } else {
+        // float32 → bfloat16
+        auto* out_bf16 = reinterpret_cast<uint16_t*>(
+            intermediate.data<bfloat16_t>()) +
+            qh * total_blocks * V_dim + cpu_block * V_dim;
+        for (int d = 0; d < V_dim; d++) {
+          uint32_t bits;
+          memcpy(&bits, &cpu_out[qh * V_dim + d], 4);
+          out_bf16[d] = static_cast<uint16_t>(bits >> 16);
+        }
+      }
+
+      // Write CPU max and sum_exp
+      float* sums_ptr = sums.data<float>() + qh * total_blocks + cpu_block;
+      float* maxs_ptr = maxs.data<float>() + qh * total_blocks + cpu_block;
+      *sums_ptr = cpu_sums[qh];
+      *maxs_ptr = cpu_maxs[qh];
+    }
+  }
+#endif
+
+  // Final pass (2pass_2) — merges all blocks including CPU block
   kname.clear();
   kname = "sdpa_vector_2pass_2_";
   kname += get_type_string(q.dtype());
@@ -709,7 +911,7 @@ void sdpa_vector_2pass(
   compute_encoder.set_input_array(sums, 1);
   compute_encoder.set_input_array(maxs, 2);
   compute_encoder.set_output_array(out, 3);
-  compute_encoder.set_bytes(blocks, 4);
+  compute_encoder.set_bytes(total_blocks, 4);
 
   // Launch
   group_dims = MTL::Size(1024, 1, 1);
