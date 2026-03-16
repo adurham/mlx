@@ -30,6 +30,19 @@ int sdpa_max_threadgroups() {
   return val;
 }
 
+// Use split-pass SDPA (separate score+max pass, then streaming V pass).
+// Optimized for Apple Silicon's high bandwidth — eliminates online softmax
+// serial dependency in the V accumulation loop.
+bool use_split_pass() {
+  static bool val = [] {
+    if (auto* env = std::getenv("MLX_SDPA_SPLIT_PASS")) {
+      return std::string(env) == "1";
+    }
+    return false;
+  }();
+  return val;
+}
+
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -539,6 +552,117 @@ void sdpa_vector_2pass(
   bool float_mask = has_mask && !bool_mask;
   bool query_transposed = !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
+
+  // Split-pass SDPA: separate score+max pass + streaming V pass.
+  if (use_split_pass()) {
+    int positions_per_block = (N + blocks - 1) / blocks;
+    int total_heads = q.shape(0) * q.shape(1);
+    int total_q_seq = q.shape(2);
+
+    // Allocate scores intermediate
+    int64_t scores_size = static_cast<int64_t>(total_heads) * total_q_seq *
+        blocks * positions_per_block;
+    array scores_buf({static_cast<int>(scores_size)}, float32, nullptr, {});
+    scores_buf.set_data(allocator::malloc(scores_buf.nbytes()));
+    d.add_temporary(scores_buf, s.index);
+
+    metal::MTLFCList fc = {
+        {&has_mask, MTL::DataType::DataTypeBool, 20},
+        {&query_transposed, MTL::DataType::DataTypeBool, 21},
+        {&do_causal, MTL::DataType::DataTypeBool, 22},
+        {&bool_mask, MTL::DataType::DataTypeBool, 23},
+        {&float_mask, MTL::DataType::DataTypeBool, 24},
+        {&has_sinks, MTL::DataType::DataTypeBool, 25},
+        {&blocks, MTL::DataType::DataTypeInt, 26},
+    };
+
+    // --- Pass A: Score + max ---
+    std::string sk = "sdpa_vector_split_scores_";
+    sk += get_type_string(q.dtype());
+    sk += "_";
+    sk += std::to_string(q.shape(-1));
+    std::string sh = sk + (has_mask ? (bool_mask ? "_bm" : "_fm") : "_nm");
+    sh += query_transposed ? "_qt" : "_qnt";
+    sh += do_causal ? "_c" : "_nc";
+    sh += has_sinks ? "_s_" : "_ns_";
+    sh += std::to_string(blocks);
+
+    auto& enc = d.get_command_encoder(s.index);
+    auto kernel = d.get_kernel(sk, sh, fc);
+    check_kernel_threadgroup_size(kernel, group_dims, sh);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(q, 0);
+    enc.set_input_array(k, 1);
+    enc.set_output_array(scores_buf, 2);
+    enc.set_output_array(maxs, 3);
+    enc.set_bytes(N, 4);
+    enc.set_bytes(positions_per_block, 5);
+    enc.set_bytes(k_head_stride, 6);
+    enc.set_bytes(k_seq_stride, 7);
+    enc.set_bytes(scale, 8);
+    if (has_mask) {
+      auto& m = *mask;
+      enc.set_input_array(m, 9 + float_mask);
+      int32_t kvs = m.shape(3) > 1 ? m.strides(3) : 0;
+      int32_t qs = m.shape(2) > 1 ? m.strides(2) : 0;
+      int32_t hs =
+          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+      enc.set_bytes(kvs, 11);
+      enc.set_bytes(qs, 12);
+      enc.set_bytes(hs, 13);
+    }
+    if (has_sinks) {
+      enc.set_input_array(*sinks, 14);
+    }
+    enc.dispatch_threadgroups(grid_dims, group_dims);
+
+    // --- Pass B: Streaming V accumulation ---
+    std::string vk = "sdpa_vector_split_values_";
+    vk += get_type_string(q.dtype());
+    vk += "_";
+    vk += std::to_string(q.shape(-1));
+    vk += "_";
+    vk += std::to_string(v.shape(-1));
+    std::string vh = vk + (has_sinks ? "_s_" : "_ns_");
+    vh += std::to_string(blocks);
+
+    metal::MTLFCList vfc = {
+        {&has_sinks, MTL::DataType::DataTypeBool, 25},
+        {&blocks, MTL::DataType::DataTypeInt, 26},
+    };
+    kernel = d.get_kernel(vk, vh, vfc);
+    check_kernel_threadgroup_size(kernel, group_dims, vh);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(scores_buf, 0);
+    enc.set_input_array(v, 1);
+    enc.set_output_array(intermediate, 2);
+    enc.set_output_array(sums, 3);
+    enc.set_input_array(maxs, 4);
+    enc.set_bytes(N, 5);
+    enc.set_bytes(positions_per_block, 6);
+    enc.set_bytes(v_head_stride, 7);
+    enc.set_bytes(v_seq_stride, 8);
+    enc.dispatch_threadgroups(grid_dims, group_dims);
+
+    // --- Pass C: Merge blocks (reuse 2pass_2) ---
+    std::string mk = "sdpa_vector_2pass_2_";
+    mk += get_type_string(q.dtype());
+    mk += "_";
+    mk += std::to_string(v.shape(-1));
+    kernel = d.get_kernel(mk);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(intermediate, 0);
+    enc.set_input_array(sums, 1);
+    enc.set_input_array(maxs, 2);
+    enc.set_output_array(out, 3);
+    enc.set_bytes(blocks, 4);
+    MTL::Size mg(1024, 1, 1);
+    MTL::Size mgrid(q.shape(0) * q.shape(1), q.shape(2), 1);
+    check_kernel_threadgroup_size(kernel, mg, mk);
+    enc.dispatch_threadgroups(mgrid, mg);
+    return;
+  }
+
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},

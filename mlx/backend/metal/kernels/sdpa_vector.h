@@ -392,3 +392,241 @@ template <typename T, int D>
     }
   }
 }
+
+// ============================================================================
+// Split-pass SDPA: optimized for Apple Silicon's high-bandwidth unified memory.
+//
+// Instead of online softmax (which serializes the KV loop due to running max
+// dependency), split into two passes:
+//   Pass A: Read K, compute Q·K scores, find block max. Store scores.
+//   Pass B: Read V + stored scores. With KNOWN max (constant), stream through
+//           V at full bandwidth — zero dependency between positions.
+//
+// Trades 8MB of intermediate score storage for elimination of the serial
+// dependency in the V accumulation loop.
+// ============================================================================
+
+// Pass A: Score computation + block max finding.
+// Reads K only. No V, no exp(), no V accumulation.
+// Still has max dependency but loop is much lighter.
+template <typename T, int D>
+[[kernel]] void sdpa_vector_split_scores(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    device float* scores_out [[buffer(2)]],
+    device float* maxs [[buffer(3)]],
+    const constant int& N [[buffer(4)]],
+    const constant int& positions_per_block [[buffer(5)]],
+    const constant size_t& k_head_stride [[buffer(6)]],
+    const constant size_t& k_seq_stride [[buffer(7)]],
+    const constant float& scale [[buffer(8)]],
+    const device bool* bmask [[buffer(9), function_constant(bool_mask)]],
+    const device T* fmask [[buffer(10), function_constant(float_mask)]],
+    const constant int& mask_kv_seq_stride
+    [[buffer(11), function_constant(has_mask)]],
+    const constant int& mask_q_seq_stride
+    [[buffer(12), function_constant(has_mask)]],
+    const constant int& mask_head_stride
+    [[buffer(13), function_constant(has_mask)]],
+    const device T* sinks [[buffer(14), function_constant(has_sinks)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+
+  typedef float U;
+
+  thread U q[qk_per_thread];
+
+  // Adjust positions (same as 2pass_1)
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const int block_idx = tid.z;
+  const int gqa_factor = tptg.y;
+  const int q_seq_len = tptg.z;
+  const int q_seq_idx = tidtg.z;
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_batch_head_idx = (batch_idx * num_q_heads + q_head_idx);
+  const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
+  const int q_offset =
+      query_transposed ? num_q_heads * q_seq_idx + q_batch_head_idx : o_offset;
+
+  queries += q_offset * D + simd_lid * qk_per_thread;
+
+  const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
+  keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
+      simd_lid * qk_per_thread;
+
+  // Score output: [o_offset, blocks, positions_per_block]
+  scores_out += o_offset * blocks * positions_per_block +
+      block_idx * positions_per_block;
+  maxs += o_offset * blocks + block_idx;
+
+  if (bool_mask) {
+    bmask += q_batch_head_idx * mask_head_stride +
+        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  }
+  if (float_mask) {
+    fmask += q_batch_head_idx * mask_head_stride +
+        block_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  }
+
+  // Read the query
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+
+  U max_score = Limits<U>::finite_min;
+  if (has_sinks && block_idx == 0) {
+    max_score = static_cast<U>(sinks[q_head_idx]);
+  }
+
+  // Score computation loop: K read + dot product + max tracking only.
+  // No V read, no exp(), no V accumulation — much lighter than online softmax.
+  int pos_idx = 0;
+  for (int i = block_idx; i < N; i += blocks) {
+    U score = Limits<U>::finite_min;
+
+    bool use_key = true;
+    if (do_causal) {
+      use_key = i <= (N - q_seq_len + int(q_seq_idx));
+    } else if (bool_mask) {
+      use_key = bmask[0];
+    } else if (float_mask) {
+      use_key = (fmask[0] >= Limits<T>::finite_min);
+    }
+
+    if (use_key) {
+      score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * keys[j];
+      }
+      score = simd_sum(score);
+      if (float_mask) {
+        score += fmask[0];
+      }
+      max_score = max(max_score, score);
+    }
+
+    // Store score — only lane 0 has the full value after simd_sum
+    if (simd_lid == 0) {
+      scores_out[pos_idx] = score;
+    }
+
+    keys += blocks * int(k_seq_stride);
+    if (bool_mask) {
+      bmask += blocks * mask_kv_seq_stride;
+    }
+    if (float_mask) {
+      fmask += blocks * mask_kv_seq_stride;
+    }
+    pos_idx++;
+  }
+
+  // Write block max
+  if (simd_lid == 0) {
+    maxs[0] = max_score;
+  }
+}
+
+// Pass B: V accumulation with KNOWN block max.
+// Reads stored scores + V. The block max is a CONSTANT — there is ZERO
+// dependency between loop iterations. The GPU can stream through V at
+// full memory bandwidth without stopping.
+template <typename T, int D, int V = D>
+[[kernel]] void sdpa_vector_split_values(
+    const device float* scores_in [[buffer(0)]],
+    const device T* values [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    device float* sums [[buffer(3)]],
+    const device float* maxs [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    const constant int& positions_per_block [[buffer(6)]],
+    const constant size_t& v_head_stride [[buffer(7)]],
+    const constant size_t& v_seq_stride [[buffer(8)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int v_per_thread = V / BD;
+
+  typedef float U;
+
+  thread U o[v_per_thread] = {0};
+
+  // Same position setup as scores pass
+  const int kv_head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const int block_idx = tid.z;
+  const int gqa_factor = tptg.y;
+  const int q_seq_len = tptg.z;
+  const int q_seq_idx = tidtg.z;
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_batch_head_idx = (batch_idx * num_q_heads + q_head_idx);
+  const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
+
+  const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
+  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
+      simd_lid * v_per_thread;
+  out += o_offset * blocks * V + block_idx * V + simd_lid * v_per_thread;
+
+  // Score input: [o_offset, blocks, positions_per_block]
+  scores_in += o_offset * blocks * positions_per_block +
+      block_idx * positions_per_block;
+  sums += o_offset * blocks + block_idx;
+  maxs += o_offset * blocks + block_idx;
+
+  // Read block max ONCE — this is constant for the entire loop.
+  // This is what eliminates the serial dependency.
+  U block_max = maxs[0];
+  U sum_exp_score = 0;
+
+  // Sinks handling: block 0 gets an extra contribution to sum_exp
+  if (has_sinks && block_idx == 0) {
+    sum_exp_score = 1;
+  }
+
+  // Streaming V accumulation: ZERO dependency between iterations.
+  // Each position independently computes exp(score - constant_max) * V.
+  // The GPU can prefetch V freely — no waiting on previous iterations.
+  int pos_idx = 0;
+  for (int i = block_idx; i < N; i += blocks) {
+    // Read stored score — broadcast from lane 0 to all lanes
+    U score = 0;
+    if (simd_lid == 0) {
+      score = scores_in[pos_idx];
+    }
+    score = simd_broadcast_first(score);
+
+    if (score > Limits<U>::finite_min) {
+      U exp_score = fast::exp(score - block_max);
+      sum_exp_score += exp_score;
+
+      // Simple accumulation — no rescaling by factor!
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] += exp_score * static_cast<U>(values[j]);
+      }
+    }
+
+    values += blocks * int(v_seq_stride);
+    pos_idx++;
+  }
+
+  // Write sum and partial outputs (same format as 2pass_1)
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+  }
+
+  for (int i = 0; i < v_per_thread; i++) {
+    out[i] = static_cast<T>(o[i]);
+  }
+}
