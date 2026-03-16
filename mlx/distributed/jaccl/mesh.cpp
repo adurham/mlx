@@ -25,6 +25,23 @@ static bool _jaccl_trace = [] {
 
 #define JACCL_TRACE(...) do { if (_jaccl_trace) fprintf(stderr, __VA_ARGS__); } while(0)
 
+size_t MeshGroup::calculate_pool_size(int num_peers) {
+  size_t total = 0;
+  for (int k = 0; k < BUFFER_SIZES; k++) {
+    size_t buf_size = FRAME_SIZE * (1 << k);
+    // Mesh buffers: NUM_BUFFERS × num_peers
+    total += NUM_BUFFERS * num_peers * buf_size;
+    // Ring buffers: NUM_BUFFERS × 2 directions × 2 (send+recv)
+    total += NUM_BUFFERS * 2 * 2 * buf_size;
+    // Sub buffers: NUM_BUFFERS × 2 (send+recv) — only for 3+ nodes
+    if (num_peers > 2) {
+      total += NUM_BUFFERS * 2 * buf_size;
+    }
+  }
+  // Add 10% headroom for page alignment
+  return total + total / 10;
+}
+
 MeshGroup::MeshGroup(
     int rank,
     const std::vector<std::string>& device_names,
@@ -32,7 +49,8 @@ MeshGroup::MeshGroup(
     : rank_(rank),
       size_(device_names.size()),
       side_channel_(rank_, size_, coordinator_addr),
-      connections_(create_connections(device_names)) {
+      connections_(create_connections(device_names)),
+      pool_(calculate_pool_size(device_names.size())) {
   if (size_ > MESH_MAX_PEERS) {
     std::ostringstream msg;
     msg << "[jaccl] The JACCL mesh supports up to " << MESH_MAX_PEERS
@@ -108,34 +126,43 @@ void MeshGroup::allocate_buffers() {
   sub_send_buffers_.clear();
   sub_recv_buffers_.clear();
 
-  // Allocate the memory
+  // Allocate from pool — uses 1 MR per PD instead of 1 per buffer
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
+      size_t buf_size = FRAME_SIZE * (1 << k);
       // Mesh buffers
       for (int j = 0; j < size_; j++) {
-        buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        buffers_.push_back(pool_.allocate(buf_size));
       }
       // Ring buffers (1 for each direction)
       for (int j = 0; j < 2; j++) {
-        ring_send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-        ring_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        ring_send_buffers_.push_back(pool_.allocate(buf_size));
+        ring_recv_buffers_.push_back(pool_.allocate(buf_size));
       }
-      // Sub-group buffers (for split() sub-groups).
-      // Only needed for 3+ node meshes (hybrid TP+PP).
-      // Skipped for size_ <= 2 to stay within per-PD MR limits.
+      // Sub-group buffers
       if (size_ > 2) {
-        sub_send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-        sub_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        sub_send_buffers_.push_back(pool_.allocate(buf_size));
+        sub_recv_buffers_.push_back(pool_.allocate(buf_size));
       }
     }
   }
 
+  // Register the pool once per protection domain instead of each buffer.
+  // This uses 1 MR per PD regardless of buffer count, bypassing the
+  // 100-MR-per-device limit.
+  for (auto& conn : connections_) {
+    if (conn.ctx != nullptr) {
+      pool_.register_to_protection_domain(conn.protection_domain);
+    }
+  }
+
+  // Pool-backed buffers don't need individual registration — they inherit
+  // lkey/rkey from the pool's MR. The registration calls below are no-ops
+  // for pool-backed buffers (checked in SharedBuffer::register_to_protection_domain).
+  // We keep the calls for compatibility if standalone buffers are ever mixed in.
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
-      // Mesh buffers
       for (int j = 0; j < size_; j++) {
-        // This is our send buffer so register it with all pds so we can send
-        // it to all connected devices.
         if (j == rank_) {
           for (auto& conn : connections_) {
             if (conn.ctx != nullptr) {
@@ -143,18 +170,12 @@ void MeshGroup::allocate_buffers() {
                   .register_to_protection_domain(conn.protection_domain);
             }
           }
-        }
-
-        // This is the recv buffer from rank j so register it to rank j's
-        // protection domain.
-        else {
+        } else {
           buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
               .register_to_protection_domain(connections_[j].protection_domain);
         }
       }
 
-      // Ring buffers (see ring group for the logic below)
-      // We register send buffers to both the right and the left.
       int left = (rank_ + size_ - 1) % size_;
       int right = (rank_ + 1) % size_;
       ring_send_buffers_[k * NUM_BUFFERS * 2 + i * 2 + 0]
@@ -166,8 +187,6 @@ void MeshGroup::allocate_buffers() {
       ring_recv_buffers_[k * NUM_BUFFERS * 2 + i * 2 + 1]
           .register_to_protection_domain(connections_[right].protection_domain);
 
-      // Sub-group buffers: register to ALL peer PDs so any sub-group
-      // configuration can use them. Only allocated for 3+ node meshes.
       if (size_ > 2) {
         for (auto& conn : connections_) {
           if (conn.ctx != nullptr) {

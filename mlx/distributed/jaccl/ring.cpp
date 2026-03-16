@@ -7,6 +7,16 @@
 
 namespace mlx::core::distributed::jaccl {
 
+size_t RingGroup::calculate_pool_size(int n_conns) {
+  size_t total = 0;
+  for (int k = 0; k < BUFFER_SIZES; k++) {
+    size_t buf_size = FRAME_SIZE * (1 << k);
+    // send + recv, n_conns connections, 2 directions
+    total += NUM_BUFFERS * n_conns * 2 * 2 * buf_size;
+  }
+  return total + total / 10;
+}
+
 RingGroup::RingGroup(
     int rank,
     int size,
@@ -18,7 +28,8 @@ RingGroup::RingGroup(
       n_conns_(left_devices.size()),
       side_channel_(rank_, size_, coordinator_addr),
       left_(create_connections(left_devices)),
-      right_(create_connections(right_devices)) {
+      right_(create_connections(right_devices)),
+      pool_(calculate_pool_size(left_devices.size())) {
   if (left_.size() > RING_MAX_CONNS || right_.size() > RING_MAX_CONNS) {
     std::ostringstream msg;
     msg << "[jaccl] Up to " << RING_MAX_CONNS << " per direction supported but "
@@ -96,17 +107,30 @@ void RingGroup::allocate_buffers() {
   send_buffers_.clear();
   recv_buffers_.clear();
 
-  // Allocate the memory
+  // Allocate from pool
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
+      size_t buf_size = FRAME_SIZE * (1 << k);
       for (int j = 0; j < n_conns_ * 2; j++) {
-        send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
-        recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+        send_buffers_.push_back(pool_.allocate(buf_size));
+        recv_buffers_.push_back(pool_.allocate(buf_size));
       }
     }
   }
 
-  // Register the buffers with the corresponding connections
+  // Register the pool once per PD
+  for (auto& conn : left_) {
+    if (conn.ctx != nullptr) {
+      pool_.register_to_protection_domain(conn.protection_domain);
+    }
+  }
+  for (auto& conn : right_) {
+    if (conn.ctx != nullptr) {
+      pool_.register_to_protection_domain(conn.protection_domain);
+    }
+  }
+
+  // Pool-backed buffers inherit lkey from pool — registration is a no-op
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
       for (int j = 0; j < n_conns_ * 2; j++) {

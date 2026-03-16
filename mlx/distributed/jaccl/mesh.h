@@ -76,10 +76,13 @@ class MeshGroup : public GroupImpl {
    */
   void allocate_buffers();
 
+  static size_t calculate_pool_size(int num_peers);
+
   int rank_;
   int size_;
   SideChannel side_channel_;
   std::vector<Connection> connections_;
+  SharedBufferPool pool_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;

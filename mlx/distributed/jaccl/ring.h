@@ -75,12 +75,15 @@ class RingGroup : public GroupImpl {
    */
   void allocate_buffers();
 
+  static size_t calculate_pool_size(int n_conns);
+
   int rank_;
   int size_;
   int n_conns_;
   SideChannel side_channel_;
   std::vector<Connection> left_;
   std::vector<Connection> right_;
+  SharedBufferPool pool_;
   std::vector<SharedBuffer> send_buffers_;
   std::vector<SharedBuffer> recv_buffers_;
   RingImpl ring_;

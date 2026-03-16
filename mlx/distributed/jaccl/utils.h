@@ -101,12 +101,22 @@ struct Destination {
   ibv_gid global_identifier;
 };
 
+// Forward declaration
+class SharedBufferPool;
+
 /**
  * A buffer that can be registered to a number of protection domains.
+ *
+ * Can operate in two modes:
+ *   1. Standalone (pool_ == nullptr): Owns its memory and MR registrations.
+ *   2. Pool-backed (pool_ != nullptr): data_ points into pool memory,
+ *      lkey/rkey come from the pool's MR. Destructor does NOT free memory
+ *      or deregister MRs.
  */
 class SharedBuffer {
  public:
   SharedBuffer(size_t num_bytes);
+  SharedBuffer(size_t num_bytes, void* pool_data, SharedBufferPool* pool);
   SharedBuffer(SharedBuffer&& b);
   ~SharedBuffer();
 
@@ -119,9 +129,7 @@ class SharedBuffer {
     return num_bytes_;
   }
 
-  uint32_t local_key(ibv_pd* protection_domain) const {
-    return memory_regions_.at(protection_domain)->lkey;
-  }
+  uint32_t local_key(ibv_pd* protection_domain) const;
 
   ibv_sge to_scatter_gather_entry(ibv_pd* protection_domain) const {
     ibv_sge entry;
@@ -149,6 +157,37 @@ class SharedBuffer {
  private:
   void* data_;
   size_t num_bytes_;
+  SharedBufferPool* pool_;
+  std::unordered_map<ibv_pd*, ibv_mr*> memory_regions_;
+};
+
+/**
+ * A memory pool that registers a single large Memory Region with the RDMA
+ * hardware and hands out sub-buffers via pointer arithmetic.
+ *
+ * Bypasses Apple's 100-MR-per-device limit by using 1 hardware MR slot
+ * for an arbitrary number of logical buffers.
+ */
+class SharedBufferPool {
+ public:
+  SharedBufferPool(size_t total_bytes);
+  ~SharedBufferPool();
+
+  SharedBufferPool(const SharedBufferPool&) = delete;
+  SharedBufferPool& operator=(const SharedBufferPool&) = delete;
+  SharedBufferPool(SharedBufferPool&& b);
+
+  void register_to_protection_domain(ibv_pd* protection_domain);
+  SharedBuffer allocate(size_t num_bytes);
+
+  uint32_t local_key(ibv_pd* protection_domain) const {
+    return memory_regions_.at(protection_domain)->lkey;
+  }
+
+ private:
+  void* data_;
+  size_t total_bytes_;
+  size_t offset_;
   std::unordered_map<ibv_pd*, ibv_mr*> memory_regions_;
 };
 
