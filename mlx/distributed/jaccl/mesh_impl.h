@@ -33,7 +33,7 @@ class MeshImpl {
     T* data = out_ptr;
     auto [sz, buffer_size] = buffer_size_from_message(size * sizeof(T));
     int64_t N = buffer_size / sizeof(T);
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE * MESH_MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(size);
     int num_peers = size_ - 1;
@@ -139,7 +139,7 @@ class MeshImpl {
     char* data = out_ptr;
     char* our_data = out_ptr + rank_ * n_bytes;
     auto [sz, N] = buffer_size_from_message(n_bytes);
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE * MESH_MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(n_bytes);
     int num_peers = size_ - 1;
@@ -212,7 +212,7 @@ class MeshImpl {
   }
 
   void send(const char* in_ptr, int64_t n_bytes, int dst) {
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE;
     auto [sz, N] = buffer_size_from_message(n_bytes);
 
@@ -262,7 +262,7 @@ class MeshImpl {
   }
 
   void recv(char* out_ptr, int64_t n_bytes, int src) {
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE;
     auto [sz, N] = buffer_size_from_message(n_bytes);
 

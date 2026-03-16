@@ -57,7 +57,7 @@ class RingImpl {
       std::memcpy(out_ptr, in_ptr, size * sizeof(T));
     }
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS * 2 * MAX_DIR;
     int64_t chunk_size = (size + size_ - 1) / size_;
     int64_t size_per_wire =
@@ -301,7 +301,7 @@ class RingImpl {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS * 2 * 2;
     size_t n_bytes_per_wire = (n_bytes + (2 * n_wires) - 1) / (2 * n_wires);
     size_t out_bytes = n_bytes * size_;
@@ -411,7 +411,7 @@ class RingImpl {
     auto& conns = (dst == left) ? left_ : right_;
     int dir = dst == left;
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS;
 
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
@@ -479,7 +479,7 @@ class RingImpl {
     auto& conns = (src == right) ? right_ : left_;
     int dir = src == right;
 
-    constexpr int PIPELINE = 2;
+    constexpr int PIPELINE = 3;
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS;
 
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
