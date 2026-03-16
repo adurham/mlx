@@ -1,6 +1,9 @@
 // Copyright © 2024 Apple Inc.
 #include <cstdlib>
 #include <sstream>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
@@ -816,9 +819,16 @@ void sdpa_vector_2pass(
         memcpy(q_f32.data() + i * D, qp + i * D, D * sizeof(float));
       }
     } else {
-      // bfloat16 → float32
+      // bfloat16 → float32 (NEON vectorized)
       auto* qp = reinterpret_cast<const uint16_t*>(q.data<bfloat16_t>());
-      for (int i = 0; i < num_q_heads_total * D; i++) {
+      int total_q = num_q_heads_total * D;
+      int i = 0;
+      for (; i + 3 < total_q; i += 4) {
+        uint16x4_t q16 = vld1_u16(qp + i);
+        uint32x4_t q32 = vshll_n_u16(q16, 16);
+        vst1q_f32(q_f32.data() + i, vreinterpretq_f32_u32(q32));
+      }
+      for (; i < total_q; i++) {
         uint32_t bits = static_cast<uint32_t>(qp[i]) << 16;
         memcpy(&q_f32[i], &bits, 4);
       }
@@ -838,15 +848,31 @@ void sdpa_vector_2pass(
           memcpy(v_f32.data() + h * N_cpu * D + pos * D, vp + pos * v_seq_stride, D * sizeof(float));
         }
       } else {
-        // bfloat16 → float32
+        // bfloat16 → float32 (vectorized: shift uint16 → uint32 << 16)
         auto* kp = reinterpret_cast<const uint16_t*>(k.data<bfloat16_t>()) + h * k_head_stride + N_gpu * k_seq_stride;
         auto* vp = reinterpret_cast<const uint16_t*>(v.data<bfloat16_t>()) + h * v_head_stride + N_gpu * v_seq_stride;
         for (int pos = 0; pos < N_cpu; pos++) {
-          for (int d = 0; d < D; d++) {
-            uint32_t kb = static_cast<uint32_t>(kp[pos * k_seq_stride + d]) << 16;
-            uint32_t vb = static_cast<uint32_t>(vp[pos * v_seq_stride + d]) << 16;
-            memcpy(&k_f32[h * N_cpu * D + pos * D + d], &kb, 4);
-            memcpy(&v_f32[h * N_cpu * D + pos * D + d], &vb, 4);
+          const uint16_t* ks = kp + pos * k_seq_stride;
+          const uint16_t* vs = vp + pos * v_seq_stride;
+          float* kd = k_f32.data() + h * N_cpu * D + pos * D;
+          float* vd = v_f32.data() + h * N_cpu * D + pos * D;
+          // Process 4 bf16 elements at a time using NEON
+          int d = 0;
+          for (; d + 3 < D; d += 4) {
+            // Load 4 uint16, zero-extend to uint32, shift left 16
+            uint16x4_t k16 = vld1_u16(ks + d);
+            uint16x4_t v16 = vld1_u16(vs + d);
+            uint32x4_t k32 = vshll_n_u16(k16, 16);
+            uint32x4_t v32 = vshll_n_u16(v16, 16);
+            vst1q_f32(kd + d, vreinterpretq_f32_u32(k32));
+            vst1q_f32(vd + d, vreinterpretq_f32_u32(v32));
+          }
+          // Remainder
+          for (; d < D; d++) {
+            uint32_t kb = static_cast<uint32_t>(ks[d]) << 16;
+            uint32_t vb = static_cast<uint32_t>(vs[d]) << 16;
+            memcpy(&kd[d], &kb, 4);
+            memcpy(&vd[d], &vb, 4);
           }
         }
       }
