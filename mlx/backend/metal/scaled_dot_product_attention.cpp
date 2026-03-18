@@ -1057,7 +1057,9 @@ void ScaledDotProductAttention::eval_gpu(
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
 
   // We are in vector mode ie single query
-  if (q_pre.shape(2) <= 8) {
+  // Route multi-query with causal mask to full attention — the vector/2pass
+  // kernels don't implement per-query causal masking correctly for q_seq > 1.
+  if (q_pre.shape(2) <= 8 && !(do_causal_ && q_pre.shape(2) > 1 && k_pre.shape(2) >= 1024)) {
     auto q_copy_unless = [](const array& arr) {
       if (arr.flags().row_contiguous) {
         return true;
