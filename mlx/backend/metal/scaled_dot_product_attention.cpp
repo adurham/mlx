@@ -1011,7 +1011,13 @@ bool ScaledDotProductAttention::use_fallback(
       sdpa_vector_supported_head_dim &&
       (query_sequence_length * gqa_factor) <= 32;
 
-  return !(supports_sdpa_full || supports_sdpa_vector);
+  bool result = !(supports_sdpa_full || supports_sdpa_vector);
+  if (query_sequence_length > 1 && key_sequence_length >= 1024) {
+    std::fprintf(stderr, "[SDPA-use_fallback] q_seq=%d k_seq=%d q_heads=%d kv_heads=%d gqa=%d head_dim=%d causal=%d vec=%d full=%d → fallback=%d\n",
+        query_sequence_length, key_sequence_length, num_query_heads, num_kv_heads, gqa_factor,
+        query_head_dim, (int)do_causal, (int)supports_sdpa_vector, (int)supports_sdpa_full, (int)result);
+  }
+  return result;
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
