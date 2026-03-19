@@ -1011,13 +1011,7 @@ bool ScaledDotProductAttention::use_fallback(
       sdpa_vector_supported_head_dim &&
       (query_sequence_length * gqa_factor) <= 32;
 
-  bool result = !(supports_sdpa_full || supports_sdpa_vector);
-  if (query_sequence_length > 1 && key_sequence_length >= 1024) {
-    std::fprintf(stderr, "[SDPA-use_fallback] q_seq=%d k_seq=%d q_heads=%d kv_heads=%d gqa=%d head_dim=%d causal=%d vec=%d full=%d → fallback=%d\n",
-        query_sequence_length, key_sequence_length, num_query_heads, num_kv_heads, gqa_factor,
-        query_head_dim, (int)do_causal, (int)supports_sdpa_vector, (int)supports_sdpa_full, (int)result);
-  }
-  return result;
+  return !(supports_sdpa_full || supports_sdpa_vector);
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
@@ -1063,13 +1057,7 @@ void ScaledDotProductAttention::eval_gpu(
   bool has_arr_mask = inputs.size() > (3 + has_sinks_);
 
   // We are in vector mode ie single query
-  // Route multi-query with causal mask to full attention — the vector/2pass
-  // kernels don't implement per-query causal masking correctly for q_seq > 1.
-  if (q_pre.shape(2) > 1 && k_pre.shape(2) >= 1024) {
-    std::fprintf(stderr, "[SDPA] q_seq=%d k_seq=%d do_causal=%d → routing to full attention\n",
-        (int)q_pre.shape(2), (int)k_pre.shape(2), (int)do_causal_);
-  }
-  if (q_pre.shape(2) <= 8 && !(do_causal_ && q_pre.shape(2) > 1 && k_pre.shape(2) >= 1024)) {
+  if (q_pre.shape(2) <= 8) {
     auto q_copy_unless = [](const array& arr) {
       if (arr.flags().row_contiguous) {
         return true;

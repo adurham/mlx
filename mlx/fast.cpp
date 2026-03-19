@@ -714,10 +714,6 @@ array scaled_dot_product_attention(
       v = expand_dims(v, 2, s);
     }
     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
-    std::fprintf(stderr, "[SDPA-fallback] q_ndim=%d q_last_shape=%d k_ndim=%d k_last2=%d do_causal=%d has_arr=%d\n",
-        (int)q.ndim(), (int)q.shape(-2),
-        (int)k.ndim(), (int)k.shape(-2),
-        (int)do_causal, (int)has_arr_mask);
     if (has_arr_mask || do_causal) {
       // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
       auto make_or_fetch_mask = [&]() {
