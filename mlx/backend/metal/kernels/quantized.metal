@@ -88,6 +88,7 @@
 #define instantiate_quantized_all_single(type, group_size, bits) \
   instantiate_quantized(affine_quantize, type, group_size, bits) \
   instantiate_quantized(affine_dequantize, type, group_size, bits)     \
+  instantiate_quantized(affine_rms_norm_qmv_fast, type, group_size, bits)     \
   instantiate_quantized(affine_gather_qmv_fast, type, group_size, bits)     \
   instantiate_quantized(affine_gather_qmv, type, group_size, bits)     \
   instantiate_quantized(affine_gather_qvm, type, group_size, bits)     \

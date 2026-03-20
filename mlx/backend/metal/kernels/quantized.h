@@ -813,6 +813,120 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// Fused RMSNorm + quantized matrix-vector multiply.
+// Computes y = qmv(rms_norm(x, norm_weight, eps), W)
+// Avoids intermediate write/read of normed x to device memory and
+// eliminates the pipeline stall between norm and matmul dispatches.
+template <typename T, int group_size, int bits>
+METAL_FUNC void rms_norm_qmv_fast_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device T* norm_weight,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant float& eps,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+
+  // ── Prologue: compute RMS inverse across all of x ──
+  // Each thread scans a strided portion of x, both simdgroups cover all elements.
+  const device T* x_base = x + tid.x * in_vec_size;
+  U sum_sq = 0;
+  // Each simdgroup covers the full vector independently (x is small, cached in SLC)
+  for (int i = simd_lid * values_per_thread; i < in_vec_size; i += block_size) {
+    for (int j = 0; j < values_per_thread && (i + j) < in_vec_size; j++) {
+      U val = static_cast<U>(x_base[i + j]);
+      sum_sq += val * val;
+    }
+  }
+  sum_sq = simd_sum(sum_sq);
+  // Both simdgroups computed the same sum — no cross-simdgroup reduction needed.
+  U rms_inv = rsqrt(sum_sq / static_cast<U>(in_vec_size) + static_cast<U>(eps));
+
+  // ── Main loop: qmv with inline norm application ──
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* x_ptr = x_base + simd_lid * values_per_thread;
+  const device T* nw_ptr = norm_weight + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    // Load x with inline RMSNorm: x_normed = x * norm_weight * rms_inv
+    U sum = 0;
+    for (int i = 0; i < values_per_thread; i += 4) {
+      U x0 = static_cast<U>(x_ptr[i]) * static_cast<U>(nw_ptr[i]) * rms_inv;
+      U x1 = static_cast<U>(x_ptr[i+1]) * static_cast<U>(nw_ptr[i+1]) * rms_inv;
+      U x2 = static_cast<U>(x_ptr[i+2]) * static_cast<U>(nw_ptr[i+2]) * rms_inv;
+      U x3 = static_cast<U>(x_ptr[i+3]) * static_cast<U>(nw_ptr[i+3]) * rms_inv;
+      sum += x0 + x1 + x2 + x3;
+      // Apply the bit-shifting for qdot compatibility (same as load_vector for 4-bit)
+      if (bits == 4) {
+        x_thread[i] = x0;
+        x_thread[i+1] = x1 / 16.0f;
+        x_thread[i+2] = x2 / 256.0f;
+        x_thread[i+3] = x3 / 4096.0f;
+      } else if (bits == 2) {
+        x_thread[i] = x0;
+        x_thread[i+1] = x1 / 4.0f;
+        x_thread[i+2] = x2 / 16.0f;
+        x_thread[i+3] = x3 / 64.0f;
+      } else {
+        // Fallback for other bit widths — 8-bit
+        x_thread[i] = x0;
+        x_thread[i+1] = x1;
+        x_thread[i+2] = x2;
+        x_thread[i+3] = x3;
+      }
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x_ptr += block_size;
+    nw_ptr += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1541,6 +1655,28 @@ template <typename T, int group_size, int bits, bool batched>
       tid,
       simd_gid,
       simd_lid);
+}
+
+// Fused RMSNorm + quantized matrix-vector multiply kernel.
+// Non-batched only (decode path).
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_rms_norm_qmv_fast(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    const device T* norm_weight [[buffer(4)]],
+    device T* y [[buffer(5)]],
+    const constant int& in_vec_size [[buffer(6)]],
+    const constant int& out_vec_size [[buffer(7)]],
+    const constant float& eps [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  rms_norm_qmv_fast_impl<T, group_size, bits>(
+      w, scales, biases, x, norm_weight, y,
+      in_vec_size, out_vec_size, eps,
+      tid, simd_gid, simd_lid);
 }
 
 template <typename T, const int group_size, const int bits, bool batched>
