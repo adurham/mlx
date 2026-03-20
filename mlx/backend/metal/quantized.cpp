@@ -691,7 +691,9 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+  // Skip NAX (bm=64) for GEMV — the non-NAX path (bm=32) has better
+  // occupancy at M=1 due to smaller threadgroup footprint.
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) && M > 4 &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
         /* const array& x = */ x,
@@ -787,7 +789,9 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+  // Skip NAX (bm=64) for GEMV — the non-NAX path (bm=32) has better
+  // occupancy at M=1 due to smaller threadgroup footprint.
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) && M > 4 &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
