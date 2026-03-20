@@ -250,7 +250,7 @@ void qmv(
 
   // 4-bit uses larger blocks (packs_per_thread=4, results_per_simdgroup=8)
   // to increase outstanding memory requests and fill the LPDDR5X pipeline.
-  int bn = bits == 4 ? 16 : 8;
+  int bn = 8;
   int bk = 32;
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
@@ -693,9 +693,7 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // Skip NAX (bm=64) for GEMV — the non-NAX path (bm=32) has better
-  // occupancy at M=1 due to smaller threadgroup footprint.
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) && M > 4 &&
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
         /* const array& x = */ x,
@@ -791,9 +789,7 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // Skip NAX (bm=64) for GEMV — the non-NAX path (bm=32) has better
-  // occupancy at M=1 due to smaller threadgroup footprint.
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) && M > 4 &&
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
@@ -885,7 +881,7 @@ void gather_qmv(
     const std::string& mode) {
   int B = out.size() / M / N;
 
-  int bn = bits == 4 ? 16 : 8;
+  int bn = 8;
   int bk = 32;
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
