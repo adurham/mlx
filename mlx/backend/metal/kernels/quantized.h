@@ -758,9 +758,9 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int packs_per_thread = bits == 2 ? 1 : (bits == 4 ? 4 : 2);
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = bits == 4 ? 8 : 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
