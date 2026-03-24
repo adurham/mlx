@@ -1789,7 +1789,9 @@ std::pair<std::vector<array>, std::vector<int>> Divide::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
   auto [a, b, to_ax] = vmap_binary_op(inputs, axes, stream());
-  return {{divide(a, b, stream())}, {to_ax}};
+  auto out = issubdtype(a.dtype(), integer) ? floor_divide(a, b, stream())
+                                            : divide(a, b, stream());
+  return {{out}, {to_ax}};
 }
 
 std::vector<array> Remainder::vjp(
@@ -3231,7 +3233,32 @@ std::vector<array> Pad::jvp(
 std::pair<std::vector<array>, std::vector<int>> Pad::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
-  throw std::runtime_error("Pad vmap is NYI.");
+  assert(inputs.size() == 2);
+  assert(axes.size() == 2);
+
+  if (axes[1] >= 0) {
+    throw std::invalid_argument(
+        "[Pad::vmap] Vmap over padding value is not supported.");
+  }
+
+  auto ax = axes[0];
+  auto pad_axes = axes_;
+  if (ax >= 0) {
+    for (auto& pad_ax : pad_axes) {
+      pad_ax = (pad_ax >= ax) ? pad_ax + 1 : pad_ax;
+    }
+  }
+
+  return {
+      {pad(
+          inputs[0],
+          pad_axes,
+          low_pad_size_,
+          high_pad_size_,
+          inputs[1],
+          "constant",
+          stream())},
+      {ax}};
 }
 
 bool Pad::is_equivalent(const Primitive& other) const {
