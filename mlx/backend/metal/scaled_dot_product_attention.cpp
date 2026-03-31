@@ -914,9 +914,16 @@ bool ScaledDotProductAttention::use_fallback(
   // unfused for short sequences. Only route to fused when kL is large enough
   // that the unfused path would exceed Metal buffer limits (the fused kernel
   // tiles K/V so it scales to arbitrary sequence lengths).
+  // MLX_SDPA_FUSED_THRESHOLD overrides the default (0 = always fused).
+  static const int sdpa_fused_threshold = [] {
+    if (auto* v = std::getenv("MLX_SDPA_FUSED_THRESHOLD")) {
+      return std::atoi(v);
+    }
+    return 16384;
+  }();
   const bool sdpa_full_large_hd_ok =
       (query_head_dim == 192 || query_head_dim == 256) &&
-      key_sequence_length > 16384;
+      key_sequence_length > sdpa_fused_threshold;
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
        sdpa_full_large_hd_ok);
