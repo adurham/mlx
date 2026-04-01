@@ -40,6 +40,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   };
   bool can_use_qmm_sm90 = supports(supports_qmm_sm90);
   bool can_use_qmm_sm80 = supports(supports_qmm_sm80);
+  bool can_use_qmm_naive = supports(supports_qmm_naive);
   bool can_use_fp_qmv = supports(supports_fp_qmv);
   bool can_use_qmv = supports(supports_qmv) || can_use_fp_qmv;
 
@@ -51,6 +52,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     qmm_sm80(x, w, scales, biases, out, bits_, group_size_, mode_, encoder);
   };
+  auto call_qmm_naive = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_naive(
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
   auto call_qmv = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     if (can_use_fp_qmv) {
@@ -60,7 +75,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
   };
 
-  int M = out.shape(-2);
+  int M = out.ndim() > 1 ? out.shape(-2) : 1;
   int N = out.shape(-1);
   int K = x.shape(-1);
   int B = out.size() / (M * N);
@@ -79,6 +94,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       call_qmv();
     } else {
       call_qmm_sm80();
+    }
+    return;
+  }
+
+  if (can_use_qmm_naive) {
+    if (can_use_qmv && (M * B < 8)) {
+      call_qmv();
+    } else {
+      call_qmm_naive();
     }
     return;
   }
@@ -109,8 +133,7 @@ void fast::Quantize::eval_gpu(
     std::vector<array>& outputs) {
   nvtx3::scoped_range r("Quantize::eval_gpu");
   auto& s = stream();
-  auto& d = cu::device(s.device);
-  auto& enc = d.get_command_encoder(s);
+  auto& enc = cu::get_command_encoder(s);
   if (dequantize_) {
     auto wq = ensure_row_contiguous(inputs[0], enc, s);
     auto scales = ensure_row_contiguous(inputs[1], enc, s);
