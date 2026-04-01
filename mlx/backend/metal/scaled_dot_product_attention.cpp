@@ -247,15 +247,14 @@ void sdpa_full_self_attention_chunked(
       {n_chunks, B * H, qL, D}, q.dtype(), nullptr, {});
   chunk_outs.set_data(allocator::malloc(
       int64_t(n_chunks) * BHqLD * int64_t(q.itemsize())));
-  d.add_temporary(chunk_outs, s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(chunk_outs);
 
   array chunk_lses(
       {n_chunks, B * H, qL}, float32, nullptr, {});
   chunk_lses.set_data(allocator::malloc(
       int64_t(n_chunks) * BHqL * int64_t(size_of(float32))));
-  d.add_temporary(chunk_lses, s.index);
-
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.add_temporary(chunk_lses);
 
   // --- Per-chunk attention dispatch ---
   for (int c = 0; c < n_chunks; c++) {
