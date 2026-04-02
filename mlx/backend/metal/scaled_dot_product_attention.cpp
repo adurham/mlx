@@ -62,7 +62,7 @@ void sdpa_full_self_attention_nax(
 
   int bd = q.shape(-1);
   int bq = 64;
-  int bk = 32;
+  int bk = bd >= 256 ? 64 : 32;
 
   int B = q.shape(0);
   int H = q.shape(1);
