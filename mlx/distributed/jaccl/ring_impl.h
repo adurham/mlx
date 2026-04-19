@@ -4,11 +4,11 @@
 
 #include <span>
 
-#include "jaccl/rdma.h"
+#include "mlx/distributed/jaccl/utils.h"
 
 constexpr int RING_MAX_CONNS = 4;
 
-namespace jaccl {
+namespace mlx::core::distributed::jaccl {
 
 class RingImpl {
  public:
@@ -628,4 +628,4 @@ class RingImpl {
   std::span<SharedBuffer> recv_buffers_;
 };
 
-} // namespace jaccl
+} // namespace mlx::core::distributed::jaccl
