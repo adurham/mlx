@@ -1363,14 +1363,38 @@ void ScaledDotProductAttentionQuant::eval_gpu(
   auto row_contig = [](const array& arr) {
     return arr.flags().row_contiguous;
   };
+  // K/V inputs (packed, scales, biases) often come from a
+  // ``QuantizedKVCache.state`` slice: the underlying storage is larger
+  // than the live range and the outer batch/head dims are the slicing
+  // axis, which leaves the tensor non-row-contiguous even though the
+  // innermost axis is still contiguous. sdpa_vector_2pass_quant reads
+  // head / seq strides at dispatch time, so the kernel handles that
+  // layout natively — copying ~540 MB per layer per decode token just
+  // to satisfy row_contig is what caused the live-cluster regression.
+  //
+  // Mirror the bf16 SDPA path's ``kv_copy_unless`` predicate instead:
+  // keep the array in place when the innermost axis is unit-stride and
+  // batch/head is a singleton (or batch strides pack tightly onto the
+  // head dim). Copy only when strides don't match that pattern.
+  auto kv_copy_unless = [](const array& arr) {
+    const auto& strides = arr.strides();
+    const auto& shape = arr.shape();
+    if (strides.back() != 1) {
+      return false;
+    }
+    if (shape[0] == 1 || shape[1] == 1) {
+      return true;
+    }
+    return strides[0] == strides[1] * shape[1];
+  };
 
   const auto& q = copy_unless(row_contig, q_pre);
-  const auto& k_packed = copy_unless(row_contig, k_packed_pre);
-  const auto& k_scales = copy_unless(row_contig, k_scales_pre);
-  const auto& k_biases = copy_unless(row_contig, k_biases_pre);
-  const auto& v_packed = copy_unless(row_contig, v_packed_pre);
-  const auto& v_scales = copy_unless(row_contig, v_scales_pre);
-  const auto& v_biases = copy_unless(row_contig, v_biases_pre);
+  const auto& k_packed = copy_unless(kv_copy_unless, k_packed_pre);
+  const auto& k_scales = copy_unless(kv_copy_unless, k_scales_pre);
+  const auto& k_biases = copy_unless(kv_copy_unless, k_biases_pre);
+  const auto& v_packed = copy_unless(kv_copy_unless, v_packed_pre);
+  const auto& v_scales = copy_unless(kv_copy_unless, v_scales_pre);
+  const auto& v_biases = copy_unless(kv_copy_unless, v_biases_pre);
 
   o.set_data(allocator::malloc(o.nbytes()));
 
