@@ -876,6 +876,189 @@ void sdpa_vector_2pass(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void sdpa_vector_2pass_quant(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k_packed,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_biases,
+    array& out,
+    float scale,
+    int group_size,
+    int bits,
+    bool do_causal,
+    const std::optional<array>& sinks) {
+  // Shape conventions (decode path, batch=1 single-step):
+  //   q:        [B, N_q,  T_q, D] — bf16 / fp16 / f32
+  //   k_packed: [B, N_kv, T_k, D * BITS / 8]         — uint8
+  //   k_scales: [B, N_kv, T_k, D / group_size]       — same dtype as q
+  //   k_biases: [B, N_kv, T_k, D / group_size]       — same dtype as q
+  //   v_packed: [B, N_kv, T_k, V * BITS / 8]         — uint8
+  //   v_scales: [B, N_kv, T_k, V / group_size]
+  //   v_biases: [B, N_kv, T_k, V / group_size]
+  //   out:      [B, N_q,  T_q, V]
+  //
+  // Kernel name: sdpa_vector_2pass_1_quant_<type>_<qk_dim>_<v_dim>_<bits>_<group>
+  std::string kname;
+  kname.reserve(80);
+  kname += "sdpa_vector_2pass_1_quant_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(v_scales.shape(-1) * group_size);
+  kname += "_";
+  kname += std::to_string(bits);
+  kname += "_";
+  kname += std::to_string(group_size);
+
+  const int V = v_scales.shape(-1) * group_size;
+  const int gqa_factor = q.shape(1) / k_packed.shape(1);
+  const int n_simds = gqa_factor * q.shape(2);
+
+  char devc = d.get_architecture().back();
+  int N = k_packed.shape(2);
+  int blocks;
+  if (devc == 's') {
+    blocks = 64;
+    if (N > 1024 && n_simds > 4) {
+      if (N <= 8192) {
+        blocks = 128;
+      } else if (N <= 32768) {
+        blocks = 256;
+      } else if (N <= 65536) {
+        blocks = 512;
+      } else {
+        blocks = 1024;
+      }
+    }
+  } else if (devc == 'd') {
+    blocks = 128;
+    if (n_simds <= 2 && N > 8192) {
+      blocks = 256;
+    } else if (n_simds >= 6) {
+      if (N >= 16384 && N < 65536) {
+        blocks = 512;
+      } else if (N >= 65536) {
+        blocks = 1024;
+      }
+    }
+  } else {
+    blocks = (n_simds >= 4) ? 64 : 32;
+  }
+
+  // Packed strides are in bytes (k_packed.dtype() == uint8), scale/bias
+  // strides are in elements.
+  size_t k_head_stride_bytes =
+      k_packed.shape(1) == 1 ? k_packed.strides(0) : k_packed.strides(1);
+  size_t k_seq_stride_bytes = k_packed.strides(2);
+  size_t v_head_stride_bytes =
+      v_packed.shape(1) == 1 ? v_packed.strides(0) : v_packed.strides(1);
+  size_t v_seq_stride_bytes = v_packed.strides(2);
+  size_t k_head_stride_scale =
+      k_scales.shape(1) == 1 ? k_scales.strides(0) : k_scales.strides(1);
+  size_t k_seq_stride_scale = k_scales.strides(2);
+  size_t v_head_stride_scale =
+      v_scales.shape(1) == 1 ? v_scales.strides(0) : v_scales.strides(1);
+  size_t v_seq_stride_scale = v_scales.strides(2);
+
+  MTL::Size group_dims(32, gqa_factor, q.shape(2));
+  MTL::Size grid_dims(k_packed.shape(1), q.shape(0), blocks);
+
+  // Allocate the intermediates (per-block partials + sums + maxs).
+  Shape intermediate_shape;
+  intermediate_shape.reserve(out.ndim() + 1);
+  intermediate_shape.insert(
+      intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
+  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(out.shape().back());
+  array intermediate(intermediate_shape, q.dtype(), nullptr, {});
+  intermediate_shape.pop_back();
+  array sums(intermediate_shape, float32, nullptr, {});
+  array maxs(std::move(intermediate_shape), float32, nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  maxs.set_data(allocator::malloc(maxs.nbytes()));
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(intermediate);
+  compute_encoder.add_temporary(sums);
+  compute_encoder.add_temporary(maxs);
+
+  // v1 quant path: mask support is deferred (decode path relies on causal
+  // masking via KV cache truncation). query_transposed is also decode-only
+  // (row-contiguous Q).
+  bool has_mask = false;
+  bool bool_mask = false;
+  bool float_mask = false;
+  bool query_transposed = false;
+  bool has_sinks = sinks.has_value();
+  metal::MTLFCList func_consts = {
+      {&has_mask, MTL::DataType::DataTypeBool, 20},
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&do_causal, MTL::DataType::DataTypeBool, 22},
+      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+      {&float_mask, MTL::DataType::DataTypeBool, 24},
+      {&has_sinks, MTL::DataType::DataTypeBool, 25},
+      {&blocks, MTL::DataType::DataTypeInt, 26},
+  };
+  std::string hash_name = kname;
+  hash_name += "_nomask";
+  hash_name += "_qnt";
+  hash_name += do_causal ? "_c" : "_nc";
+  hash_name += has_sinks ? "_sinks_" : "_nosinks_";
+  hash_name += std::to_string(blocks);
+
+  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k_packed, 1);
+  compute_encoder.set_input_array(k_scales, 2);
+  compute_encoder.set_input_array(k_biases, 3);
+  compute_encoder.set_input_array(v_packed, 4);
+  compute_encoder.set_input_array(v_scales, 5);
+  compute_encoder.set_input_array(v_biases, 6);
+  compute_encoder.set_output_array(intermediate, 7);
+  compute_encoder.set_output_array(sums, 8);
+  compute_encoder.set_output_array(maxs, 9);
+  compute_encoder.set_bytes(N, 11);
+  compute_encoder.set_bytes(k_head_stride_bytes, 12);
+  compute_encoder.set_bytes(k_seq_stride_bytes, 13);
+  compute_encoder.set_bytes(k_head_stride_scale, 14);
+  compute_encoder.set_bytes(k_seq_stride_scale, 15);
+  compute_encoder.set_bytes(v_head_stride_bytes, 16);
+  compute_encoder.set_bytes(v_seq_stride_bytes, 17);
+  compute_encoder.set_bytes(v_head_stride_scale, 18);
+  compute_encoder.set_bytes(v_seq_stride_scale, 19);
+  compute_encoder.set_bytes(scale, 20);
+  // Sinks would go at buffer 21 — deferred with mask support.
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // ── Second pass: identical to the bf16 path's reduction kernel ──
+  kname.clear();
+  kname = "sdpa_vector_2pass_2_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(V);
+  kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_input_array(sums, 1);
+  compute_encoder.set_input_array(maxs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(blocks, 4);
+  group_dims = MTL::Size(1024, 1, 1);
+  grid_dims = MTL::Size(q.shape(0) * q.shape(1), q.shape(2), 1);
+  check_kernel_threadgroup_size(kernel, group_dims, kname);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 } // namespace
 
 bool ScaledDotProductAttention::use_fallback(
