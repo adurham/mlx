@@ -101,6 +101,19 @@ constexpr int sdpa_quant_max(int a, int b) {
   return a > b ? a : b;
 }
 
+// Minimum per-thread element count that load_vector / qdot /
+// dequantize_thread will accept for a given bit-width. This is the
+// "natural stride" at which the helpers process values: load_vector
+// and qdot at bits ∈ {2, 4, 6} read 4 at a time; at bits ∈ {3, 5} they
+// read 8 at a time; at bits=8 they read 1 at a time. The thread-local
+// V dequantize mirrors the same loop structure.
+template <int bits>
+constexpr int sdpa_quant_min_per_thread() {
+  return (bits == 8)                                    ? 1
+      : (bits == 3 || bits == 5)                        ? 8
+                                                        : 4;
+}
+
 // ---------------------------------------------------------------------------
 // sdpa_vector_2pass_1_quant
 //
@@ -149,19 +162,27 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
     uint3 tpg   [[threadgroups_per_grid]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int pack_factor = get_pack_factor<BITS, 8>();
+  constexpr int min_per_thread = sdpa_quant_min_per_thread<BITS>();
 
-  // Each thread owns a contiguous slice of head_dim. For bit-widths that
-  // pack 8 values per storage group (bits=5), a thread's slice must cover
-  // a whole number of pack groups. Default slice is D/32 (one slice per
-  // simd lane); if that's smaller than pack_factor we widen the slice and
-  // leave trailing lanes inactive.
-  constexpr int qk_per_thread = sdpa_quant_max(D / 32, pack_factor);
-  constexpr int v_per_thread = sdpa_quant_max(V / 32, pack_factor);
+  // Each thread owns a contiguous slice of head_dim. `min_per_thread`
+  // is the natural stride that load_vector / qdot / dequantize_thread
+  // require for this bit-width (4 for bits ∈ {2, 4, 6}; 8 for bits
+  // ∈ {3, 5}; 1 for bits=8). We widen the default D/32 slice to meet
+  // that stride; lanes beyond `active_*` stay inactive and contribute
+  // 0 via `simd_sum`.
+  constexpr int qk_per_thread = sdpa_quant_max(D / 32, min_per_thread);
+  constexpr int v_per_thread = sdpa_quant_max(V / 32, min_per_thread);
 
   // Count of lanes that actually touch memory.
   constexpr int active_k = D / qk_per_thread;
   constexpr int active_v = V / v_per_thread;
 
+  static_assert(
+      qk_per_thread % min_per_thread == 0,
+      "qk_per_thread must be a multiple of the helper natural stride");
+  static_assert(
+      v_per_thread % min_per_thread == 0,
+      "v_per_thread must be a multiple of the helper natural stride");
   static_assert(
       qk_per_thread % pack_factor == 0,
       "qk_per_thread must be a multiple of the quantization pack factor");
@@ -182,7 +203,6 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
 
   typedef float U;
 
-  thread U q_thread[qk_per_thread];
   thread U o[v_per_thread] = {0};
 
   // Position within the dispatch grid — identical to sdpa_vector_2pass_1.
@@ -245,22 +265,6 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
   sums += o_offset * blocks + block_idx;
   maxs += o_offset * blocks + block_idx;
 
-  // ── Pre-scale Q using load_vector (matches qdot's expected layout) ──
-  U q_sum = 0;
-  if (k_active) {
-    q_sum = load_vector<T, U, qk_per_thread, BITS>(queries, q_thread);
-    #pragma unroll
-    for (int i = 0; i < qk_per_thread; i++) {
-      q_thread[i] *= static_cast<U>(scale);
-    }
-    q_sum *= static_cast<U>(scale);
-  } else {
-    #pragma unroll
-    for (int i = 0; i < qk_per_thread; i++) {
-      q_thread[i] = 0;
-    }
-  }
-
   U max_score = Limits<U>::finite_min;
   U sum_exp_score = 0;
 
@@ -272,14 +276,24 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
     }
 
     if (use_key) {
-      // K dot product. qdot returns scale * <x,w_raw> + bias * sum(x),
-      // which equals <x, scale*w_raw + bias>.
+      // K dot product: explicit dequantize + dot. Using dequantize_thread
+      // (shared with the V side) instead of qdot because qdot's
+      // positional-Q prescale contract requires values_per_thread to be a
+      // multiple of 4 even at bits=4 (which would force qk_per_thread > D/32
+      // for small D). Explicit dot is cleaner and measured-identical in
+      // register pressure for our instantiated shapes.
       U score = 0;
       if (k_active) {
         U k_scale_val = static_cast<U>(*k_scales);
         U k_bias_val  = static_cast<U>(*k_biases);
-        score = qdot<U, qk_per_thread, BITS>(
-            k_packed, q_thread, k_scale_val, k_bias_val, q_sum);
+        thread U k_deq[qk_per_thread];
+        dequantize_thread<U, qk_per_thread, BITS>(
+            k_packed, k_scale_val, k_bias_val, k_deq);
+        #pragma unroll
+        for (int j = 0; j < qk_per_thread; j++) {
+          score += static_cast<U>(queries[j]) * k_deq[j];
+        }
+        score *= static_cast<U>(scale);
       }
       score = simd_sum(score);
 

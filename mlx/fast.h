@@ -54,6 +54,27 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+/** Quantized-KV variant. K and V are passed as (packed_bytes, scales,
+ *  biases) triples matching mlx's quantize/dequantize layout. Decode-only
+ *  v1: routes to the 2-pass fused sdpa kernel when q_seq_len == 1 and
+ *  the config is supported; otherwise falls back to dequantize + the
+ *  standard sdpa primitive. Mask unsupported in v1 (decode uses implicit
+ *  causal masking via KV cache length). */
+MLX_API array scaled_dot_product_attention_quant(
+    const array& queries,
+    const array& k_packed,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_biases,
+    float scale,
+    int group_size,
+    int bits,
+    bool do_causal = false,
+    const std::optional<array>& sinks = {},
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

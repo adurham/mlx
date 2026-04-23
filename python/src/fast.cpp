@@ -297,6 +297,93 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "scaled_dot_product_attention_quant",
+      [](const mx::array& q,
+         const mx::array& k_packed,
+         const mx::array& k_scales,
+         const mx::array& k_biases,
+         const mx::array& v_packed,
+         const mx::array& v_scales,
+         const mx::array& v_biases,
+         float scale,
+         int group_size,
+         int bits,
+         bool do_causal,
+         const std::optional<mx::array>& sinks,
+         mx::StreamOrDevice s) {
+        return mx::fast::scaled_dot_product_attention_quant(
+            q,
+            k_packed,
+            k_scales,
+            k_biases,
+            v_packed,
+            v_scales,
+            v_biases,
+            scale,
+            group_size,
+            bits,
+            do_causal,
+            sinks,
+            s);
+      },
+      "q"_a,
+      "k_packed"_a,
+      "k_scales"_a,
+      "k_biases"_a,
+      "v_packed"_a,
+      "v_scales"_a,
+      "v_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "group_size"_a,
+      "bits"_a,
+      "do_causal"_a = false,
+      "sinks"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_quant(q: array, k_packed: array, k_scales: array, k_biases: array, v_packed: array, v_scales: array, v_biases: array, *, scale: float, group_size: int, bits: int, do_causal: bool = False, sinks: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Quantized-KV variant of :func:`scaled_dot_product_attention`.
+
+        Keys and values are passed as `(packed_bytes, scales, biases)`
+        triples matching ``mx.quantize`` / ``mx.dequantize`` layout.
+        Avoids the dequantize → bf16 → SDPA round-trip by dequantizing
+        K/V in-register per tile inside the attention kernel.
+
+        v1 scope:
+
+        * Decode path only (``q.shape[2] == 1``). Prefill falls back to
+          ``dequantize`` + :func:`scaled_dot_product_attention`.
+        * ``bits`` in ``{4, 5, 8}``, ``group_size == 64``,
+          ``head_dim in {64, 128}``, ``value_dim == head_dim``.
+        * Mask unsupported. ``do_causal=True`` is honored via the
+          sequence-length truncation pattern used by the 2-pass kernel.
+        * Other configurations fall through the slow path transparently.
+
+        Args:
+            q (array): Queries with shape ``[B, N_q, T_q, D]``.
+            k_packed (array): Packed K bytes, shape
+              ``[B, N_kv, T_k, D * bits / 8]``, dtype ``uint8``.
+            k_scales (array): K scales, shape
+              ``[B, N_kv, T_k, D / group_size]``, dtype matches Q.
+            k_biases (array): K biases, same shape/dtype as scales.
+            v_packed (array): Packed V bytes (same layout as K).
+            v_scales (array): V scales.
+            v_biases (array): V biases.
+            scale (float): Attention scale (typically
+              ``1.0 / sqrt(head_dim)``).
+            group_size (int): Quantization group size (must be 64 in v1).
+            bits (int): Quantization bit-width (4, 5, or 8).
+            do_causal (bool, optional): Whether to apply causal masking.
+              Default: False.
+            sinks (array, optional): Attention sinks (mirrors the bf16
+              primitive's semantics). Default: None.
+
+        Returns:
+            array: Output of shape ``[B, N_q, T_q, D]``.
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

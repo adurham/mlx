@@ -861,6 +861,134 @@ array scaled_dot_product_attention(
   return fallback(std::move(inputs))[0];
 }
 
+array scaled_dot_product_attention_quant(
+    const array& queries,
+    const array& k_packed,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_biases,
+    float scale,
+    int group_size,
+    int bits,
+    bool do_causal /* = false */,
+    const std::optional<array>& sinks /* = {} */,
+    StreamOrDevice s /* = {} */) {
+  if (queries.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_quant] queries shape "
+        << queries.shape() << " expected to be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  for (const auto* t : {&k_packed, &k_scales, &k_biases,
+                        &v_packed, &v_scales, &v_biases}) {
+    if (t->ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention_quant] quant input shape "
+          << t->shape() << " expected to be rank 4";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  if (k_packed.dtype() != uint32 || v_packed.dtype() != uint32) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_quant] packed K/V must be uint32 "
+        "(native mx.quantize output)");
+  }
+  if (bits != 4 && bits != 5 && bits != 8) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_quant] bits must be 4, 5, or 8; got "
+        << bits;
+    throw std::invalid_argument(msg.str());
+  }
+  if (group_size != 64) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_quant] v1 only supports "
+           "group_size=64; got "
+        << group_size;
+    throw std::invalid_argument(msg.str());
+  }
+
+  const int head_dim = queries.shape(-1);
+  // Derive V's value_dim from v_scales last axis × group_size.
+  const int value_dim = v_scales.shape(-1) * group_size;
+  const int n_q_heads = queries.shape(1);
+  const int n_kv_heads = k_packed.shape(1);
+  if (n_q_heads % n_kv_heads != 0) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention_quant] n_q_heads ("
+        << n_q_heads << ") must be a multiple of n_kv_heads ("
+        << n_kv_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = result_type(queries, k_scales, v_scales);
+  if (!issubdtype(final_type, floating)) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_quant] Q/scales dtype must be floating");
+  }
+  auto q = astype(queries, final_type, s);
+  auto ks = astype(k_scales, final_type, s);
+  auto kb = astype(k_biases, final_type, s);
+  auto vs = astype(v_scales, final_type, s);
+  auto vb = astype(v_biases, final_type, s);
+
+  bool has_sinks = sinks.has_value();
+
+  // Fallback: dequantize K and V and dispatch the standard SDPA primitive.
+  auto fallback = [scale, group_size, bits, do_causal, has_sinks, s](
+                      const std::vector<array>& inputs) {
+    const auto& q = inputs[0];
+    const auto& k_packed = inputs[1];
+    const auto& k_scales = inputs[2];
+    const auto& k_biases = inputs[3];
+    const auto& v_packed = inputs[4];
+    const auto& v_scales = inputs[5];
+    const auto& v_biases = inputs[6];
+    auto k = dequantize(
+        k_packed,
+        k_scales,
+        k_biases,
+        group_size,
+        bits,
+        "affine",
+        std::nullopt,
+        q.dtype(),
+        s);
+    auto v = dequantize(
+        v_packed,
+        v_scales,
+        v_biases,
+        group_size,
+        bits,
+        "affine",
+        std::nullopt,
+        q.dtype(),
+        s);
+    std::string mask_mode = do_causal ? "causal" : "";
+    std::optional<array> opt_sinks =
+        has_sinks ? std::optional<array>{inputs.back()} : std::nullopt;
+    auto out = scaled_dot_product_attention(
+        q, k, v, scale, mask_mode, std::nullopt, opt_sinks, s);
+    return std::vector<array>{out};
+  };
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {q, k_packed, ks, kb, v_packed, vs, vb};
+  if (has_sinks) {
+    inputs.push_back(astype(*sinks, final_type, stream));
+  }
+
+  if (!ScaledDotProductAttentionQuant::use_fallback(
+          q, head_dim, value_dim, group_size, bits, stream)) {
+    Shape out_shape{q.shape(0), q.shape(1), q.shape(2), value_dim};
+    auto primitive = std::make_shared<ScaledDotProductAttentionQuant>(
+        stream, fallback, scale, group_size, bits, do_causal, has_sinks);
+    return array(std::move(out_shape), final_type, primitive, std::move(inputs));
+  }
+  return fallback(std::move(inputs))[0];
+}
+
 std::vector<array> ScaledDotProductAttention::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -905,6 +1033,13 @@ std::vector<array> ScaledDotProductAttention::vjp(
     returned_vjps.push_back(std::move(vjps[arg]));
   }
   return returned_vjps;
+}
+
+bool ScaledDotProductAttentionQuant::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const ScaledDotProductAttentionQuant&>(other);
+  return scale_ == o.scale_ && group_size_ == o.group_size_ &&
+      bits_ == o.bits_ && do_causal_ == o.do_causal_ &&
+      has_sinks_ == o.has_sinks_;
 }
 
 bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {

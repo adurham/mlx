@@ -295,6 +295,61 @@ class ScaledDotProductAttentionVJP : public Custom {
   bool has_sinks_;
 };
 
+// Quantized-KV variant of ScaledDotProductAttention. K and V are passed
+// as (packed_bytes, scales, biases) triples matching mlx::quantize /
+// mlx::dequantize layout. v1 scope is decode-only (q_seq_len == 1,
+// mask unsupported). Fallback path dequantizes K/V then calls the
+// standard SDPA primitive.
+class ScaledDotProductAttentionQuant : public Custom {
+ public:
+  ScaledDotProductAttentionQuant(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      int group_size,
+      int bits,
+      bool do_causal,
+      bool has_sinks)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        group_size_(group_size),
+        bits_(bits),
+        do_causal_(do_causal),
+        has_sinks_(has_sinks) {}
+
+  static bool use_fallback(
+      const array& q,
+      int head_dim,
+      int value_dim,
+      int group_size,
+      int bits,
+      Stream s);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(ScaledDotProductAttentionQuant);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(
+        nullptr, scale_, group_size_, bits_, do_causal_, has_sinks_);
+  }
+
+ private:
+  float scale_;
+  int group_size_;
+  int bits_;
+  bool do_causal_;
+  bool has_sinks_;
+};
+
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)

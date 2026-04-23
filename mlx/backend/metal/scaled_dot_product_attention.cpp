@@ -951,14 +951,19 @@ void sdpa_vector_2pass_quant(
     blocks = (n_simds >= 4) ? 64 : 32;
   }
 
-  // Packed strides are in bytes (k_packed.dtype() == uint8), scale/bias
-  // strides are in elements.
+  // Packed arrays are uint32 (native mx.quantize output) but the kernel
+  // reads them as a uint8_t byte stream, so strides must be scaled to
+  // bytes. Scale/bias strides are in elements (bf16/fp16/fp32) and the
+  // kernel dereferences them as T* directly.
+  const size_t packed_elem_bytes = k_packed.itemsize(); // == 4 for uint32
   size_t k_head_stride_bytes =
-      k_packed.shape(1) == 1 ? k_packed.strides(0) : k_packed.strides(1);
-  size_t k_seq_stride_bytes = k_packed.strides(2);
+      (k_packed.shape(1) == 1 ? k_packed.strides(0) : k_packed.strides(1)) *
+      packed_elem_bytes;
+  size_t k_seq_stride_bytes = k_packed.strides(2) * packed_elem_bytes;
   size_t v_head_stride_bytes =
-      v_packed.shape(1) == 1 ? v_packed.strides(0) : v_packed.strides(1);
-  size_t v_seq_stride_bytes = v_packed.strides(2);
+      (v_packed.shape(1) == 1 ? v_packed.strides(0) : v_packed.strides(1)) *
+      packed_elem_bytes;
+  size_t v_seq_stride_bytes = v_packed.strides(2) * packed_elem_bytes;
   size_t k_head_stride_scale =
       k_scales.shape(1) == 1 ? k_scales.strides(0) : k_scales.strides(1);
   size_t k_seq_stride_scale = k_scales.strides(2);
@@ -1292,6 +1297,101 @@ void ScaledDotProductAttentionVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   throw std::runtime_error("NYI");
+}
+
+bool ScaledDotProductAttentionQuant::use_fallback(
+    const array& q,
+    int head_dim,
+    int value_dim,
+    int group_size,
+    int bits,
+    Stream s) {
+  if (s.device == Device::cpu) {
+    return true;
+  }
+  if (head_dim != 64 && head_dim != 128) {
+    return true;
+  }
+  if (value_dim != head_dim) {
+    return true;
+  }
+  if (bits != 4 && bits != 5 && bits != 8) {
+    return true;
+  }
+  if (group_size != 64) {
+    return true;
+  }
+  // v1: decode-only (q_seq_len == 1). Prefill falls back to dequantize
+  // + standard SDPA.
+  if (q.shape(2) != 1) {
+    return true;
+  }
+  return false;
+}
+
+void ScaledDotProductAttentionQuant::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& q_pre = inputs[0];
+  auto& k_packed_pre = inputs[1];
+  auto& k_scales_pre = inputs[2];
+  auto& k_biases_pre = inputs[3];
+  auto& v_packed_pre = inputs[4];
+  auto& v_scales_pre = inputs[5];
+  auto& v_biases_pre = inputs[6];
+  auto& o = outputs[0];
+
+  std::optional<array> sinks = std::nullopt;
+  if (has_sinks_) {
+    sinks = inputs.back();
+  }
+
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  auto copy_unless =
+      [&copies, &s](auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    }
+    return arr;
+  };
+  auto row_contig = [](const array& arr) {
+    return arr.flags().row_contiguous;
+  };
+
+  const auto& q = copy_unless(row_contig, q_pre);
+  const auto& k_packed = copy_unless(row_contig, k_packed_pre);
+  const auto& k_scales = copy_unless(row_contig, k_scales_pre);
+  const auto& k_biases = copy_unless(row_contig, k_biases_pre);
+  const auto& v_packed = copy_unless(row_contig, v_packed_pre);
+  const auto& v_scales = copy_unless(row_contig, v_scales_pre);
+  const auto& v_biases = copy_unless(row_contig, v_biases_pre);
+
+  o.set_data(allocator::malloc(o.nbytes()));
+
+  sdpa_vector_2pass_quant(
+      s,
+      d,
+      q,
+      k_packed,
+      k_scales,
+      k_biases,
+      v_packed,
+      v_scales,
+      v_biases,
+      o,
+      scale_,
+      group_size_,
+      bits_,
+      do_causal_,
+      sinks);
+
+  metal::get_command_encoder(s).add_temporaries(std::move(copies));
 }
 
 } // namespace mlx::core::fast
