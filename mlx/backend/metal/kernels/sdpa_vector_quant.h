@@ -95,6 +95,55 @@ inline void dequantize_thread(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Branch-free half-pack dequantize for bits=5.
+//
+// A bits=5 pack group holds 8 values in 5 bytes (40 bits). With
+// `qk_per_thread = 8`, one simd lane per pack group leaves half the lanes
+// inactive at head_dim ∈ {64, 128} and the simdgroup idles through
+// predicated-off cycles. To fix the 50 % occupancy cliff without
+// reintroducing simdgroup divergence (the enemy of SIMT throughput), two
+// lanes cooperate on each pack group via a branch-free bit-extraction
+// formula: `low` and `high` lanes execute *the same* instructions with a
+// lane-dependent shift amount, so the simdgroup runs at full rate.
+//
+//   - low  lane  (half == 0) → values 0..3 (bits  0..19)
+//   - high lane  (half == 1) → values 4..7 (bits 20..39)
+//
+// Both lanes point at byte 0 of the full 5-byte pack group; this helper
+// reads bytes 0..4 via a pair of overlapping uint32 loads and slices out
+// the requested 5-bit value. At `half * 4 + i` for i ∈ [0, 4), the values
+// land at bit positions {0, 5, 10, 15, 20, 25, 30, 35}, all within the
+// 40-bit pack group. Reading `bytes_pair = (w[byte+1] << 8) | w[byte]`
+// covers bits spanning byte boundaries; the value 7 case (bit_start=35)
+// fits entirely in `w[4]` so the `w[byte+1]` read (byte 5) is valid
+// scratch past the pack group — the 5-bit mask discards its contribution.
+// ---------------------------------------------------------------------------
+
+template <typename U>
+inline void dequantize_thread_half5(
+    const device uint8_t* w,
+    U scale,
+    U bias,
+    int pack_half,
+    thread U* w_local) {
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    // pack_half ∈ {0, 1}; i ∈ {0, 1, 2, 3}
+    //   ⇒ bit_start ∈ {0, 5, 10, 15, 20, 25, 30, 35}
+    const int bit_start   = 5 * (pack_half * 4 + i);
+    const int byte_start  = bit_start >> 3;
+    const int bit_in_byte = bit_start & 7;
+    // Two-byte window; high byte contribution is masked off by & 0x1f
+    // when bit_in_byte < 4 so reading one byte past the pack group
+    // (pack_group_end + 1) is harmless.
+    const uint32_t bytes_pair =
+        (uint32_t(w[byte_start + 1]) << 8) | uint32_t(w[byte_start]);
+    const uint32_t val = (bytes_pair >> bit_in_byte) & 0x1fu;
+    w_local[i] = U(val) * scale + bias;
+  }
+}
+
 // constexpr helpers used to pick qk/v per-thread counts without pulling in
 // <algorithm>.
 constexpr int sdpa_quant_max(int a, int b) {
@@ -107,10 +156,18 @@ constexpr int sdpa_quant_max(int a, int b) {
 // and qdot at bits ∈ {2, 4, 6} read 4 at a time; at bits ∈ {3, 5} they
 // read 8 at a time; at bits=8 they read 1 at a time. The thread-local
 // V dequantize mirrors the same loop structure.
+//
+// Exception: bits=5 returns 4 instead of 8. That allows the kernel to
+// use `qk_per_thread = 4` at head_dim ∈ {64, 128} and keep all 32 simd
+// lanes active via the half-pack dequant helpers (two lanes cooperate
+// on one 5-byte pack group — low lane + high lane). Without this
+// exception, bits=5 × head_dim=128 only used 16 of 32 lanes and wasted
+// half the simdgroup's throughput. See `dequantize_thread_half5_*` above.
 template <int bits>
 constexpr int sdpa_quant_min_per_thread() {
   return (bits == 8)                                    ? 1
-      : (bits == 3 || bits == 5)                        ? 8
+      : (bits == 3)                                     ? 8
+      : (bits == 5)                                     ? 4
                                                         : 4;
 }
 
@@ -166,16 +223,24 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
 
   // Each thread owns a contiguous slice of head_dim. `min_per_thread`
   // is the natural stride that load_vector / qdot / dequantize_thread
-  // require for this bit-width (4 for bits ∈ {2, 4, 6}; 8 for bits
-  // ∈ {3, 5}; 1 for bits=8). We widen the default D/32 slice to meet
-  // that stride; lanes beyond `active_*` stay inactive and contribute
-  // 0 via `simd_sum`.
+  // require for this bit-width (4 for bits ∈ {2, 4, 6, 5}; 8 for bits=3;
+  // 1 for bits=8). We widen the default D/32 slice to meet that stride;
+  // lanes beyond `active_*` stay inactive and contribute 0 via `simd_sum`.
   constexpr int qk_per_thread = sdpa_quant_max(D / 32, min_per_thread);
   constexpr int v_per_thread = sdpa_quant_max(V / 32, min_per_thread);
 
   // Count of lanes that actually touch memory.
   constexpr int active_k = D / qk_per_thread;
   constexpr int active_v = V / v_per_thread;
+
+  // Half-pack mode: at bits=5 a pack group holds 8 values in 5 bytes, so
+  // the straight `qk_per_thread % pack_factor == 0` invariant would force
+  // qk_per_thread=8 (i.e., one lane per pack group). That halves simd
+  // occupancy at head_dim ∈ {64, 128}. Instead, we pair two lanes per
+  // pack group at qk_per_thread=4 and dispatch `dequantize_thread_half5_{low,high}`
+  // — see the helpers above this function for bit-layout details.
+  constexpr bool k_half_pack = (BITS == 5) && (qk_per_thread == 4);
+  constexpr bool v_half_pack = (BITS == 5) && (v_per_thread == 4);
 
   static_assert(
       qk_per_thread % min_per_thread == 0,
@@ -184,11 +249,13 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       v_per_thread % min_per_thread == 0,
       "v_per_thread must be a multiple of the helper natural stride");
   static_assert(
-      qk_per_thread % pack_factor == 0,
-      "qk_per_thread must be a multiple of the quantization pack factor");
+      k_half_pack || qk_per_thread % pack_factor == 0,
+      "qk_per_thread must be a multiple of the quantization pack factor "
+      "(or use the bits=5 half-pack path)");
   static_assert(
-      v_per_thread % pack_factor == 0,
-      "v_per_thread must be a multiple of the quantization pack factor");
+      v_half_pack || v_per_thread % pack_factor == 0,
+      "v_per_thread must be a multiple of the quantization pack factor "
+      "(or use the bits=5 half-pack path)");
   static_assert(
       GROUP_SIZE % pack_factor == 0,
       "group_size must be a multiple of pack_factor");
@@ -233,12 +300,21 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
   const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
 
   // Packed pointer increments by (elems * BITS / 8) bytes per thread.
-  // k_elem_off is guaranteed a multiple of pack_factor, so the division
-  // is exact.
-  const int k_thread_byte_off =
-      k_active ? (k_elem_off * BITS) / 8 : 0;
-  const int v_thread_byte_off =
-      v_active ? (v_elem_off * BITS) / 8 : 0;
+  // In half-pack mode (bits=5, qk_per_thread=4), two adjacent lanes
+  // share a single 5-byte pack group; they both point at byte 0 of the
+  // group and the low/high helpers pick the right 4 values. In the
+  // standard path, each lane's elem_off is a multiple of pack_factor
+  // so the division is exact.
+  const int k_pack_group = k_active ? (k_elem_off / pack_factor) : 0;
+  const int v_pack_group = v_active ? (v_elem_off / pack_factor) : 0;
+  const int k_thread_byte_off = k_half_pack
+      ? k_pack_group * ((pack_factor * BITS) / 8)  // bits=5: 5 bytes per group
+      : (k_active ? (k_elem_off * BITS) / 8 : 0);
+  const int v_thread_byte_off = v_half_pack
+      ? v_pack_group * ((pack_factor * BITS) / 8)
+      : (v_active ? (v_elem_off * BITS) / 8 : 0);
+  const int k_half = k_half_pack ? int(simd_lid & 1u) : 0;
+  const int v_half = v_half_pack ? int(simd_lid & 1u) : 0;
   k_packed += kv_batch_head_idx * k_head_stride_bytes
             + block_idx * k_seq_stride_bytes
             + k_thread_byte_off;
@@ -282,13 +358,23 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       // multiple of 4 even at bits=4 (which would force qk_per_thread > D/32
       // for small D). Explicit dot is cleaner and measured-identical in
       // register pressure for our instantiated shapes.
+      //
+      // At bits=5 × D ∈ {64, 128} we take the half-pack path: two lanes
+      // share a 5-byte pack group, one does values 0..3 and the other
+      // does 4..7. Both land in the same simd_sum reduction below so the
+      // score agrees across all lanes.
       U score = 0;
       if (k_active) {
         U k_scale_val = static_cast<U>(*k_scales);
         U k_bias_val  = static_cast<U>(*k_biases);
         thread U k_deq[qk_per_thread];
-        dequantize_thread<U, qk_per_thread, BITS>(
-            k_packed, k_scale_val, k_bias_val, k_deq);
+        if constexpr (k_half_pack) {
+          dequantize_thread_half5<U>(
+              k_packed, k_scale_val, k_bias_val, k_half, k_deq);
+        } else {
+          dequantize_thread<U, qk_per_thread, BITS>(
+              k_packed, k_scale_val, k_bias_val, k_deq);
+        }
         #pragma unroll
         for (int j = 0; j < qk_per_thread; j++) {
           score += static_cast<U>(queries[j]) * k_deq[j];
@@ -305,12 +391,18 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // V dequantize + accumulate into this thread's slice of o[].
+      // Same half-pack treatment as K when bits=5 × V ∈ {64, 128}.
       if (v_active) {
         U v_scale_val = static_cast<U>(*v_scales);
         U v_bias_val  = static_cast<U>(*v_biases);
         thread U v_deq[v_per_thread];
-        dequantize_thread<U, v_per_thread, BITS>(
-            v_packed, v_scale_val, v_bias_val, v_deq);
+        if constexpr (v_half_pack) {
+          dequantize_thread_half5<U>(
+              v_packed, v_scale_val, v_bias_val, v_half, v_deq);
+        } else {
+          dequantize_thread<U, v_per_thread, BITS>(
+              v_packed, v_scale_val, v_bias_val, v_deq);
+        }
         #pragma unroll
         for (int j = 0; j < v_per_thread; j++) {
           o[j] = o[j] * factor + exp_score * v_deq[j];
