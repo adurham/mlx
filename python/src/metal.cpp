@@ -91,6 +91,28 @@ void init_metal(nb::module_& m) {
       R"pbdoc(
       Stop a Metal capture.
       )pbdoc");
+  metal.def(
+      "dispatch_count",
+      &mx::metal::dispatch_count,
+      R"pbdoc(
+      Total number of GPU kernel dispatches issued since process start or
+      the last reset. Counts every ``dispatch_threadgroups`` and
+      ``dispatch_threads`` call across all command encoders. Intended for
+      fused-kernel validation and dispatch-scheduling diagnostics.
+
+      Gated on the ``MLX_DISPATCH_COUNT=1`` env var (default off). When
+      unset, always returns 0 — the dispatch hot path stays free of
+      counter traffic in production. Set the env var before importing
+      ``mlx`` to enable.
+
+      Call ``mx.eval(...)`` before reading so in-flight work is flushed.
+      )pbdoc");
+  metal.def(
+      "reset_dispatch_count",
+      &mx::metal::reset_dispatch_count,
+      R"pbdoc(
+      Reset the global dispatch counter to zero.
+      )pbdoc");
   metal.def("device_info", []() {
     DEPRECATE("mx.metal.device_info", "mx.device_info");
     return mx::device_info(mx::Device(mx::Device::gpu, 0));

@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 
@@ -30,6 +31,26 @@ struct hash<NS::SharedPtr<T>> {
 namespace mlx::core::metal {
 
 namespace {
+
+// Global dispatch counter — incremented on every dispatch_threadgroups /
+// dispatch_threads call. Used by fused-kernel validation to measure the
+// per-decode-step dispatch count. Relaxed ordering is fine: we only read
+// it from the main Python thread after a full eval() barrier, so any
+// contention ordering issues are settled by then.
+//
+// Gated on the MLX_DISPATCH_COUNT env var (read once, cached). Default
+// off so the hot path pays at most a predictable-branch cost.
+std::atomic<uint64_t> g_dispatch_count_{0};
+
+bool dispatch_count_enabled() {
+  static bool enabled = [] {
+    if (auto* env = std::getenv("MLX_DISPATCH_COUNT")) {
+      return std::atoi(env) != 0;
+    }
+    return false;
+  }();
+  return enabled;
+}
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -358,6 +379,9 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  if (dispatch_count_enabled()) {
+    g_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
+  }
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -366,6 +390,9 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  if (dispatch_count_enabled()) {
+    g_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
+  }
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
@@ -844,6 +871,14 @@ bool is_nax_available() {
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;
 #endif
+}
+
+uint64_t dispatch_count() {
+  return g_dispatch_count_.load(std::memory_order_relaxed);
+}
+
+void reset_dispatch_count() {
+  g_dispatch_count_.store(0, std::memory_order_relaxed);
 }
 
 } // namespace mlx::core::metal
