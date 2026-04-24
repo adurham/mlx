@@ -127,19 +127,22 @@ inline void dequantize_thread_half5(
     U bias,
     int pack_half,
     thread U* w_local) {
+  // Load the full 5-byte (40-bit) pack group once. Five adjacent byte
+  // reads coalesce into a single cache-line access within a simdgroup
+  // (paired lanes read the same 5 bytes). Afterwards, each value
+  // extraction is a shift+mask+muladd from registers — no further
+  // memory traffic. A reinterpret_cast<const device uint32_t*> load was
+  // tried here but breaks correctness at bits=5 (pack groups start at
+  // 5-byte offsets, which are not 4-aligned).
+  const uint64_t pack = uint64_t(w[0])
+                      | (uint64_t(w[1]) << 8)
+                      | (uint64_t(w[2]) << 16)
+                      | (uint64_t(w[3]) << 24)
+                      | (uint64_t(w[4]) << 32);
+  const int base_shift = pack_half * 20;
   #pragma unroll
   for (int i = 0; i < 4; i++) {
-    // pack_half ∈ {0, 1}; i ∈ {0, 1, 2, 3}
-    //   ⇒ bit_start ∈ {0, 5, 10, 15, 20, 25, 30, 35}
-    const int bit_start   = 5 * (pack_half * 4 + i);
-    const int byte_start  = bit_start >> 3;
-    const int bit_in_byte = bit_start & 7;
-    // Two-byte window; high byte contribution is masked off by & 0x1f
-    // when bit_in_byte < 4 so reading one byte past the pack group
-    // (pack_group_end + 1) is harmless.
-    const uint32_t bytes_pair =
-        (uint32_t(w[byte_start + 1]) << 8) | uint32_t(w[byte_start]);
-    const uint32_t val = (bytes_pair >> bit_in_byte) & 0x1fu;
+    const uint32_t val = uint32_t((pack >> (base_shift + 5 * i)) & 0x1fu);
     w_local[i] = U(val) * scale + bias;
   }
 }
@@ -270,6 +273,10 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
 
   typedef float U;
 
+  // Pre-scaled Q, loaded once before the outer K-iteration loop. Matches
+  // the pattern in sdpa_vector_2pass_1 (non-quant); avoids re-reading
+  // queries[] from global memory on every inner iteration.
+  thread U q[qk_per_thread];
   thread U o[v_per_thread] = {0};
 
   // Position within the dispatch grid — identical to sdpa_vector_2pass_1.
@@ -315,11 +322,19 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       : (v_active ? (v_elem_off * BITS) / 8 : 0);
   const int k_half = k_half_pack ? int(simd_lid & 1u) : 0;
   const int v_half = v_half_pack ? int(simd_lid & 1u) : 0;
+  // Contiguous-chunk dispatch: each block processes positions
+  // [start_pos, end_pos) sequentially instead of striding by `blocks`
+  // (80 KB stride per iter at D=128 bits=5 defeats the prefetcher).
+  // Matches the pattern in sdpa_vector.h (commit 0bf7df7f).
+  const int chunk_size = (N + blocks - 1) / blocks;
+  const int start_pos = block_idx * chunk_size;
+  const int end_pos = min(start_pos + chunk_size, N);
+
   k_packed += kv_batch_head_idx * k_head_stride_bytes
-            + block_idx * k_seq_stride_bytes
+            + start_pos * k_seq_stride_bytes
             + k_thread_byte_off;
   v_packed += kv_batch_head_idx * v_head_stride_bytes
-            + block_idx * v_seq_stride_bytes
+            + start_pos * v_seq_stride_bytes
             + v_thread_byte_off;
 
   // Scales / biases: one per GROUP_SIZE elements. Since qk_per_thread ≤
@@ -328,24 +343,36 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
   const int k_group_idx = k_active ? (k_elem_off / GROUP_SIZE) : 0;
   const int v_group_idx = v_active ? (v_elem_off / GROUP_SIZE) : 0;
   k_scales += kv_batch_head_idx * k_head_stride_scale
-            + block_idx * k_seq_stride_scale + k_group_idx;
+            + start_pos * k_seq_stride_scale + k_group_idx;
   k_biases += kv_batch_head_idx * k_head_stride_scale
-            + block_idx * k_seq_stride_scale + k_group_idx;
+            + start_pos * k_seq_stride_scale + k_group_idx;
   v_scales += kv_batch_head_idx * v_head_stride_scale
-            + block_idx * v_seq_stride_scale + v_group_idx;
+            + start_pos * v_seq_stride_scale + v_group_idx;
   v_biases += kv_batch_head_idx * v_head_stride_scale
-            + block_idx * v_seq_stride_scale + v_group_idx;
+            + start_pos * v_seq_stride_scale + v_group_idx;
 
   out += o_offset * blocks * V + block_idx * V
        + (v_active ? v_elem_off : 0);
   sums += o_offset * blocks + block_idx;
   maxs += o_offset * blocks + block_idx;
 
+  // Load Q once, pre-scaled. Inactive lanes skip the load (their dot
+  // contribution will be 0 via simd_sum).
+  if (k_active) {
+    #pragma unroll
+    for (int j = 0; j < qk_per_thread; j++) {
+      q[j] = static_cast<U>(scale) * static_cast<U>(queries[j]);
+    }
+  }
+
   U max_score = Limits<U>::finite_min;
   U sum_exp_score = 0;
 
-  // ── For each K position in this block's shard ──
-  for (int i = block_idx; i < N; i += blocks) {
+  // ── For each K position in this block's contiguous chunk ──
+  // Sequential stride (80 bytes/iter for D=128 bits=5) is prefetcher-
+  // friendly vs the previous strided pattern (80 KB/iter) that defeated
+  // hardware prefetch.
+  for (int i = start_pos; i < end_pos; i++) {
     bool use_key = true;
     if (do_causal) {
       use_key = i <= (N - q_seq_len + int(q_seq_idx));
@@ -363,11 +390,17 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       // share a 5-byte pack group, one does values 0..3 and the other
       // does 4..7. Both land in the same simd_sum reduction below so the
       // score agrees across all lanes.
-      U score = 0;
+      // Pre-load and dequantize BOTH K and V at the top of the iteration
+      // so the GPU can issue K and V memory reads in parallel. K is
+      // needed immediately for the dot product; V isn't consumed until
+      // after softmax, but the V read latency gets hidden behind the
+      // softmax/exp compute path. Mirrors the pattern in
+      // sdpa_vector.h (commit cb95faf9).
+      thread U k_deq[qk_per_thread];
+      thread U v_deq[v_per_thread];
       if (k_active) {
         U k_scale_val = static_cast<U>(*k_scales);
         U k_bias_val  = static_cast<U>(*k_biases);
-        thread U k_deq[qk_per_thread];
         if constexpr (k_half_pack) {
           dequantize_thread_half5<U>(
               k_packed, k_scale_val, k_bias_val, k_half, k_deq);
@@ -375,11 +408,26 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
           dequantize_thread<U, qk_per_thread, BITS>(
               k_packed, k_scale_val, k_bias_val, k_deq);
         }
+      }
+      if (v_active) {
+        U v_scale_val = static_cast<U>(*v_scales);
+        U v_bias_val  = static_cast<U>(*v_biases);
+        if constexpr (v_half_pack) {
+          dequantize_thread_half5<U>(
+              v_packed, v_scale_val, v_bias_val, v_half, v_deq);
+        } else {
+          dequantize_thread<U, v_per_thread, BITS>(
+              v_packed, v_scale_val, v_bias_val, v_deq);
+        }
+      }
+
+      U score = 0;
+      if (k_active) {
+        // q[] was pre-scaled once before the loop (matches sdpa_vector_2pass_1).
         #pragma unroll
         for (int j = 0; j < qk_per_thread; j++) {
-          score += static_cast<U>(queries[j]) * k_deq[j];
+          score += q[j] * k_deq[j];
         }
-        score *= static_cast<U>(scale);
       }
       score = simd_sum(score);
 
@@ -390,19 +438,8 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // V dequantize + accumulate into this thread's slice of o[].
-      // Same half-pack treatment as K when bits=5 × V ∈ {64, 128}.
+      // Update the output accumulator from V registers already loaded above.
       if (v_active) {
-        U v_scale_val = static_cast<U>(*v_scales);
-        U v_bias_val  = static_cast<U>(*v_biases);
-        thread U v_deq[v_per_thread];
-        if constexpr (v_half_pack) {
-          dequantize_thread_half5<U>(
-              v_packed, v_scale_val, v_bias_val, v_half, v_deq);
-        } else {
-          dequantize_thread<U, v_per_thread, BITS>(
-              v_packed, v_scale_val, v_bias_val, v_deq);
-        }
         #pragma unroll
         for (int j = 0; j < v_per_thread; j++) {
           o[j] = o[j] * factor + exp_score * v_deq[j];
@@ -417,13 +454,13 @@ template <typename T, int D, int V, int BITS, int GROUP_SIZE>
       }
     }
 
-    // Advance to the next K/V row this threadgroup is responsible for.
-    k_packed += blocks * k_seq_stride_bytes;
-    v_packed += blocks * v_seq_stride_bytes;
-    k_scales += blocks * k_seq_stride_scale;
-    k_biases += blocks * k_seq_stride_scale;
-    v_scales += blocks * v_seq_stride_scale;
-    v_biases += blocks * v_seq_stride_scale;
+    // Advance to the next sequentially-adjacent K/V row.
+    k_packed += k_seq_stride_bytes;
+    v_packed += v_seq_stride_bytes;
+    k_scales += k_seq_stride_scale;
+    k_biases += k_seq_stride_scale;
+    v_scales += v_seq_stride_scale;
+    v_biases += v_seq_stride_scale;
   }
 
   // Publish per-block partials for sdpa_vector_2pass_2 to reduce.
