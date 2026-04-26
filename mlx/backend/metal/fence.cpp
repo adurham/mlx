@@ -4,6 +4,8 @@
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
+#include <arm_acle.h>
+
 namespace mlx::core {
 
 struct FenceImpl {
@@ -109,7 +111,11 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
         return;
       }
 
+      // seq_cst compiles to DMB ISH (inner-shareable) on ARM64,
+      // which is not visible to the GPU. Use DSB ST (full system,
+      // stores only) to force the store to the point of coherence.
       f.cpu_value()[0] = count;
+      __dsb(0xE);
     });
     return;
   }
