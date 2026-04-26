@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -14,6 +15,20 @@
 namespace mlx::core::fast {
 
 namespace {
+
+// Override the heuristic-chosen `blocks` count for the 2-pass SDPA vector
+// kernel via the MLX_SDPA_BLOCKS env var. Returns -1 (no override) when
+// unset or non-positive. Useful for tuning the partial-tile count on
+// device/workload combinations the heuristic doesn't anticipate.
+int sdpa_2pass_blocks_override() {
+  if (auto* env = std::getenv("MLX_SDPA_BLOCKS")) {
+    int v = std::atoi(env);
+    if (v > 0) {
+      return v;
+    }
+  }
+  return -1;
+}
 
 void sdpa_full_self_attention_nax(
     const Stream& s,
@@ -473,6 +488,9 @@ void sdpa_vector_2pass(
     } else {
       blocks = 32;
     }
+  }
+  if (int override = sdpa_2pass_blocks_override(); override > 0) {
+    blocks = override;
   }
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];

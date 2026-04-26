@@ -682,6 +682,38 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                         tolerance = {"rtol": 1e-2, "atol": 1e-2}
                     self.assertTrue(mx.allclose(ref, out, **tolerance))
 
+    def test_sdpa_blocks_env_override(self):
+        # The 2-pass vector kernel chooses `blocks` heuristically from the
+        # device + sequence length. MLX_SDPA_BLOCKS overrides that choice
+        # but must not change correctness.
+        D = 128
+        Nq = 4
+        Nkv = 1
+        N = 8192  # long enough to take the 2-pass path
+        scale = D**-0.5
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(1, Nq, 1, D)).astype(mx.float16)
+        k = mx.random.normal(shape=(1, Nkv, N, D)).astype(mx.float16)
+        v = mx.random.normal(shape=(1, Nkv, N, D)).astype(mx.float16)
+
+        prev = os.environ.pop("MLX_SDPA_BLOCKS", None)
+        try:
+            ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+            mx.eval(ref)
+            for blocks in ("16", "64", "256"):
+                os.environ["MLX_SDPA_BLOCKS"] = blocks
+                out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+                mx.eval(out)
+                self.assertTrue(
+                    mx.allclose(ref, out, rtol=1e-3, atol=1e-3),
+                    f"MLX_SDPA_BLOCKS={blocks} changed numerics",
+                )
+        finally:
+            if prev is None:
+                os.environ.pop("MLX_SDPA_BLOCKS", None)
+            else:
+                os.environ["MLX_SDPA_BLOCKS"] = prev
+
 
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner(failfast=True)
