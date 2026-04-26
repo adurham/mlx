@@ -91,6 +91,29 @@ void init_metal(nb::module_& m) {
       R"pbdoc(
       Stop a Metal capture.
       )pbdoc");
+  metal.def(
+      "dispatch_count",
+      &mx::metal::dispatch_count,
+      R"pbdoc(
+      Total number of GPU kernel dispatches issued since process start or
+      the last call to :func:`reset_dispatch_count`. Counts every
+      ``dispatch_threadgroups`` and ``dispatch_threads`` call across all
+      command encoders. Intended for fused-kernel validation and dispatch
+      diagnostics — for example, asserting in a test that a fused op
+      compiles to the expected number of kernels.
+
+      Call :func:`mlx.core.eval` (or read a result back) before reading
+      so in-flight work is flushed.
+
+      Returns:
+          int: cumulative dispatch count.
+      )pbdoc");
+  metal.def(
+      "reset_dispatch_count",
+      &mx::metal::reset_dispatch_count,
+      R"pbdoc(
+      Reset the dispatch counter exposed by :func:`dispatch_count` to zero.
+      )pbdoc");
   metal.def("device_info", []() {
     DEPRECATE("mx.metal.device_info", "mx.device_info");
     return mx::device_info(mx::Device(mx::Device::gpu, 0));

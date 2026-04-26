@@ -16,6 +16,11 @@ bool is_available() {
 void start_capture(std::string) {}
 void stop_capture() {}
 
+uint64_t dispatch_count() {
+  return 0;
+}
+void reset_dispatch_count() {}
+
 const std::unordered_map<std::string, std::variant<std::string, size_t>>&
 device_info() {
   throw std::runtime_error(

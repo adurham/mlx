@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 
@@ -30,6 +31,13 @@ struct hash<NS::SharedPtr<T>> {
 namespace mlx::core::metal {
 
 namespace {
+
+// Global counter incremented on every Metal kernel dispatch (one per
+// dispatch_threadgroups / dispatch_threads call). Useful for fused-kernel
+// validation and dispatch-scheduling diagnostics: read after `eval()` to
+// know how many kernels a region of work compiled to. Relaxed ordering is
+// fine — the counter is observed only after a full eval barrier.
+std::atomic<uint64_t> g_dispatch_count_{0};
 
 constexpr const char* default_mtllib_path = METAL_PATH;
 
@@ -358,6 +366,7 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  g_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -366,6 +375,7 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  g_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
@@ -844,6 +854,14 @@ bool is_nax_available() {
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;
 #endif
+}
+
+uint64_t dispatch_count() {
+  return g_dispatch_count_.load(std::memory_order_relaxed);
+}
+
+void reset_dispatch_count() {
+  g_dispatch_count_.store(0, std::memory_order_relaxed);
 }
 
 } // namespace mlx::core::metal
