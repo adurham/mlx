@@ -15,15 +15,6 @@ namespace mlx::core::fast {
 
 namespace {
 
-// Override the heuristic-chosen `blocks` count for the 2-pass SDPA vector
-// kernel via the MLX_SDPA_BLOCKS env var. Returns 0 (no override) when
-// unset or non-positive. Useful for tuning the partial-tile count on
-// device/workload combinations the heuristic doesn't anticipate.
-int sdpa_2pass_blocks_from_env() {
-  int v = env::get_var("MLX_SDPA_BLOCKS", 0);
-  return v > 0 ? v : 0;
-}
-
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -483,7 +474,7 @@ void sdpa_vector_2pass(
       blocks = 32;
     }
   }
-  if (int blocks_env = sdpa_2pass_blocks_from_env(); blocks_env > 0) {
+  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
     blocks = blocks_env;
   }
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
