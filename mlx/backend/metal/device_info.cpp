@@ -33,7 +33,13 @@ device_info(int device_index) {
     size_t rsrc_limit = 0;
     sysctlbyname("iogpu.rsrc_limit", &rsrc_limit, &length, NULL, 0);
     if (rsrc_limit == 0) {
-      rsrc_limit = 499000;
+      // The iogpu.rsrc_limit sysctl is not registered on stock macOS
+      // (Darwin 25.x at least) — sysctlbyname returns 0 and we fall
+      // back here. Upstream's 499000 is far below the real GPU buffer
+      // budget on Apple Silicon and trips after only ~10K decode
+      // steps on cast-heavy attention models (DSv4-Flash V4Attention).
+      // Bump to 5M so long-form generation stops blowing up.
+      rsrc_limit = 5000000;
     }
 
     return {
