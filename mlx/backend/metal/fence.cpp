@@ -64,7 +64,13 @@ void Fence::wait(Stream stream, const array& x) {
         }
         return;
       }
-      while (f.cpu_value()[0] < count) {
+      // Symmetric to Fence::update's seq_cst store + DSB SY: without a
+      // read-side full-system barrier the CPU can sit on a stale cache
+      // line that the GPU has already updated. vskiwi's #3142 follow-up
+      // (Mar 8 2026) showed 271/271 sample frames stuck in this exact
+      // loop on a deadlocked process.
+      while (f.cpu_value()->load(std::memory_order_seq_cst) < count) {
+        __dsb(0xF);
       }
     });
     return;
