@@ -29,24 +29,21 @@ void ResidencySet::insert(MTL::Allocation* buf) {
   if (!wired_set_) {
     return;
   }
-  // Use a 5% safety margin under capacity_. Apple's IOGPUMetalResidencySet
-  // internally calls removeAllocation: during addAllocation/commit when
-  // close to its own (kernel-side) limits — and that path silently calls
-  // abort() rather than returning an error. Confirmed via DYLD interposer
-  // backtrace on DSv4-Flash long-decode SIGABRTs:
-  //   IOGPU removeAllocation: -> ResidencySet::insert -> MetalAllocator::malloc
-  //   -> ArgPartition::eval_gpu -> async_eval -> ...
-  // capacity_ is set from mx.set_wired_limit() which we set to
-  // max_recommended_working_set_size (~121 GiB on M4 Max 128GB). Pushing
-  // close to that boundary triggers the abort. Falling back to unwired
-  // earlier costs a bit of perf but never aborts the process.
-  size_t safe_capacity = capacity_ - capacity_ / 20;
-  if (wired_set_->allocatedSize() + buf->allocatedSize() <= safe_capacity) {
-    wired_set_->addAllocation(buf);
-    wired_set_->commit();
-  } else {
-    unwired_set_.insert(buf);
-  }
+  // Skip wired_set_->addAllocation entirely. Apple's IOGPUMetalResidencySet
+  // unconditionally calls abort() from inside addAllocation/commit on
+  // certain (undocumented) conditions — confirmed via DYLD interposer on
+  // DSv4-Flash long-decode SIGABRTs:
+  //   abort()
+  //   IOGPUMetalResidencySet removeAllocation:
+  //   ResidencySet::insert            ← here
+  //   MetalAllocator::malloc
+  //   ArgPartition::eval_gpu
+  //   async_eval                      ← every decode step
+  // Adding even with a 5% capacity-margin guard didn't help — Apple's
+  // abort path fires regardless of size headroom. Always route through
+  // unwired_set_ instead. This loses the GPU-residency hint optimization
+  // but never aborts the process.
+  unwired_set_.insert(buf);
 }
 
 void ResidencySet::erase(MTL::Allocation* buf) {
