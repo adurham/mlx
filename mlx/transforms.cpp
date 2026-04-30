@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <numeric>
@@ -22,7 +23,21 @@
 
 namespace mlx::core {
 
-static constexpr int MAX_ACTIVE_TASKS = 10;
+// Configurable via EXO_MAX_ACTIVE_TASKS so we can throttle GPU command
+// buffer queue depth at runtime without a rebuild. Lower values give
+// macOS WindowServer more GPU breathing room — long DSv4-Flash decodes
+// have been triggering WindowServer userspace_watchdog_timeouts (40s
+// stuck in IOGPUFamily kernel) when the queue stays saturated, which
+// kills WindowServer, tears down the GPU context, and aborts in-flight
+// command buffers in our process. Default 10 matches upstream.
+static int MAX_ACTIVE_TASKS = []() {
+  const char* env = std::getenv("EXO_MAX_ACTIVE_TASKS");
+  if (env) {
+    int v = std::atoi(env);
+    return v > 0 ? v : 10;
+  }
+  return 10;
+}();
 
 namespace {
 
