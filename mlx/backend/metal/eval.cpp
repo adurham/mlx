@@ -1,4 +1,5 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdio>
 #include <memory>
 
 #include "mlx/backend/gpu/eval.h"
@@ -20,9 +21,20 @@ void new_stream(Stream s) {
 
 inline void check_error(MTL::CommandBuffer* cbuf) {
   if (cbuf->status() == MTL::CommandBufferStatusError) {
+    // This runs in a Metal driver-managed completion handler thread.
+    // Any throw here escapes the lambda, hits std::terminate, and the
+    // default libc++abi message is unreliable on driver threads — the
+    // process aborts silently. Log the Metal error first so we always
+    // see what failed, then throw to preserve existing semantics.
+    const char* desc =
+        cbuf->error() && cbuf->error()->localizedDescription()
+        ? cbuf->error()->localizedDescription()->utf8String()
+        : "(no localizedDescription)";
+    std::fprintf(
+        stderr, "[METAL] Command buffer execution failed: %s\n", desc);
+    std::fflush(stderr);
     std::ostringstream msg;
-    msg << "[METAL] Command buffer execution failed: "
-        << cbuf->error()->localizedDescription()->utf8String();
+    msg << "[METAL] Command buffer execution failed: " << desc;
     throw std::runtime_error(msg.str());
   }
 }
