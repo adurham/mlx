@@ -1,6 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cstdio>
 #include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/metal/device.h"
@@ -9,6 +12,39 @@
 #include "mlx/scheduler.h"
 
 namespace mlx::core::gpu {
+
+namespace {
+// Thread-safe deferred error from Metal completion handlers.
+// Completion handlers run on Apple's com.Metal.CompletionQueueDispatch
+// (a libdispatch queue). C++ exceptions cannot unwind through GCD
+// dispatch blocks — a throw in a completion handler hits std::terminate
+// and aborts the process unconditionally. Store the error here and
+// re-throw at the next eval()/synchronize() call where the call stack
+// has a real catch frame.
+//
+// Ported from upstream PR #3318 (closed without merge but production-
+// validated by Thump604 with 5 days zero crashes on Qwen3.5-122B). See
+// mlx#3224, #3317, #3390 — same root cause for our DSv4-Flash silent
+// SIGABRTs after ~10-12 minutes of decode.
+std::mutex deferred_error_mutex;
+std::string deferred_error_message;
+
+void set_deferred_error(const std::string& msg) {
+  std::lock_guard<std::mutex> lock(deferred_error_mutex);
+  if (deferred_error_message.empty()) {
+    deferred_error_message = msg;
+  }
+}
+
+void check_deferred_error() {
+  std::lock_guard<std::mutex> lock(deferred_error_mutex);
+  if (!deferred_error_message.empty()) {
+    std::string msg = std::move(deferred_error_message);
+    deferred_error_message.clear();
+    throw std::runtime_error(msg);
+  }
+}
+} // namespace
 
 void init() {}
 
@@ -19,27 +55,30 @@ void new_stream(Stream s) {
   encoders.try_emplace(s.index, d, s.index, d.residency_set());
 }
 
-inline void check_error(MTL::CommandBuffer* cbuf) {
+// Safe version for Metal completion handlers (GCD callbacks).
+// Cannot throw — stores the error for deferred propagation at the
+// next eval()/synchronize() call.
+inline void check_error_deferred(MTL::CommandBuffer* cbuf) {
   if (cbuf->status() == MTL::CommandBufferStatusError) {
-    // This runs in a Metal driver-managed completion handler thread.
-    // Any throw here escapes the lambda, hits std::terminate, and the
-    // default libc++abi message is unreliable on driver threads — the
-    // process aborts silently. Log the Metal error first so we always
-    // see what failed, then throw to preserve existing semantics.
     const char* desc =
         cbuf->error() && cbuf->error()->localizedDescription()
         ? cbuf->error()->localizedDescription()->utf8String()
         : "(no localizedDescription)";
+    // fprintf is async-signal-safe-ish and gives us a deterministic
+    // log line even if the deferred re-throw never reaches Python
+    // (e.g., process is being torn down).
     std::fprintf(
         stderr, "[METAL] Command buffer execution failed: %s\n", desc);
     std::fflush(stderr);
     std::ostringstream msg;
     msg << "[METAL] Command buffer execution failed: " << desc;
-    throw std::runtime_error(msg.str());
+    set_deferred_error(msg.str());
   }
 }
 
 void eval(array& arr) {
+  // Re-throw any deferred error from a prior completion handler.
+  check_deferred_error();
   auto pool = metal::new_scoped_memory_pool();
   auto s = arr.primitive().stream();
   auto& encoder = metal::get_command_encoder(s);
@@ -75,13 +114,13 @@ void eval(array& arr) {
     command_buffer->addCompletedHandler(
         [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
           scheduler::notify_task_completion(s);
-          check_error(cbuf);
+          check_error_deferred(cbuf);
         });
     encoder.commit();
   } else {
     command_buffer->addCompletedHandler(
         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          check_error(cbuf);
+          check_error_deferred(cbuf);
         });
   }
 }
@@ -91,11 +130,14 @@ void finalize(Stream s) {
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) { check_error(cbuf); });
+  cb->addCompletedHandler(
+      [](MTL::CommandBuffer* cbuf) { check_error_deferred(cbuf); });
   encoder.commit();
 }
 
 void synchronize(Stream s) {
+  // Re-throw any deferred error from a prior completion handler.
+  check_deferred_error();
   metal::get_command_encoder(s).synchronize();
 }
 
