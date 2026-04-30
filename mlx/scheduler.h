@@ -3,10 +3,12 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <future>
 #include <queue>
 #include <shared_mutex>
 #include <thread>
+#include <typeinfo>
 #include <unordered_map>
 
 #include "mlx/api.h"
@@ -47,7 +49,21 @@ struct StreamThread {
         q.pop();
       }
 
-      task();
+      try {
+        task();
+      } catch (const std::exception& e) {
+        std::fprintf(
+            stderr,
+            "[mlx scheduler] uncaught %s in task: %s\n",
+            typeid(e).name(),
+            e.what());
+        std::fflush(stderr);
+        throw;
+      } catch (...) {
+        std::fprintf(stderr, "[mlx scheduler] unknown uncaught exception\n");
+        std::fflush(stderr);
+        throw;
+      }
     }
   }
 
