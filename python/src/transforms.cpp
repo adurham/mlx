@@ -1184,6 +1184,43 @@ void init_transforms(nb::module_& m) {
               arrays are ignored.
       )pbdoc");
   m.def(
+      "detach",
+      [](const nb::args& args) {
+        std::vector<mx::array> arrays = tree_flatten(args, false);
+        // Detach is metadata-only (clears inputs/siblings/primitive on the
+        // array_desc) so it's safe under the GIL — no GPU work, no
+        // synchronization. We don't release the GIL to keep the call
+        // cheap; the typical use is per-decode-step force-detach of cache
+        // tensors after eval, where the GIL hand-off would dominate.
+        for (auto& a : arrays) {
+          if (a.has_primitive()) {
+            a.detach();
+          }
+        }
+      },
+      nb::arg(),
+      nb::sig("def detach(*args)"),
+      R"pbdoc(
+        Force-detach the given arrays from their construction graph.
+
+        Clears each array's primitive, inputs, and siblings — equivalent to
+        what ``mlx::core::eval`` does internally on each visited node, but
+        callable from Python without triggering an evaluation. The arrays
+        themselves remain valid: their data buffer is unchanged, and they
+        can still be read or used as inputs to new operations. Only the
+        upstream graph linkage is severed.
+
+        Use case: per-decode-step force-detach of KV-cache tensors. The
+        cache holds a graph chain back through every prior step; if eval
+        doesn't reach the cache (because it's not in the dependency tree
+        of the current eval target), the chain accumulates and the
+        per-step ArrayDesc count grows without bound.
+
+        Args:
+            *args: Arrays (or trees of arrays) to detach. Already-leaf
+              arrays (no primitive) are skipped.
+      )pbdoc");
+  m.def(
       "async_eval",
       [](const nb::args& args) {
         std::vector<mx::array> arrays = tree_flatten(args, false);
