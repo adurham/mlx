@@ -2,8 +2,15 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cxxabi.h>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <typeinfo>
 #include <unordered_map>
+#include <vector>
 
 #include "mlx/array.h"
 #include "mlx/ops.h"
@@ -268,6 +275,117 @@ static int64_t array_desc_log_interval() {
   return interval;
 }
 
+// Read MLX_PER_TYPE_DUMP_INTERVAL once at first use. When > 0, the
+// per-primitive-type live-count map is populated on every ArrayDesc
+// construction and every Nth construction the top entries are dumped to
+// stderr. Off by default — primitive_type_counter_ stays nullptr and the
+// dtor takes the fast path.
+static int64_t per_type_dump_interval() {
+  static int64_t interval = []() -> int64_t {
+    if (const char* env = std::getenv("MLX_PER_TYPE_DUMP_INTERVAL")) {
+      return std::strtoll(env, nullptr, 10);
+    }
+    return 0;
+  }();
+  return interval;
+}
+
+// Per-primitive-type live counter. The map only gains entries when a new
+// primitive type is first seen; lookups go through a mutex on the slow
+// path of construction but the resulting pointer is then stored in the
+// ArrayDesc so destruction is mutex-free. The atomic counter inside the
+// struct gives lock-free inc/dec from any thread.
+struct PrimitiveTypeCounter {
+  std::string demangled_name;
+  std::atomic<int64_t> live_count{0};
+};
+
+static std::mutex& per_type_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+// Stable storage: unique_ptrs so the map can grow without invalidating
+// pointers we've handed out to ArrayDescs.
+static std::vector<std::unique_ptr<PrimitiveTypeCounter>>& per_type_storage() {
+  static std::vector<std::unique_ptr<PrimitiveTypeCounter>> v;
+  return v;
+}
+
+static std::unordered_map<std::string, PrimitiveTypeCounter*>&
+per_type_index() {
+  static std::unordered_map<std::string, PrimitiveTypeCounter*> m;
+  return m;
+}
+
+// Demangle a typeid().name() into a human-readable type name. Returns the
+// mangled string on demangle failure.
+static std::string demangle_type_name(const char* mangled) {
+  int status = 0;
+  char* d = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+  if (status == 0 && d != nullptr) {
+    std::string out(d);
+    std::free(d);
+    return out;
+  }
+  if (d != nullptr) {
+    std::free(d);
+  }
+  return std::string(mangled);
+}
+
+// Look up (or create) a stable counter for a given primitive type name.
+// Slow path: takes the mutex, allocates on first sighting. Fast path
+// (after the storage exists): pure map lookup. The returned pointer is
+// stable for process lifetime.
+static PrimitiveTypeCounter* get_or_create_type_counter(
+    const std::string& name) {
+  std::lock_guard<std::mutex> lk(per_type_mutex());
+  auto& idx = per_type_index();
+  auto it = idx.find(name);
+  if (it != idx.end()) {
+    return it->second;
+  }
+  per_type_storage().push_back(std::make_unique<PrimitiveTypeCounter>());
+  auto* c = per_type_storage().back().get();
+  c->demangled_name = name;
+  idx[name] = c;
+  return c;
+}
+
+// Dump the top-K live primitive-type counters (sorted descending by
+// live_count) to stderr. Called from the count-printer hook.
+static void dump_per_type_counts(int64_t cur, size_t top_k = 30) {
+  std::vector<std::pair<std::string, int64_t>> snapshot;
+  {
+    std::lock_guard<std::mutex> lk(per_type_mutex());
+    snapshot.reserve(per_type_storage().size());
+    for (const auto& c : per_type_storage()) {
+      snapshot.emplace_back(
+          c->demangled_name,
+          c->live_count.load(std::memory_order_relaxed));
+    }
+  }
+  std::sort(
+      snapshot.begin(),
+      snapshot.end(),
+      [](const auto& a, const auto& b) { return a.second > b.second; });
+  std::fprintf(
+      stderr,
+      "[mlx ArrayDesc per-type] cur=%lld types=%zu\n",
+      static_cast<long long>(cur),
+      snapshot.size());
+  size_t shown = std::min(top_k, snapshot.size());
+  for (size_t i = 0; i < shown; ++i) {
+    std::fprintf(
+        stderr,
+        "  %8lld  %s\n",
+        static_cast<long long>(snapshot[i].second),
+        snapshot[i].first.c_str());
+  }
+  std::fflush(stderr);
+}
+
 static void log_array_desc_count_if_due(int64_t cur) {
   int64_t interval = array_desc_log_interval();
   if (interval > 0 && (cur % interval) == 0) {
@@ -276,6 +394,10 @@ static void log_array_desc_count_if_due(int64_t cur) {
         "[mlx ArrayDesc] live=%lld\n",
         static_cast<long long>(cur));
     std::fflush(stderr);
+  }
+  int64_t per_type_interval = per_type_dump_interval();
+  if (per_type_interval > 0 && (cur % per_type_interval) == 0) {
+    dump_per_type_counts(cur);
   }
 }
 
@@ -296,6 +418,16 @@ array::ArrayDesc::ArrayDesc(
       status(Status::unscheduled),
       inputs(std::move(inputs)) {
   init();
+  // Per-primitive-type live counter. Only populated when
+  // MLX_PER_TYPE_DUMP_INTERVAL is set, to keep the production hot path
+  // free of the mutex-protected lookup. The counter pointer, once
+  // assigned, is stable for process lifetime.
+  if (per_type_dump_interval() > 0 && this->primitive != nullptr) {
+    auto name = demangle_type_name(typeid(*this->primitive).name());
+    primitive_type_counter_ = get_or_create_type_counter(name);
+    static_cast<PrimitiveTypeCounter*>(primitive_type_counter_)
+        ->live_count.fetch_add(1, std::memory_order_relaxed);
+  }
   log_array_desc_count_if_due(++live_array_desc_count());
 }
 
@@ -317,6 +449,10 @@ int64_t live_array_desc_count() {
 
 array::ArrayDesc::~ArrayDesc() {
   --live_array_desc_count();
+  if (primitive_type_counter_ != nullptr) {
+    static_cast<PrimitiveTypeCounter*>(primitive_type_counter_)
+        ->live_count.fetch_sub(1, std::memory_order_relaxed);
+  }
   // When an array description is destroyed it will delete a bunch of arrays
   // that may also destroy their corresponding descriptions and so on and so
   // forth.

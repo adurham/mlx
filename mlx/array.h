@@ -514,6 +514,13 @@ class MLX_API array {
     // The arrays position in the output list
     uint32_t position{0};
 
+    // Diagnostic (fork-only): pointer to the per-primitive-type live
+    // counter for this descriptor's primitive. nullptr unless
+    // MLX_PER_TYPE_DUMP_INTERVAL is set when this ArrayDesc is
+    // constructed. Held as void* to keep the counter type internal to
+    // array.cpp; the dtor casts it back when decrementing.
+    void* primitive_type_counter_{nullptr};
+
     explicit ArrayDesc(Shape shape, Dtype dtype);
 
     explicit ArrayDesc(
