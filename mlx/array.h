@@ -27,6 +27,19 @@ class Primitive;
 // count is compared against heap snapshots taken at the same instant.
 MLX_API int64_t live_array_desc_count();
 
+// Diagnostic (fork-only): snapshot the per-primitive-type live count map.
+//
+// Returns (demangled-name, live-count) pairs for every primitive type
+// that has been seen since process start. Only populated when
+// MLX_PER_TYPE_DUMP_INTERVAL was set during runtime startup; otherwise
+// returns an empty vector.
+//
+// Cheap by absolute terms — takes a brief mutex while copying the map —
+// but should not be called from the per-step decode hot path. Intended
+// for sampling alongside heap snapshots or memory-profile JSONL records.
+MLX_API std::vector<std::pair<std::string, int64_t>>
+live_array_desc_count_by_type();
+
 using Deleter = std::function<void(allocator::Buffer)>;
 using ShapeElem = int32_t;
 using Shape = SmallVector<ShapeElem>;

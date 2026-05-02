@@ -276,10 +276,9 @@ static int64_t array_desc_log_interval() {
 }
 
 // Read MLX_PER_TYPE_DUMP_INTERVAL once at first use. When > 0, the
-// per-primitive-type live-count map is populated on every ArrayDesc
-// construction and every Nth construction the top entries are dumped to
-// stderr. Off by default — primitive_type_counter_ stays nullptr and the
-// dtor takes the fast path.
+// stderr dump fires every Nth ArrayDesc construction (the dump path is
+// independent of the counting path; counting is gated separately on
+// per_type_tracking_enabled).
 static int64_t per_type_dump_interval() {
   static int64_t interval = []() -> int64_t {
     if (const char* env = std::getenv("MLX_PER_TYPE_DUMP_INTERVAL")) {
@@ -288,6 +287,26 @@ static int64_t per_type_dump_interval() {
     return 0;
   }();
   return interval;
+}
+
+// Read MLX_PER_TYPE_TRACK once at first use. When set (or when
+// MLX_PER_TYPE_DUMP_INTERVAL > 0), the per-type live-count map is
+// populated on every ArrayDesc construction and the
+// `live_array_desc_count_by_type()` accessor returns non-empty data.
+// Cheap-but-not-free: each construction does a mutex-protected map
+// lookup the first time it sees a primitive type, and one lock-free
+// atomic increment thereafter. Off by default.
+static bool per_type_tracking_enabled() {
+  static bool enabled = []() -> bool {
+    if (per_type_dump_interval() > 0) {
+      return true;
+    }
+    if (const char* env = std::getenv("MLX_PER_TYPE_TRACK")) {
+      return std::strcmp(env, "0") != 0 && env[0] != '\0';
+    }
+    return false;
+  }();
+  return enabled;
 }
 
 // Per-primitive-type live counter. The map only gains entries when a new
@@ -419,10 +438,10 @@ array::ArrayDesc::ArrayDesc(
       inputs(std::move(inputs)) {
   init();
   // Per-primitive-type live counter. Only populated when
-  // MLX_PER_TYPE_DUMP_INTERVAL is set, to keep the production hot path
-  // free of the mutex-protected lookup. The counter pointer, once
-  // assigned, is stable for process lifetime.
-  if (per_type_dump_interval() > 0 && this->primitive != nullptr) {
+  // MLX_PER_TYPE_TRACK or MLX_PER_TYPE_DUMP_INTERVAL is set, to keep the
+  // production hot path free of the mutex-protected lookup. The counter
+  // pointer, once assigned, is stable for process lifetime.
+  if (per_type_tracking_enabled() && this->primitive != nullptr) {
     auto name = demangle_type_name(typeid(*this->primitive).name());
     primitive_type_counter_ = get_or_create_type_counter(name);
     static_cast<PrimitiveTypeCounter*>(primitive_type_counter_)
@@ -445,6 +464,22 @@ std::atomic<int64_t>& array::ArrayDesc::live_array_desc_count() {
 int64_t live_array_desc_count() {
   return array::ArrayDesc::live_array_desc_count().load(
       std::memory_order_relaxed);
+}
+
+// Public snapshot accessor for the per-primitive-type live counters.
+// Returns an empty vector when MLX_PER_TYPE_DUMP_INTERVAL was not set
+// at runtime startup (storage stays empty in that case).
+std::vector<std::pair<std::string, int64_t>>
+live_array_desc_count_by_type() {
+  std::vector<std::pair<std::string, int64_t>> out;
+  std::lock_guard<std::mutex> lk(per_type_mutex());
+  out.reserve(per_type_storage().size());
+  for (const auto& c : per_type_storage()) {
+    out.emplace_back(
+        c->demangled_name,
+        c->live_count.load(std::memory_order_relaxed));
+  }
+  return out;
 }
 
 array::ArrayDesc::~ArrayDesc() {

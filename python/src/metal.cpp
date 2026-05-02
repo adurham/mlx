@@ -132,4 +132,30 @@ void init_metal(nb::module_& m) {
       The counter is process-global and lock-free. Reading it is cheap; safe
       to call from the decode hot loop.
       )pbdoc");
+  metal.def(
+      "live_array_desc_count_by_type",
+      []() {
+        // Convert (string, int64) pairs into a Python dict so callers can
+        // do `d.get("mlx::core::SliceUpdate", 0)` directly.
+        auto pairs = mx::live_array_desc_count_by_type();
+        std::unordered_map<std::string, int64_t> out;
+        out.reserve(pairs.size());
+        for (auto& p : pairs) {
+          out.emplace(std::move(p.first), p.second);
+        }
+        return out;
+      },
+      R"pbdoc(
+      Diagnostic: per-primitive-type live ``ArrayDesc`` counts (fork-only).
+
+      Returns a ``dict[str, int]`` mapping demangled primitive class name
+      (e.g. ``"mlx::core::SliceUpdate"``) to live ArrayDesc count for every
+      primitive type that has been constructed since process start.
+
+      Empty when neither ``MLX_PER_TYPE_TRACK`` nor
+      ``MLX_PER_TYPE_DUMP_INTERVAL`` were set in the environment at startup.
+
+      Snapshot via a brief mutex; safe to call periodically (e.g. once per
+      memory-profile sample) but not in the per-step decode hot loop.
+      )pbdoc");
 }
