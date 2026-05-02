@@ -1184,6 +1184,30 @@ void init_transforms(nb::module_& m) {
               arrays are ignored.
       )pbdoc");
   m.def(
+      "clear_compile_cache",
+      []() {
+        // Drop all entries from the per-thread compile cache. Each
+        // compile entry holds a tape (vector of arrays); when the
+        // arrays in that tape have a long graph chain referenced via
+        // their inputs vectors, the compile cache becomes a long-lived
+        // holder of those ArrayDescs even after eval has supposedly
+        // detached them.
+        //
+        // Default behavior: compile cache is per-thread and only
+        // cleared on thread exit. For decode loops that call compiled
+        // samplers / model fns repeatedly, periodic explicit clearing
+        // bounds the cumulative footprint.
+        nb::gil_scoped_release nogil;
+        mx::detail::compile_clear_cache();
+      },
+      R"pbdoc(
+      Clear the per-thread compile cache (fork-only diagnostic).
+
+      Drops all cached traces. The next call to a compiled function
+      will retrace from scratch. Cost: one tape walk per cached entry,
+      but no GPU work.
+      )pbdoc");
+  m.def(
       "detach",
       [](const nb::args& args) {
         std::vector<mx::array> arrays = tree_flatten(args, false);
