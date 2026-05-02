@@ -1196,8 +1196,10 @@ void init_transforms(nb::module_& m) {
         // Default behavior: compile cache is per-thread and only
         // cleared on thread exit. For decode loops that call compiled
         // samplers / model fns repeatedly, periodic explicit clearing
-        // bounds the cumulative footprint.
-        nb::gil_scoped_release nogil;
+        // bounds the cumulative footprint. Hold the GIL throughout —
+        // tape destruction may invoke Python wrappers' refcount drops
+        // (PyCompiledFun et al.), and releasing the GIL crashes the
+        // process with "PyThreadState_Get: GIL is released".
         mx::detail::compile_clear_cache();
       },
       R"pbdoc(
