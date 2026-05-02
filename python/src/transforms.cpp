@@ -1192,8 +1192,20 @@ void init_transforms(nb::module_& m) {
         // synchronization. We don't release the GIL to keep the call
         // cheap; the typical use is per-decode-step force-detach of cache
         // tensors after eval, where the GIL hand-off would dominate.
+        //
+        // Mirrors the safety check in mlx::core::eval_impl: only detach
+        // arrays whose status is already past "unscheduled". An
+        // unscheduled array has a primitive that some FUTURE eval may
+        // need to walk; clearing it would leave the array in a
+        // status=unscheduled + primitive=null zombie state and crash the
+        // next eval with "Attempting to eval an array without a
+        // primitive". This matters for cache buffers that were mutated
+        // via __setitem__ but whose result isn't in the dependency tree
+        // of the most recent eval (e.g. zero-size values tensors written
+        // by some attention impls that only consume the keys side).
         for (auto& a : arrays) {
-          if (a.has_primitive()) {
+          if (a.has_primitive() &&
+              a.status() != mx::array::Status::unscheduled) {
             a.detach();
           }
         }
