@@ -1187,27 +1187,40 @@ void init_transforms(nb::module_& m) {
       "detach",
       [](const nb::args& args) {
         std::vector<mx::array> arrays = tree_flatten(args, false);
-        // Detach is metadata-only (clears inputs/siblings/primitive on the
-        // array_desc) so it's safe under the GIL — no GPU work, no
-        // synchronization. We don't release the GIL to keep the call
-        // cheap; the typical use is per-decode-step force-detach of cache
-        // tensors after eval, where the GIL hand-off would dominate.
+        // Recursively walk each array's input subgraph and detach every
+        // already-evaluated node we reach. Stops at unscheduled nodes
+        // (those have a primitive that future eval may still need) and
+        // at leaves (no primitive). Metadata-only — no GPU work.
         //
-        // Mirrors the safety check in mlx::core::eval_impl: only detach
-        // arrays whose status is already past "unscheduled". An
-        // unscheduled array has a primitive that some FUTURE eval may
-        // need to walk; clearing it would leave the array in a
-        // status=unscheduled + primitive=null zombie state and crash the
-        // next eval with "Attempting to eval an array without a
-        // primitive". This matters for cache buffers that were mutated
-        // via __setitem__ but whose result isn't in the dependency tree
-        // of the most recent eval (e.g. zero-size values tensors written
-        // by some attention impls that only consume the keys side).
-        for (auto& a : arrays) {
-          if (a.has_primitive() &&
-              a.status() != mx::array::Status::unscheduled) {
-            a.detach();
+        // Why recursive: when only the *root* of a graph chain is
+        // detached (clearing its primitive + inputs vector), the
+        // immediate input arrays go out of scope and their refcounts
+        // drop. If those refcounts hit zero, their destructors cascade
+        // and clean up the rest of the chain. But if any intermediate
+        // ArrayDesc has an extra holder somewhere (compile cache, async
+        // worker queue, sibling reference, etc.), the cascade stops and
+        // the rest of the chain leaks. Walking explicitly forces a
+        // detach on every reachable evaluated node, so the chain dies
+        // even when refcount-cascade would have stalled.
+        std::vector<mx::array> stack(arrays.begin(), arrays.end());
+        while (!stack.empty()) {
+          mx::array a = std::move(stack.back());
+          stack.pop_back();
+          if (!a.has_primitive()) {
+            continue;
           }
+          if (a.status() == mx::array::Status::unscheduled) {
+            continue;
+          }
+          // Snapshot inputs BEFORE detach clears them, so we can
+          // continue the walk.
+          for (const auto& in : a.inputs()) {
+            stack.push_back(in);
+          }
+          for (const auto& s : a.siblings()) {
+            stack.push_back(s);
+          }
+          a.detach();
         }
       },
       nb::arg(),
