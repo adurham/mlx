@@ -839,6 +839,22 @@ array slice_update(
   auto [has_neg_strides, upd_shape] =
       normalize_slice(src.shape(), start, stop, strides);
 
+  // Zero-size update is a no-op (writes nothing into src). Short-circuit
+  // to return src unchanged BEFORE building the graph node — otherwise
+  // we'd construct a SliceUpdate whose output is never read by any
+  // downstream eval (the slice has 0 elements; nothing reads it). That
+  // unreached node would never get detached, and its inputs (the
+  // upstream Broadcast + AsType + Full from the source `update`) would
+  // accumulate on the Python wrapper holding the output. Steady-state
+  // leak measured at 3 ArrayDescs per call before this guard, which on
+  // a 43-layer DSv4 decode loop accumulated 200K+ ArrayDescs over a
+  // few thousand decoded tokens. See arraydesc_phase0_finding.md.
+  for (int i = 0; i < upd_shape.size(); ++i) {
+    if (upd_shape[i] == 0) {
+      return src;
+    }
+  }
+
   // Cast update to src type and broadcast update shape to slice shape
   auto upd = broadcast_to(astype(update, src.dtype(), s), upd_shape, s);
 
