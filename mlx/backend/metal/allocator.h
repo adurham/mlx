@@ -66,7 +66,7 @@ class MetalAllocator : public allocator::Allocator {
   // buffer slots is appropriately oversized for the live set even with deep
   // async pipelines. Heap is wired-memory-backed but 256 MB is negligible
   // on a 128 GB system.
-  static constexpr int small_size_ = 16384;
+  static constexpr int small_size_ = 256;
   static constexpr size_t heap_size_ = 1ULL << 28;
 
   MetalAllocator(Device& d);
