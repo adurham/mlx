@@ -48,8 +48,19 @@ class MetalAllocator : public allocator::Allocator {
   // The size of allocations which go on the heap until it is full. This size
   // is chosen because it is the actual minimum size of a buffer allocated from
   // the heap, a heap can have at most heap.size() / 256 buffers.
+  //
+  // heap_size_ raised from 1 MB to 256 MB on this fork. At 1 MB the heap
+  // holds at most 4096 small buffers; long-decode transformer inference
+  // (DSv4-Flash, ~50 scalar mx.arrays per decode step) exhausts the heap
+  // within a few seconds of decode, after which every scalar allocation
+  // falls through to device_->newBuffer(size=4) and consumes a fresh
+  // vm_page_size (16 KB) region. Net effect was ~800 KB of "leaked"
+  // VM-region growth per decode token at steady state on the cluster.
+  // 256 MB / 256-byte alignment = ~1M heap slots — fits the live working
+  // set comfortably even with async eval pipelining holding multiple
+  // steps' worth of small buffers in flight.
   static constexpr int small_size_ = 256;
-  static constexpr int heap_size_ = 1 << 20;
+  static constexpr size_t heap_size_ = 1ULL << 28;
 
   MetalAllocator(Device& d);
   ~MetalAllocator();
