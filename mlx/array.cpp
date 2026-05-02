@@ -1,4 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 
@@ -254,9 +257,32 @@ void array::ArrayDesc::init() {
   }
 }
 
+// Read MLX_LOG_ARRAY_DESC_COUNT_INTERVAL once at first use.
+static int64_t array_desc_log_interval() {
+  static int64_t interval = []() -> int64_t {
+    if (const char* env = std::getenv("MLX_LOG_ARRAY_DESC_COUNT_INTERVAL")) {
+      return std::strtoll(env, nullptr, 10);
+    }
+    return 0;
+  }();
+  return interval;
+}
+
+static void log_array_desc_count_if_due(int64_t cur) {
+  int64_t interval = array_desc_log_interval();
+  if (interval > 0 && (cur % interval) == 0) {
+    std::fprintf(
+        stderr,
+        "[mlx ArrayDesc] live=%lld\n",
+        static_cast<long long>(cur));
+    std::fflush(stderr);
+  }
+}
+
 array::ArrayDesc::ArrayDesc(Shape shape, Dtype dtype)
     : shape(std::move(shape)), dtype(dtype), status(Status::available) {
   init();
+  log_array_desc_count_if_due(++live_array_desc_count());
 }
 
 array::ArrayDesc::ArrayDesc(
@@ -270,9 +296,19 @@ array::ArrayDesc::ArrayDesc(
       status(Status::unscheduled),
       inputs(std::move(inputs)) {
   init();
+  log_array_desc_count_if_due(++live_array_desc_count());
+}
+
+// Live ArrayDesc count diagnostic (fork-only). Returns a reference to a
+// thread-safe atomic counter incremented on each ArrayDesc construction
+// and decremented on destruction.
+std::atomic<int64_t>& array::ArrayDesc::live_array_desc_count() {
+  static std::atomic<int64_t> count{0};
+  return count;
 }
 
 array::ArrayDesc::~ArrayDesc() {
+  --live_array_desc_count();
   // When an array description is destroyed it will delete a bunch of arrays
   // that may also destroy their corresponding descriptions and so on and so
   // forth.

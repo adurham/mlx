@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -510,6 +511,10 @@ class MLX_API array {
         std::vector<array> inputs);
 
     ~ArrayDesc();
+
+    // Diagnostic: live ArrayDesc instance counter. Exposed for fork-only
+    // memory-leak hunts.
+    static std::atomic<int64_t>& live_array_desc_count();
 
    private:
     // Initialize size, strides, and other metadata
