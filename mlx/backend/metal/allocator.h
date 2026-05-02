@@ -67,7 +67,7 @@ class MetalAllocator : public allocator::Allocator {
   // async pipelines. Heap is wired-memory-backed but 256 MB is negligible
   // on a 128 GB system.
   static constexpr int small_size_ = 256;
-  static constexpr size_t heap_size_ = 1ULL << 28;
+  static constexpr size_t heap_size_ = 1ULL << 26;
 
   MetalAllocator(Device& d);
   ~MetalAllocator();
