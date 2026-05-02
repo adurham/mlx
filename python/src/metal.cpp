@@ -8,6 +8,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include "mlx/array.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/device.h"
 #include "mlx/memory.h"
@@ -117,4 +118,18 @@ void init_metal(nb::module_& m) {
     DEPRECATE("mx.metal.device_info", "mx.device_info");
     return mx::device_info(mx::Device(mx::Device::gpu, 0));
   });
+  metal.def(
+      "live_array_desc_count",
+      []() { return mx::live_array_desc_count(); },
+      R"pbdoc(
+      Diagnostic: snapshot the live ``ArrayDesc`` instance counter (fork-only).
+
+      Returns the current value of an atomic counter that is incremented on
+      each ``ArrayDesc`` construction and decremented on destruction. Intended
+      for memory-leak hunts where we need to compare a "live count" reading
+      against heap snapshots taken at the same moment.
+
+      The counter is process-global and lock-free. Reading it is cheap; safe
+      to call from the decode hot loop.
+      )pbdoc");
 }

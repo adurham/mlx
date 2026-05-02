@@ -19,6 +19,14 @@ namespace mlx::core {
 // Forward declaration
 class Primitive;
 
+// Diagnostic (fork-only): snapshot the live ArrayDesc instance counter.
+//
+// Returns the current value of an atomic counter incremented on each
+// ArrayDesc construction and decremented on destruction. Cheap and safe
+// to call from hot paths; intended for memory-leak hunts where the live
+// count is compared against heap snapshots taken at the same instant.
+MLX_API int64_t live_array_desc_count();
+
 using Deleter = std::function<void(allocator::Buffer)>;
 using ShapeElem = int32_t;
 using Shape = SmallVector<ShapeElem>;
@@ -460,6 +468,10 @@ class MLX_API array {
   }
 
   ~array();
+
+  // Friend the public accessor so it can read the private inner struct's
+  // counter without exposing the struct itself.
+  friend MLX_API int64_t live_array_desc_count();
 
  private:
   // Initialize the arrays data

@@ -307,6 +307,14 @@ std::atomic<int64_t>& array::ArrayDesc::live_array_desc_count() {
   return count;
 }
 
+// Public read-only accessor for the live ArrayDesc counter. Wraps the
+// private inner-class static so external callers (Python bindings, tests)
+// can sample the value without touching the private type.
+int64_t live_array_desc_count() {
+  return array::ArrayDesc::live_array_desc_count().load(
+      std::memory_order_relaxed);
+}
+
 array::ArrayDesc::~ArrayDesc() {
   --live_array_desc_count();
   // When an array description is destroyed it will delete a bunch of arrays
