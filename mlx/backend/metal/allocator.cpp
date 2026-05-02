@@ -7,7 +7,9 @@
 
 #include <mach/vm_page_size.h>
 #include <unistd.h>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 namespace mlx::core {
 
@@ -134,6 +136,19 @@ Buffer MetalAllocator::malloc(size_t size) {
       throw std::runtime_error(msg.str());
     }
     lk.unlock();
+
+    // Cache-miss diagnostic: log every newBuffer call with size.
+    // Off by default. Enable by setting MLX_LOG_NEW_BUFFER_PATH=/path/to.log.
+    // Append-only line protocol: "<size>\n" per allocation.
+    static const char* log_path = std::getenv("MLX_LOG_NEW_BUFFER_PATH");
+    static FILE* log_file = log_path ? std::fopen(log_path, "a") : nullptr;
+    if (log_file) {
+      static std::mutex log_mutex;
+      std::lock_guard<std::mutex> lock(log_mutex);
+      std::fprintf(log_file, "%zu\n", size);
+      std::fflush(log_file);
+    }
+
     if (size < small_size_ && heap_) {
       buf = heap_->newBuffer(size, resource_options);
     }
