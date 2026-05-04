@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "mlx/distributed/distributed_impl.h"
 #include "mlx/distributed/jaccl/ring_impl.h"
 #include "mlx/distributed/jaccl/utils.h"
@@ -84,6 +86,11 @@ class RingGroup : public GroupImpl {
   std::vector<SharedBuffer> send_buffers_;
   std::vector<SharedBuffer> recv_buffers_;
   RingImpl ring_;
+
+  // RingImpl shares its connections + buffer pool the same way MeshImpl
+  // does, so the same concurrent-call race applies. See the comment on
+  // MeshGroup::collective_mutex_ for the full rationale.
+  std::mutex collective_mutex_;
 };
 
 } // namespace mlx::core::distributed::jaccl

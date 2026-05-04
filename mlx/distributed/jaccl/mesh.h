@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "mlx/distributed/distributed_impl.h"
 #include "mlx/distributed/jaccl/mesh_impl.h"
 #include "mlx/distributed/jaccl/ring_impl.h"
@@ -84,6 +86,22 @@ class MeshGroup : public GroupImpl {
 
   MeshImpl mesh_;
   RingImpl ring_;
+
+  // MeshImpl and RingImpl are NOT thread-safe: they share `connections_`
+  // (one ibv_cq per peer) and `buffers_` (one (sz, buff) slot per peer).
+  // MLX dispatches each collective on the CPU command encoder for the
+  // input array's stream, and `cpu::get_command_encoder` keyes its
+  // encoder map by stream.index — so two collectives issued from
+  // different streams (e.g. a CPU-stream `all_gather` of task counts
+  // racing a GPU-stream `all_reduce` from MTP's verify forward) run
+  // on different worker threads. Without serialization the polling
+  // loops drain each other's completions out of the shared CQ and
+  // post into each other's buffer slots, producing the float-bit-
+  // pattern garbage seen at c=2 + MTP. DSB barriers (added in the
+  // earlier coherency fix) only protect a single collective's CPU-NIC
+  // handshake; they do not address this concurrent-call race. Serialize
+  // every collective on this group behind one mutex.
+  std::mutex collective_mutex_;
 };
 
 } // namespace mlx::core::distributed::jaccl
