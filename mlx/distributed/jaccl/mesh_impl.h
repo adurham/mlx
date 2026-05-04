@@ -50,10 +50,12 @@ class MeshImpl {
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
       post_recv_all(sz, buff);
+      auto& sbuf = send_buffer(sz, buff);
+      zero_pool_buffer(sbuf);
       std::copy(
           data + read_offset,
           data + std::min(read_offset + N, total),
-          send_buffer(sz, buff).begin<T>());
+          sbuf.begin<T>());
       post_send_all(sz, buff);
 
       buff++;
@@ -85,10 +87,12 @@ class MeshImpl {
         if (work_type == SEND_WR && read_offset < total) {
           completed_send_count[buff]++;
           if (completed_send_count[buff] == num_peers) {
+            auto& sbuf = send_buffer(sz, buff);
+            zero_pool_buffer(sbuf);
             std::copy(
                 data + read_offset,
                 data + std::min(read_offset + N, total),
-                send_buffer(sz, buff).begin<T>());
+                sbuf.begin<T>());
             post_send_all(sz, buff);
 
             completed_send_count[buff] = 0;
@@ -158,10 +162,12 @@ class MeshImpl {
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
       post_recv_all(sz, buff);
+      auto& sbuf = send_buffer(sz, buff);
+      zero_pool_buffer(sbuf);
       std::copy(
           our_data + read_offset,
           our_data + std::min(read_offset + N, total),
-          send_buffer(sz, buff).begin<char>());
+          sbuf.begin<char>());
       post_send_all(sz, buff);
 
       buff++;
@@ -186,10 +192,12 @@ class MeshImpl {
         if (work_type == SEND_WR && read_offset < total) {
           completed_send_count[buff]++;
           if (completed_send_count[buff] == num_peers) {
+            auto& sbuf = send_buffer(sz, buff);
+            zero_pool_buffer(sbuf);
             std::copy(
                 our_data + read_offset,
                 our_data + std::min(read_offset + N, total),
-                send_buffer(sz, buff).begin<char>());
+                sbuf.begin<char>());
             post_send_all(sz, buff);
 
             completed_send_count[buff] = 0;
@@ -229,10 +237,12 @@ class MeshImpl {
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < n_bytes && buff < PIPELINE) {
+      auto& sbuf = send_buffer(sz, buff);
+      zero_pool_buffer(sbuf);
       std::copy(
           in_ptr + read_offset,
           in_ptr + std::min(read_offset + N, n_bytes),
-          send_buffer(sz, buff).begin<char>());
+          sbuf.begin<char>());
       send_to(sz, dst, buff);
 
       buff++;
@@ -255,10 +265,12 @@ class MeshImpl {
         in_flight--;
 
         if (read_offset < n_bytes) {
+          auto& sbuf = send_buffer(sz, buff);
+          zero_pool_buffer(sbuf);
           std::copy(
               in_ptr + read_offset,
               in_ptr + std::min(read_offset + N, n_bytes),
-              send_buffer(sz, buff).begin<char>());
+              sbuf.begin<char>());
           send_to(sz, dst, buff);
 
           read_offset += N;
@@ -323,20 +335,26 @@ class MeshImpl {
         send_buffer(sz, buff), SEND_WR << 16 | buff << 8 | rank);
   }
 
-  // Zero the recv buffer before posting it. JACCL's buffer pool indexes
-  // by (sz, buff, peer) and reuses slots across consecutive collectives.
-  // If the next NIC DMA-write fails to fully overwrite the slot — which
-  // is the symptom on c=2 + MTP after the DSB barriers landed (the recv
-  // buffer ends up holding bf16 bit patterns from a prior small
-  // all_reduce, and the corruption guard reads them back as integer
-  // garbage in the billions) — the reader gets stale bytes instead of
-  // fresh data. Pre-zeroing means we read zeros if the DMA never lands,
-  // which the upper layers can detect/route. The DSB after memset
-  // ensures the zero is visible to the NIC before it accepts a
-  // matching send.
-  void zero_recv_buffer(SharedBuffer& buf) {
+  // Zero a pool buffer before reuse. JACCL's buffer pool indexes by
+  // (sz, buff, peer) and reuses slots across consecutive collectives.
+  // The NIC always transfers `entry.length = buf.size()` bytes per
+  // SEND (the SGE length, not the payload length), so a small message
+  // (4 bytes for the count gather) leaves the rest of the buffer
+  // populated with stale bytes from whatever last filled this slot —
+  // typically bf16 from a prior small all_reduce. Without pre-zeroing,
+  // those stale bytes propagate over the wire and we end up reading
+  // them back on the receive side, producing the corruption-guard
+  // fingerprint (1B+ int32 values, 0x3E…/0x3F… bf16 bit patterns)
+  // when c=2 + MTP brings sustained mixed-bucket-0 traffic.
+  // Zero-fill on every reuse breaks that bleed-through; the DSB
+  // ensures the zeros are visible before the NIC reads/writes the slot.
+  void zero_pool_buffer(SharedBuffer& buf) {
     std::memset(buf.data<char>(), 0, buf.size());
     JACCL_DMA_BARRIER();
+  }
+
+  void zero_recv_buffer(SharedBuffer& buf) {
+    zero_pool_buffer(buf);
   }
 
   void recv_from(int sz, int rank, int buff) {
