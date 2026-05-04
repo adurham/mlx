@@ -170,6 +170,7 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
+    std::lock_guard<std::mutex> guard(collective_mutex_);
     mesh_.all_gather(in_ptr, out_ptr, n_bytes);
   });
 }
@@ -179,8 +180,10 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   int64_t n_bytes = input.nbytes();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
-  encoder.dispatch(
-      [data, n_bytes, dst, this]() { mesh_.send(data, n_bytes, dst); });
+  encoder.dispatch([data, n_bytes, dst, this]() {
+    std::lock_guard<std::mutex> guard(collective_mutex_);
+    mesh_.send(data, n_bytes, dst);
+  });
 }
 
 void MeshGroup::recv(array& out, int src, Stream stream) {
@@ -188,8 +191,10 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   int64_t n_bytes = out.nbytes();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
-  encoder.dispatch(
-      [data, n_bytes, src, this]() { mesh_.recv(data, n_bytes, src); });
+  encoder.dispatch([data, n_bytes, src, this]() {
+    std::lock_guard<std::mutex> guard(collective_mutex_);
+    mesh_.recv(data, n_bytes, src);
+  });
 }
 
 template <typename T, typename ReduceOp>
@@ -205,6 +210,7 @@ void MeshGroup::all_reduce(
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, size, this, reduce_op]() {
+    std::lock_guard<std::mutex> guard(collective_mutex_);
     if (size_ > 2 &&
         ((std::is_same_v<T, bfloat16_t> && size > 65536) ||
          size >= 8 * 1024 * 1024 / sizeof(T))) {
