@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <span>
 
 #include "mlx/distributed/jaccl/utils.h"
@@ -322,9 +323,27 @@ class MeshImpl {
         send_buffer(sz, buff), SEND_WR << 16 | buff << 8 | rank);
   }
 
+  // Zero the recv buffer before posting it. JACCL's buffer pool indexes
+  // by (sz, buff, peer) and reuses slots across consecutive collectives.
+  // If the next NIC DMA-write fails to fully overwrite the slot — which
+  // is the symptom on c=2 + MTP after the DSB barriers landed (the recv
+  // buffer ends up holding bf16 bit patterns from a prior small
+  // all_reduce, and the corruption guard reads them back as integer
+  // garbage in the billions) — the reader gets stale bytes instead of
+  // fresh data. Pre-zeroing means we read zeros if the DMA never lands,
+  // which the upper layers can detect/route. The DSB after memset
+  // ensures the zero is visible to the NIC before it accepts a
+  // matching send.
+  void zero_recv_buffer(SharedBuffer& buf) {
+    std::memset(buf.data<char>(), 0, buf.size());
+    JACCL_DMA_BARRIER();
+  }
+
   void recv_from(int sz, int rank, int buff) {
+    auto& recv_buf = recv_buffer(sz, buff, rank);
+    zero_recv_buffer(recv_buf);
     connections_[rank].post_recv(
-        recv_buffer(sz, buff, rank), RECV_WR << 16 | buff << 8 | rank);
+        recv_buf, RECV_WR << 16 | buff << 8 | rank);
   }
 
   SharedBuffer& send_buffer(int sz, int buff) {
@@ -353,7 +372,9 @@ class MeshImpl {
       if (i == rank_) {
         continue;
       }
-      connections_[i].post_recv(buffers_[b + i], wr_id | i);
+      auto& recv_buf = buffers_[b + i];
+      zero_recv_buffer(recv_buf);
+      connections_[i].post_recv(recv_buf, wr_id | i);
     }
   }
 
