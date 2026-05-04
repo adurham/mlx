@@ -172,7 +172,9 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
   encoder.set_output_array(output);
   encoder.dispatch([call_id, in_ptr, out_ptr, n_bytes, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
+    cross_rank_pre_barrier(call_id);
     mesh_.all_gather(call_id, in_ptr, out_ptr, n_bytes);
+    cross_rank_post_barrier(call_id);
   });
 }
 
@@ -184,7 +186,9 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
   encoder.set_input_array(input);
   encoder.dispatch([call_id, data, n_bytes, dst, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
+    cross_rank_pre_barrier(call_id);
     mesh_.send(call_id, data, n_bytes, dst);
+    cross_rank_post_barrier(call_id);
   });
 }
 
@@ -196,7 +200,9 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
   encoder.set_output_array(out);
   encoder.dispatch([call_id, data, n_bytes, src, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
+    cross_rank_pre_barrier(call_id);
     mesh_.recv(call_id, data, n_bytes, src);
+    cross_rank_post_barrier(call_id);
   });
 }
 
@@ -215,6 +221,7 @@ void MeshGroup::all_reduce(
   encoder.set_output_array(output);
   encoder.dispatch([call_id, in_ptr, out_ptr, size, this, reduce_op]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
+    cross_rank_pre_barrier(call_id);
     if (size_ > 2 &&
         ((std::is_same_v<T, bfloat16_t> && size > 65536) ||
          size >= 8 * 1024 * 1024 / sizeof(T))) {
@@ -222,7 +229,34 @@ void MeshGroup::all_reduce(
     } else {
       mesh_.all_reduce(call_id, in_ptr, out_ptr, size, reduce_op);
     }
+    cross_rank_post_barrier(call_id);
   });
+}
+
+void MeshGroup::cross_rank_pre_barrier(uint32_t call_id) {
+  // Cross-rank pacing barrier: drain the TCP side-channel before any
+  // post_send / post_recv. Without this, local threads on each rank
+  // can race to acquire the per-group mutex in different orders
+  // (multiple MLX streams + γ=2 MTP at c>1 reliably reproduces it),
+  // producing asymmetric sequences of post_send / post_recv at the
+  // QP level. UC's FIFO matching then fills our recv WR's buffer
+  // with the wrong collective's bytes — even with a per-call wr_id
+  // we see the matching id on the completion but read foreign bytes
+  // out of our slot. Synchronizing the call_ids forces both ranks
+  // to wait for each other before either advances. We do NOT abort
+  // on call_id mismatch: at c>1 the two ranks' call_id sequences
+  // are independent counters, so mismatch is the normal case. The
+  // value of the barrier is timing — both ranks block here until
+  // both have arrived.
+  (void)side_channel_.all_gather<uint32_t>(call_id);
+}
+
+void MeshGroup::cross_rank_post_barrier(uint32_t call_id) {
+  // Drain symmetrically: ensure peer also finished THIS collective
+  // before we return. Otherwise we might enter the next collective
+  // and post sends while peer is still finishing this one — same
+  // asymmetric-FIFO failure mode.
+  (void)side_channel_.all_gather<uint32_t>(call_id);
 }
 
 } // namespace mlx::core::distributed::jaccl

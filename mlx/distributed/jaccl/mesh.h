@@ -117,6 +117,9 @@ class MeshGroup : public GroupImpl {
   uint32_t next_call_id() {
     return next_call_id_.fetch_add(1, std::memory_order_relaxed);
   }
+
+  void cross_rank_pre_barrier(uint32_t call_id);
+  void cross_rank_post_barrier(uint32_t call_id);
 };
 
 } // namespace mlx::core::distributed::jaccl
