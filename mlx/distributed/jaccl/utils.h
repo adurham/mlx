@@ -8,6 +8,21 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__aarch64__) || defined(__arm64__)
+#include <arm_acle.h>
+// Full-system data-synchronization barrier. On ARM (Apple Silicon) the
+// CPU has weak memory ordering and a regular std::copy into a buffer
+// is not guaranteed to be visible to a NIC that reads the same buffer
+// via DMA. Without this barrier, JACCL's send path reads stale bytes
+// (typically leftover bf16 from a prior all_reduce in the same FRAME-
+// sized buffer slot), and the receiver gets float-bit-pattern garbage
+// in what was supposed to be an int message. Same idiom mlx already
+// uses in metal/fence.cpp for CPU<->GPU coherency.
+#define JACCL_DMA_BARRIER() __dsb(0xF)
+#else
+#define JACCL_DMA_BARRIER() ((void)0)
+#endif
+
 #include "mlx/distributed/utils.h"
 
 constexpr const char* IBV_TAG = "[jaccl]";
@@ -176,6 +191,12 @@ struct Connection {
   void queue_pair_rts();
 
   void post_send(const SharedBuffer& buff, uint64_t work_request_id) {
+    // Make sure every prior CPU write to `buff` is visible to the NIC
+    // before we hand the buffer over for DMA. Without this, the NIC may
+    // race the CPU and DMA stale bytes (the bug that produced
+    // 0x3E…/0x3F… float-pattern garbage on c=2 + MTP).
+    JACCL_DMA_BARRIER();
+
     ibv_send_wr work_request, *bad_work_request;
 
     auto entry = buff.to_scatter_gather_entry(protection_domain);

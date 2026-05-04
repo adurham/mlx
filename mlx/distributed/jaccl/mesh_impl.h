@@ -97,6 +97,9 @@ class MeshImpl {
         }
 
         else if (work_type == RECV_WR) {
+          // The NIC has DMA'd into recv_buffer; ensure those writes are
+          // visible to the CPU before we read from the buffer below.
+          JACCL_DMA_BARRIER();
           completed_recv_end[rank]++;
         }
       }
@@ -196,6 +199,9 @@ class MeshImpl {
 
         // Recv completed. If we have more chunks then post another recv.
         else if (work_type == RECV_WR) {
+          // Ensure the NIC's DMA writes to recv_buffer are visible to
+          // the CPU before we std::copy out of it.
+          JACCL_DMA_BARRIER();
           std::copy(
               recv_buffer(sz, buff, rank).begin<char>(),
               recv_buffer(sz, buff, rank).begin<char>() +
@@ -292,6 +298,8 @@ class MeshImpl {
 
         in_flight--;
 
+        // Ensure NIC DMA writes to recv_buffer are visible to the CPU.
+        JACCL_DMA_BARRIER();
         std::copy(
             recv_buffer(sz, buff, src).begin<char>(),
             recv_buffer(sz, buff, src).begin<char>() +
