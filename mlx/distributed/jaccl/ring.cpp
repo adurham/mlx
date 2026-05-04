@@ -155,7 +155,6 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
-    std::lock_guard<std::mutex> guard(collective_mutex_);
     ring_.all_gather(in_ptr, out_ptr, n_bytes, n_conns_);
   });
 }
@@ -174,7 +173,6 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.dispatch([data, n_bytes, dst, this]() {
-    std::lock_guard<std::mutex> guard(collective_mutex_);
     ring_.send(data, n_bytes, dst, n_conns_);
   });
 }
@@ -193,7 +191,6 @@ void RingGroup::recv(array& out, int src, Stream stream) {
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
   encoder.dispatch([data, n_bytes, src, this]() {
-    std::lock_guard<std::mutex> guard(collective_mutex_);
     ring_.recv(data, n_bytes, src, n_conns_);
   });
 }
@@ -212,7 +209,6 @@ void RingGroup::all_reduce(
   encoder.set_input_array(input);
   encoder.set_output_array(output);
   encoder.dispatch([in_ptr, out_ptr, size, n_bytes, this, reduce_op]() {
-    std::lock_guard<std::mutex> guard(collective_mutex_);
     if (size < size_ * 2 * n_conns_) {
       ring_.all_reduce<1, T, ReduceOp>(in_ptr, out_ptr, size, 1, reduce_op);
       return;
