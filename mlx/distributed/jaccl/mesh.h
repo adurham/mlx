@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 
 #include "mlx/distributed/distributed_impl.h"
@@ -102,6 +103,20 @@ class MeshGroup : public GroupImpl {
   // handshake; they do not address this concurrent-call race. Serialize
   // every collective on this group behind one mutex.
   std::mutex collective_mutex_;
+
+  // Per-collective monotonic id, encoded in the high 32 bits of every
+  // wr_id we post. Ensures that any completion that surfaces in the
+  // shared CQ from a prior call (whether because the prior call leaked
+  // a completion, or because a recv WR it posted was matched by a
+  // peer's send after the prior call returned) is detected by id
+  // mismatch and skipped during polling — instead of being interpreted
+  // as ours and read out of a buffer slot we never wrote to. Starts at
+  // 1 so 0 stays an obvious sentinel for "no call yet."
+  std::atomic<uint32_t> next_call_id_{1};
+
+  uint32_t next_call_id() {
+    return next_call_id_.fetch_add(1, std::memory_order_relaxed);
+  }
 };
 
 } // namespace mlx::core::distributed::jaccl

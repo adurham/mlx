@@ -151,12 +151,13 @@ void RingGroup::all_gather(const array& input, array& output, Stream stream) {
   auto in_ptr = input.data<char>();
   auto out_ptr = output.data<char>();
   int64_t n_bytes = input.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.set_output_array(output);
-  encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
+  encoder.dispatch([call_id, in_ptr, out_ptr, n_bytes, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
-    ring_.all_gather(in_ptr, out_ptr, n_bytes, n_conns_);
+    ring_.all_gather(call_id, in_ptr, out_ptr, n_bytes, n_conns_);
   });
 }
 
@@ -171,11 +172,12 @@ void RingGroup::send(const array& input, int dst, Stream stream) {
   }
   auto data = input.data<char>();
   int64_t n_bytes = input.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
-  encoder.dispatch([data, n_bytes, dst, this]() {
+  encoder.dispatch([call_id, data, n_bytes, dst, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
-    ring_.send(data, n_bytes, dst, n_conns_);
+    ring_.send(call_id, data, n_bytes, dst, n_conns_);
   });
 }
 
@@ -190,11 +192,12 @@ void RingGroup::recv(array& out, int src, Stream stream) {
   }
   auto data = out.data<char>();
   int64_t n_bytes = out.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
-  encoder.dispatch([data, n_bytes, src, this]() {
+  encoder.dispatch([call_id, data, n_bytes, src, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
-    ring_.recv(data, n_bytes, src, n_conns_);
+    ring_.recv(call_id, data, n_bytes, src, n_conns_);
   });
 }
 
@@ -208,24 +211,28 @@ void RingGroup::all_reduce(
   auto out_ptr = output.data<T>();
   int64_t size = input.size();
   int64_t n_bytes = input.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.set_output_array(output);
-  encoder.dispatch([in_ptr, out_ptr, size, n_bytes, this, reduce_op]() {
-    std::lock_guard<std::mutex> guard(collective_mutex_);
-    if (size < size_ * 2 * n_conns_) {
-      ring_.all_reduce<1, T, ReduceOp>(in_ptr, out_ptr, size, 1, reduce_op);
-      return;
-    }
+  encoder.dispatch(
+      [call_id, in_ptr, out_ptr, size, n_bytes, this, reduce_op]() {
+        std::lock_guard<std::mutex> guard(collective_mutex_);
+        if (size < size_ * 2 * n_conns_) {
+          ring_.all_reduce<1, T, ReduceOp>(
+              call_id, in_ptr, out_ptr, size, 1, reduce_op);
+          return;
+        }
 
-    if (n_bytes <= 65536) {
-      ring_.all_reduce<2, T, ReduceOp>(in_ptr, out_ptr, size, 1, reduce_op);
-      return;
-    }
+        if (n_bytes <= 65536) {
+          ring_.all_reduce<2, T, ReduceOp>(
+              call_id, in_ptr, out_ptr, size, 1, reduce_op);
+          return;
+        }
 
-    ring_.all_reduce<2, T, ReduceOp>(
-        in_ptr, out_ptr, size, n_conns_, reduce_op);
-  });
+        ring_.all_reduce<2, T, ReduceOp>(
+            call_id, in_ptr, out_ptr, size, n_conns_, reduce_op);
+      });
 }
 
 } // namespace mlx::core::distributed::jaccl

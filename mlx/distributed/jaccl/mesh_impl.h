@@ -23,8 +23,12 @@ class MeshImpl {
   MeshImpl() : rank_(0), size_(1) {}
 
   template <typename T, typename ReduceOp>
-  void
-  all_reduce(const T* in_ptr, T* out_ptr, int64_t size, ReduceOp reduce_op) {
+  void all_reduce(
+      uint32_t call_id,
+      const T* in_ptr,
+      T* out_ptr,
+      int64_t size,
+      ReduceOp reduce_op) {
     // If not inplace all reduce then copy the input to the output first
     if (in_ptr != out_ptr) {
       std::memcpy(out_ptr, in_ptr, size * sizeof(T));
@@ -49,12 +53,12 @@ class MeshImpl {
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(sz, buff);
+      post_recv_all(call_id, sz, buff);
       std::copy(
           data + read_offset,
           data + std::min(read_offset + N, total),
           send_buffer(sz, buff).begin<T>());
-      post_send_all(sz, buff);
+      post_send_all(call_id, sz, buff);
 
       buff++;
       in_flight += 2 * num_peers;
@@ -76,9 +80,18 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int work_type = wc[i].wr_id >> 16;
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        // Stale completion from a prior collective: ignore it. Do not
+        // decrement in_flight (it does not belong to ours) and do not
+        // touch the buffer it points at — that buffer is owned by a
+        // call that has already returned, and reading it produces
+        // exactly the cross-call corruption this scheme exists to
+        // prevent.
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int work_type = wr_id_work_type(wc[i].wr_id);
+        int buff = wr_id_buff(wc[i].wr_id);
+        int rank = wr_id_peer(wc[i].wr_id);
 
         in_flight--;
 
@@ -89,7 +102,7 @@ class MeshImpl {
                 data + read_offset,
                 data + std::min(read_offset + N, total),
                 send_buffer(sz, buff).begin<T>());
-            post_send_all(sz, buff);
+            post_send_all(call_id, sz, buff);
 
             completed_send_count[buff] = 0;
             in_flight += num_peers;
@@ -126,7 +139,7 @@ class MeshImpl {
           w += N;
           s++;
           if (w + (PIPELINE - 1) * N < total) {
-            recv_from(sz, r, buff);
+            recv_from(call_id, sz, r, buff);
             in_flight++;
           }
         }
@@ -135,7 +148,11 @@ class MeshImpl {
     }
   }
 
-  void all_gather(const char* in_ptr, char* out_ptr, int64_t n_bytes) {
+  void all_gather(
+      uint32_t call_id,
+      const char* in_ptr,
+      char* out_ptr,
+      int64_t n_bytes) {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
@@ -157,12 +174,12 @@ class MeshImpl {
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(sz, buff);
+      post_recv_all(call_id, sz, buff);
       std::copy(
           our_data + read_offset,
           our_data + std::min(read_offset + N, total),
           send_buffer(sz, buff).begin<char>());
-      post_send_all(sz, buff);
+      post_send_all(call_id, sz, buff);
 
       buff++;
       in_flight += 2 * num_peers;
@@ -176,9 +193,12 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int work_type = wc[i].wr_id >> 16;
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int work_type = wr_id_work_type(wc[i].wr_id);
+        int buff = wr_id_buff(wc[i].wr_id);
+        int rank = wr_id_peer(wc[i].wr_id);
 
         in_flight--;
 
@@ -190,7 +210,7 @@ class MeshImpl {
                 our_data + read_offset,
                 our_data + std::min(read_offset + N, total),
                 send_buffer(sz, buff).begin<char>());
-            post_send_all(sz, buff);
+            post_send_all(call_id, sz, buff);
 
             completed_send_count[buff] = 0;
             in_flight += num_peers;
@@ -210,7 +230,7 @@ class MeshImpl {
               data + rank * n_bytes + write_offset[rank]);
           write_offset[rank] += N;
           if (write_offset[rank] + N * (PIPELINE - 1) < total) {
-            recv_from(sz, rank, buff);
+            recv_from(call_id, sz, rank, buff);
             in_flight++;
           }
         }
@@ -218,7 +238,7 @@ class MeshImpl {
     }
   }
 
-  void send(const char* in_ptr, int64_t n_bytes, int dst) {
+  void send(uint32_t call_id, const char* in_ptr, int64_t n_bytes, int dst) {
     constexpr int PIPELINE = 2;
     constexpr int WC_NUM = PIPELINE;
     auto [sz, N] = buffer_size_from_message(n_bytes);
@@ -233,7 +253,7 @@ class MeshImpl {
           in_ptr + read_offset,
           in_ptr + std::min(read_offset + N, n_bytes),
           send_buffer(sz, buff).begin<char>());
-      send_to(sz, dst, buff);
+      send_to(call_id, sz, dst, buff);
 
       buff++;
       read_offset += N;
@@ -249,8 +269,10 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = connections_[dst].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int buff = wr_id_buff(wc[i].wr_id);
 
         in_flight--;
 
@@ -259,7 +281,7 @@ class MeshImpl {
               in_ptr + read_offset,
               in_ptr + std::min(read_offset + N, n_bytes),
               send_buffer(sz, buff).begin<char>());
-          send_to(sz, dst, buff);
+          send_to(call_id, sz, dst, buff);
 
           read_offset += N;
           in_flight++;
@@ -268,7 +290,7 @@ class MeshImpl {
     }
   }
 
-  void recv(char* out_ptr, int64_t n_bytes, int src) {
+  void recv(uint32_t call_id, char* out_ptr, int64_t n_bytes, int src) {
     constexpr int PIPELINE = 2;
     constexpr int WC_NUM = PIPELINE;
     auto [sz, N] = buffer_size_from_message(n_bytes);
@@ -279,7 +301,7 @@ class MeshImpl {
     // Prefill the pipeline
     int buff = 0;
     while (N * buff < n_bytes && buff < PIPELINE) {
-      recv_from(sz, src, buff);
+      recv_from(call_id, sz, src, buff);
 
       in_flight++;
       buff++;
@@ -294,8 +316,10 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = connections_[src].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int buff = wr_id_buff(wc[i].wr_id);
 
         in_flight--;
 
@@ -309,7 +333,7 @@ class MeshImpl {
         write_offset += N;
 
         if (write_offset + (PIPELINE - 1) * N < n_bytes) {
-          recv_from(sz, src, buff);
+          recv_from(call_id, sz, src, buff);
 
           in_flight++;
         }
@@ -318,9 +342,9 @@ class MeshImpl {
   }
 
  private:
-  void send_to(int sz, int rank, int buff) {
+  void send_to(uint32_t call_id, int sz, int rank, int buff) {
     connections_[rank].post_send(
-        send_buffer(sz, buff), SEND_WR << 16 | buff << 8 | rank);
+        send_buffer(sz, buff), make_wr_id(call_id, SEND_WR, buff, rank));
   }
 
   // Zero the recv buffer before posting it. JACCL's buffer pool indexes
@@ -339,11 +363,11 @@ class MeshImpl {
     JACCL_DMA_BARRIER();
   }
 
-  void recv_from(int sz, int rank, int buff) {
+  void recv_from(uint32_t call_id, int sz, int rank, int buff) {
     auto& recv_buf = recv_buffer(sz, buff, rank);
     zero_recv_buffer(recv_buf);
     connections_[rank].post_recv(
-        recv_buf, RECV_WR << 16 | buff << 8 | rank);
+        recv_buf, make_wr_id(call_id, RECV_WR, buff, rank));
   }
 
   SharedBuffer& send_buffer(int sz, int buff) {
@@ -354,27 +378,26 @@ class MeshImpl {
     return buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank];
   }
 
-  void post_send_all(int sz, int buff) {
+  void post_send_all(uint32_t call_id, int sz, int buff) {
     auto& b = send_buffer(sz, buff);
-    int wr_id = SEND_WR << 16 | buff << 8;
     for (int i = 0; i < size_; i++) {
       if (i == rank_) {
         continue;
       }
-      connections_[i].post_send(b, wr_id | i);
+      connections_[i].post_send(b, make_wr_id(call_id, SEND_WR, buff, i));
     }
   }
 
-  void post_recv_all(int sz, int buff) {
+  void post_recv_all(uint32_t call_id, int sz, int buff) {
     int b = sz * NUM_BUFFERS * size_ + buff * size_;
-    int wr_id = RECV_WR << 16 | buff << 8;
     for (int i = 0; i < size_; i++) {
       if (i == rank_) {
         continue;
       }
       auto& recv_buf = buffers_[b + i];
       zero_recv_buffer(recv_buf);
-      connections_[i].post_recv(recv_buf, wr_id | i);
+      connections_[i].post_recv(
+          recv_buf, make_wr_id(call_id, RECV_WR, buff, i));
     }
   }
 

@@ -166,34 +166,37 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
   auto in_ptr = input.data<char>();
   auto out_ptr = output.data<char>();
   size_t n_bytes = input.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.set_output_array(output);
-  encoder.dispatch([in_ptr, out_ptr, n_bytes, this]() {
+  encoder.dispatch([call_id, in_ptr, out_ptr, n_bytes, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
-    mesh_.all_gather(in_ptr, out_ptr, n_bytes);
+    mesh_.all_gather(call_id, in_ptr, out_ptr, n_bytes);
   });
 }
 
 void MeshGroup::send(const array& input, int dst, Stream stream) {
   auto data = input.data<char>();
   int64_t n_bytes = input.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
-  encoder.dispatch([data, n_bytes, dst, this]() {
+  encoder.dispatch([call_id, data, n_bytes, dst, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
-    mesh_.send(data, n_bytes, dst);
+    mesh_.send(call_id, data, n_bytes, dst);
   });
 }
 
 void MeshGroup::recv(array& out, int src, Stream stream) {
   auto data = out.data<char>();
   int64_t n_bytes = out.nbytes();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_output_array(out);
-  encoder.dispatch([data, n_bytes, src, this]() {
+  encoder.dispatch([call_id, data, n_bytes, src, this]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
-    mesh_.recv(data, n_bytes, src);
+    mesh_.recv(call_id, data, n_bytes, src);
   });
 }
 
@@ -206,17 +209,18 @@ void MeshGroup::all_reduce(
   auto in_ptr = input.data<T>();
   auto out_ptr = output.data<T>();
   int64_t size = input.size();
+  uint32_t call_id = next_call_id();
   auto& encoder = cpu::get_command_encoder(stream);
   encoder.set_input_array(input);
   encoder.set_output_array(output);
-  encoder.dispatch([in_ptr, out_ptr, size, this, reduce_op]() {
+  encoder.dispatch([call_id, in_ptr, out_ptr, size, this, reduce_op]() {
     std::lock_guard<std::mutex> guard(collective_mutex_);
     if (size_ > 2 &&
         ((std::is_same_v<T, bfloat16_t> && size > 65536) ||
          size >= 8 * 1024 * 1024 / sizeof(T))) {
-      ring_.all_reduce<2>(in_ptr, out_ptr, size, 1, reduce_op);
+      ring_.all_reduce<2>(call_id, in_ptr, out_ptr, size, 1, reduce_op);
     } else {
-      mesh_.all_reduce(in_ptr, out_ptr, size, reduce_op);
+      mesh_.all_reduce(call_id, in_ptr, out_ptr, size, reduce_op);
     }
   });
 }

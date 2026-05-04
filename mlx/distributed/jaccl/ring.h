@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 
 #include "mlx/distributed/distributed_impl.h"
@@ -91,6 +92,13 @@ class RingGroup : public GroupImpl {
   // does, so the same concurrent-call race applies. See the comment on
   // MeshGroup::collective_mutex_ for the full rationale.
   std::mutex collective_mutex_;
+
+  // See MeshGroup::next_call_id_ for the full rationale.
+  std::atomic<uint32_t> next_call_id_{1};
+
+  uint32_t next_call_id() {
+    return next_call_id_.fetch_add(1, std::memory_order_relaxed);
+  }
 };
 
 } // namespace mlx::core::distributed::jaccl

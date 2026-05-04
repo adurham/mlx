@@ -34,6 +34,48 @@ constexpr int BUFFER_SIZES = 8;
 constexpr int NUM_BUFFERS = 2;
 constexpr int FRAME_SIZE = 4096;
 
+// wr_id layout (64 bits):
+//   [63..32]  call_id  — unique per collective invocation on a group
+//   [23..16]  work_type (SEND_WR | RECV_WR)
+//   [15..8]   buff index (0..NUM_BUFFERS-1)
+//   [7..0]    peer rank or wire index (0..255)
+//
+// The call_id is critical for correctness when a prior collective leaks a
+// completion into the CQ (or leaves a posted recv WR that subsequently gets
+// matched by a peer's send): without it, the current collective's polling
+// loop would parse the stale wr_id's buff/rank fields and read from a
+// (sz, buff, peer) buffer slot it never posted to, returning whatever bytes
+// the prior collective left there (typically bf16 from a prior all_reduce
+// landing in what should be an int gather, etc). With it, stale completions
+// are detected by call_id mismatch and skipped without decrementing
+// in_flight or processing the buffer.
+inline uint64_t make_wr_id(
+    uint32_t call_id,
+    int work_type,
+    int buff,
+    int peer_or_wire) {
+  return (static_cast<uint64_t>(call_id) << 32) |
+      (static_cast<uint64_t>(work_type & 0xff) << 16) |
+      (static_cast<uint64_t>(buff & 0xff) << 8) |
+      static_cast<uint64_t>(peer_or_wire & 0xff);
+}
+
+inline uint32_t wr_id_call_id(uint64_t wr_id) {
+  return static_cast<uint32_t>(wr_id >> 32);
+}
+
+inline int wr_id_work_type(uint64_t wr_id) {
+  return static_cast<int>((wr_id >> 16) & 0xff);
+}
+
+inline int wr_id_buff(uint64_t wr_id) {
+  return static_cast<int>((wr_id >> 8) & 0xff);
+}
+
+inline int wr_id_peer(uint64_t wr_id) {
+  return static_cast<int>(wr_id & 0xff);
+}
+
 namespace detail = mlx::core::distributed::detail;
 
 namespace {
