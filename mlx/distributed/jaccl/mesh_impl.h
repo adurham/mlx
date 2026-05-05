@@ -57,6 +57,12 @@ class MeshImpl {
     int completed_recv_begin[MESH_MAX_PEERS] = {0};
     int completed_recv_end[MESH_MAX_PEERS] = {0};
 
+    // Cross-rank start barrier: post ack_recv FIRST (head of QP),
+    // then ack_send + wait. After this, both ranks are at the
+    // SAME lambda boundary and have agreed on call_id ordering.
+    post_ack_recvs(call_id);
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
@@ -173,7 +179,7 @@ class MeshImpl {
         completed_recv_begin[r] = s;
       }
     }
-    ack_sync(call_id);
+    ack_sync_post(call_id);
   }
 
   void all_gather(
@@ -198,6 +204,10 @@ class MeshImpl {
     int read_offset = 0;
     int completed_send_count[PIPELINE] = {0};
     int write_offset[MESH_MAX_PEERS] = {0};
+
+    // Cross-rank start barrier — see all_reduce equivalent.
+    post_ack_recvs(call_id);
+    ack_sync_pre(call_id);
 
     // Prefill the pipeline
     int buff = 0;
@@ -281,7 +291,7 @@ class MeshImpl {
         }
       }
     }
-    ack_sync(call_id);
+    ack_sync_post(call_id);
   }
 
   void send(uint32_t call_id, const char* in_ptr, int64_t n_bytes, int dst) {
@@ -291,6 +301,10 @@ class MeshImpl {
 
     int in_flight = 0;
     int64_t read_offset = 0;
+
+    // Cross-rank start barrier — see all_reduce.
+    post_ack_recvs(call_id);
+    ack_sync_pre(call_id);
 
     // Prefill the pipeline
     int buff = 0;
@@ -334,7 +348,7 @@ class MeshImpl {
         }
       }
     }
-    ack_sync(call_id);
+    ack_sync_post(call_id);
   }
 
   void recv(uint32_t call_id, char* out_ptr, int64_t n_bytes, int src) {
@@ -344,6 +358,10 @@ class MeshImpl {
 
     int in_flight = 0;
     int64_t write_offset = 0;
+
+    // Cross-rank start barrier — see all_reduce.
+    post_ack_recvs(call_id);
+    ack_sync_pre(call_id);
 
     // Prefill the pipeline
     int buff = 0;
@@ -386,24 +404,122 @@ class MeshImpl {
         }
       }
     }
-    ack_sync(call_id);
+    ack_sync_post(call_id);
   }
 
  private:
-  // End-of-lambda cross-rank synchronization. Each lambda calls this
-  // after its main loop (after in_flight reaches 0). Posts a 4-byte
-  // ack send + ack recv to every peer over the SAME QP and waits for
-  // both completions per peer. By the time this returns, peer has
-  // also drained its main loop and posted its ack — so both ranks
-  // are provably at the SAME end-of-lambda boundary.
+  // Cross-rank ack barrier — used at BOTH ends of every lambda.
+  // Posts a small ack send + ack recv to every peer over the data
+  // QP and waits for both completions per peer.
+  //
+  // Two calls per lambda:
+  //   ack_sync_pre(): called BEFORE the data prefill posts. Confirms
+  //     peer has reached the same lambda boundary AND posted its
+  //     ack_recv as the very first WR on its QP recv queue. So our
+  //     ack_send arrives at peer's first recv (the ack one), not at
+  //     a stale prior-lambda recv. Once this returns, both ranks are
+  //     synchronized at lambda start.
+  //   ack_sync_post(): called AFTER the data main loop. Confirms peer
+  //     also drained its main loop. Without this, in_flight==0 only
+  //     proves OUR side drained; peer might still be polling, and
+  //     our next-lambda send could arrive at peer's still-posted
+  //     prior-lambda recv WR (different sz → IBV_WC_LOC_LEN_ERR).
+  //
+  // CRITICAL: callers MUST post the per-peer ack_recv BEFORE any
+  // other recvs in the lambda (so the ack is at the head of the
+  // QP recv queue and matches peer's ack_send first). The pre/post
+  // ack pair on each call is the ack_send followed by waiting on
+  // both ack-side completions.
   //
   // Why this is needed even with single-CPU-stream pinning: in_flight
   // == 0 locally means our local NIC has reported completion for our
   // posts; UC delivers send-completion when transmitted, not when
   // peer received. So our lambda can return before peer's lambda has
-  // reached its main-loop exit. If we then start a new lambda with a
-  // different sz, our new lambda's sends arrive at peer's still-
-  // running lambda's recv WRs (different size → IBV_WC_LOC_LEN_ERR).
+  // reached its main-loop exit. The ack barrier closes that window.
+  void ack_sync_pre(uint32_t call_id) {
+    // Caller has already posted ack_recvs as the FIRST recv WRs.
+    // Now post our ack_sends and wait for both completions per peer.
+    int num_peers = size_ - 1;
+    int in_flight = 2 * num_peers;
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& sbuf = ack_send_buffers_[peer];
+      connections_[peer].post_send(
+          sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+    }
+    drain_acks(call_id, in_flight);
+  }
+
+  void ack_sync_post(uint32_t call_id) {
+    int num_peers = size_ - 1;
+    int in_flight = 2 * num_peers; // one send + one recv per peer
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& sbuf = ack_send_buffers_[peer];
+      auto& rbuf = ack_recv_buffers_[peer];
+      // Zero before post — defends against any stale recv-side bytes
+      // (same rationale as zero_recv_buffer in the data path).
+      std::memset(rbuf.data<char>(), 0, rbuf.size());
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_recv(
+          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+      connections_[peer].post_send(
+          sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+    }
+    drain_acks(call_id, in_flight);
+  }
+
+  // Helper used by post_ack_recvs() to put ack_recv as the FIRST
+  // recv WR on each peer's QP queue, before any data recv WRs. This
+  // makes peer's ack_send hit our ack_recv first (FIFO matching).
+  void post_ack_recvs(uint32_t call_id) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& rbuf = ack_recv_buffers_[peer];
+      std::memset(rbuf.data<char>(), 0, rbuf.size());
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_recv(
+          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+    }
+  }
+
+  void drain_acks(uint32_t call_id, int in_flight) {
+    while (in_flight > 0) {
+      ibv_wc wc[16];
+      int n = poll(connections_, 16, wc);
+      for (int i = 0; i < n; i++) {
+        // Skip stale completions from prior calls; never decrement
+        // in_flight or touch buffers for those.
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int wt = wr_id_work_type(wc[i].wr_id);
+        if (wt != ACK_SEND_WR && wt != ACK_RECV_WR) {
+          // Leftover data completion from this same call — drain
+          // without touching in_flight (the data side already
+          // accounted for it).
+          continue;
+        }
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::ostringstream msg;
+          msg << "[jaccl] ack drain wc.status=" << wc[i].status
+              << " wr_id=0x" << std::hex << wc[i].wr_id;
+          throw std::runtime_error(msg.str());
+        }
+        in_flight--;
+      }
+    }
+  }
+
+  // Legacy single-call wrapper. Kept for callers that haven't been
+  // migrated to the post_ack_recvs + ack_sync_pre + ack_sync_post
+  // pattern.
   void ack_sync(uint32_t call_id) {
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers; // one send + one recv per peer
