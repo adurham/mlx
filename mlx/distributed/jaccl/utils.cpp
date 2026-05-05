@@ -107,11 +107,14 @@ void SharedBuffer::register_to_protection_domain(ibv_pd* protection_domain) {
   }
 }
 
-Connection::Connection(ibv_context* ctx_)
+Connection::Connection(ibv_context* ctx_) : Connection(ctx_, true) {}
+
+Connection::Connection(ibv_context* ctx_, bool owns_ctx_)
     : ctx(ctx_),
       protection_domain(nullptr),
       completion_queue(nullptr),
-      queue_pair(nullptr) {
+      queue_pair(nullptr),
+      owns_ctx(owns_ctx_) {
   src.local_id = -1;
 }
 
@@ -121,6 +124,7 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(completion_queue, c.completion_queue);
   std::swap(queue_pair, c.queue_pair);
   std::swap(src, c.src);
+  std::swap(owns_ctx, c.owns_ctx);
 }
 
 Connection::~Connection() {
@@ -133,7 +137,7 @@ Connection::~Connection() {
   if (protection_domain != nullptr) {
     ibv().dealloc_pd(protection_domain);
   }
-  if (ctx != nullptr) {
+  if (ctx != nullptr && owns_ctx) {
     ibv().close_device(ctx);
   }
 }

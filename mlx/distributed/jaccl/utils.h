@@ -217,8 +217,22 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
+  // True when this Connection owns the ibv_context and should
+  // close_device on destruction. False when the context is borrowed
+  // from a parent group (subgroups created via MeshGroup::split share
+  // the parent's contexts but allocate their own PD/CQ/QP — this is
+  // the standard RDMA-multi-comm pattern; macOS librdma does not
+  // give back independent contexts from a second ibv_open_device on
+  // the same device, so opening once and sharing is the only way).
+  bool owns_ctx;
 
+  // Owning ctor — takes ownership of ctx (closes on destruction).
   Connection(ibv_context* ctx_);
+  // Borrowing ctor — `ctx_` is borrowed from another Connection;
+  // destruction does not close the device. The caller is responsible
+  // for keeping the owning Connection alive at least as long as this
+  // borrowing one.
+  Connection(ibv_context* ctx_, bool owns_ctx_);
   Connection(Connection&& c);
 
   Connection(const Connection&) = delete;

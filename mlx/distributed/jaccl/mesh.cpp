@@ -133,16 +133,24 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   // supported. For all-ranks-join we keep parent's rank ordering.
   (void)key;
 
-  // Open fresh device contexts for the subgroup. macOS librdma allows
-  // multiple ibv_open_device calls for the same physical device; each
-  // call returns an independent ibv_context that owns its own PD/CQ/QP
-  // namespace. The fresh QPs are what gives the subgroup an isolated
-  // FIFO from the parent's QPs — collectives on the subgroup cannot
-  // race-mix posts/recvs with collectives on the parent or on a
-  // sibling subgroup.
-  auto new_conns = create_connections(device_names_);
+  // Build subgroup connections that SHARE the parent's ibv_context per
+  // peer (borrowing — owns_ctx=false), but allocate their OWN PD/CQ/QP.
+  // macOS librdma's ibv_open_device does not return independent
+  // contexts on a second call for the same device — recv WRs posted on
+  // a "second-open" context fail with IBV_WC_LOC_PROT_ERR despite the
+  // PD/MR/QP all being properly bound. The standard RDMA-multi-comm
+  // pattern (used by NCCL etc.) is one context per device, with fresh
+  // PD/CQ/QP per logical comm. The fresh QPs are what give the
+  // subgroup an isolated FIFO from the parent — collectives on the
+  // subgroup cannot race-mix posts/recvs with collectives on the
+  // parent or on a sibling subgroup.
+  std::vector<Connection> new_conns;
+  new_conns.reserve(size_);
+  for (auto& parent_conn : connections_) {
+    new_conns.emplace_back(parent_conn.ctx, /*owns_ctx=*/false);
+  }
 
-  // Allocate PD/CQ/QP for each fresh connection.
+  // Allocate PD/CQ/QP for each subgroup connection.
   for (auto& conn : new_conns) {
     if (conn.ctx == nullptr) {
       continue;
