@@ -79,13 +79,15 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Build borrowing Connections that share the parent's per-peer
-  // ibv_context (owns_ctx=false → destruction does not close the
-  // device). The caller (split) is responsible for keeping the
-  // owning parent group alive at least as long as this subgroup.
+  // Build owning Connections from the per-peer ibv_contexts handed
+  // to us. split() opens fresh device contexts (a second
+  // ibv_open_device per device) for the subgroup, since macOS
+  // librdma does not isolate QPs sharing a context — sibling
+  // subgroups observed cross-talk in the smoke test (g2's recv
+  // matched against g1's posted recv WR).
   connections_.reserve(static_cast<size_t>(size_));
   for (auto* ctx : shared_ctxs) {
-    connections_.emplace_back(ctx, /*owns_ctx=*/false);
+    connections_.emplace_back(ctx, /*owns_ctx=*/true);
   }
 
   // Run the same init sequence as the top-level path. The order
@@ -147,15 +149,23 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   // supported. For all-ranks-join we keep parent's rank ordering.
   (void)key;
 
-  // Borrow parent's per-peer ibv_contexts. The subgroup will allocate
-  // its own PD/CQ/QP on each shared context. The fresh QPs are what
-  // give the subgroup an isolated FIFO from the parent and from any
-  // sibling subgroup — collectives on different groups cannot
-  // race-mix posts/recvs into each other's recv WRs.
-  std::vector<ibv_context*> shared_ctxs;
-  shared_ctxs.reserve(static_cast<size_t>(size_));
-  for (auto& parent_conn : connections_) {
-    shared_ctxs.push_back(parent_conn.ctx);
+  // Open FRESH per-peer ibv_contexts for the subgroup (a second
+  // ibv_open_device for each device on the system). macOS librdma
+  // does NOT isolate QPs that share a context — sibling subgroups
+  // observed cross-talk (rank 1's g2 all_sum returned its local
+  // input, the peer's send went to g1's recv WR and was discarded).
+  // With fresh contexts, each subgroup has its own kernel-side
+  // device handle and its own QP namespace.
+  //
+  // We pre-open the contexts here (before passing into the subgroup
+  // ctor) so the subgroup can take ownership via the standard
+  // owns_ctx=true path — it will close the device on destruction.
+  auto fresh_conns = create_connections(device_names_);
+  std::vector<ibv_context*> fresh_ctxs;
+  fresh_ctxs.reserve(static_cast<size_t>(size_));
+  for (auto& c : fresh_conns) {
+    fresh_ctxs.push_back(c.ctx);
+    c.ctx = nullptr; // transfer ownership to subgroup ctor
   }
 
   // Build the subgroup. Its ctor runs the full init pipeline (PD/CQ/QP
@@ -164,7 +174,7 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   return std::make_shared<MeshGroup>(
       rank_,
       size_,
-      std::move(shared_ctxs),
+      std::move(fresh_ctxs),
       device_names_,
       [this](const std::vector<Destination>& info) {
         return side_channel_->all_gather(info);
