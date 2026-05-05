@@ -57,25 +57,46 @@ class MeshImpl {
     int completed_recv_begin[MESH_MAX_PEERS] = {0};
     int completed_recv_end[MESH_MAX_PEERS] = {0};
 
-    // Cross-rank start barrier: post ack_recv FIRST (head of QP),
-    // then ack_send + wait. After this, both ranks are at the
-    // SAME lambda boundary and have agreed on call_id ordering.
+    // Cross-rank start barrier with data_recv pre-posting:
+    //   1. Post ack_recv FIRST (head of QP recv queue).
+    //   2. Post ALL prefill data_recvs (in QP recv queue AFTER ack_recv).
+    //   3. Post ack_send + wait for ack pair completion. Once this
+    //      drains, peer has provably reached the same boundary AND
+    //      posted its prefill data_recvs (peer also did 1+2 before
+    //      sending its ack_send, so peer's ack_send→our ack_recv
+    //      success implies peer's recvs are posted too).
+    //   4. NOW post prefill data_sends. They'll arrive at peer's
+    //      already-posted data_recvs (size match). No drop, no race.
     post_ack_recvs(call_id);
+    int prefill_buffs = 0;
+    {
+      // Step 2: post all prefill recvs (without sends yet).
+      int b = 0;
+      int64_t ro = 0;
+      while (ro < total && b < PIPELINE) {
+        post_recv_all(call_id, sz, b);
+        b++;
+        ro += N;
+      }
+      prefill_buffs = b;
+    }
     ack_sync_pre(call_id);
-
-    // Prefill the pipeline
-    int buff = 0;
-    while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(call_id, sz, buff);
-      std::copy(
-          data + read_offset,
-          data + std::min(read_offset + N, total),
-          send_buffer(sz, buff).begin<T>());
-      post_send_all(call_id, sz, buff);
-
-      buff++;
-      in_flight += 2 * num_peers;
-      read_offset += N;
+    // Step 4: post all prefill sends (data_recvs already posted on
+    // both sides; safe to send now).
+    {
+      int b = 0;
+      int64_t ro = 0;
+      while (ro < total && b < prefill_buffs) {
+        std::copy(
+            data + ro,
+            data + std::min(ro + N, total),
+            send_buffer(sz, b).begin<T>());
+        post_send_all(call_id, sz, b);
+        b++;
+        in_flight += 2 * num_peers;
+        ro += N;
+      }
+      read_offset = ro;
     }
 
     // Main loop
@@ -205,23 +226,35 @@ class MeshImpl {
     int completed_send_count[PIPELINE] = {0};
     int write_offset[MESH_MAX_PEERS] = {0};
 
-    // Cross-rank start barrier — see all_reduce equivalent.
+    // Cross-rank start barrier with data_recv pre-posting —
+    // see all_reduce equivalent for the full rationale.
     post_ack_recvs(call_id);
+    int prefill_buffs = 0;
+    {
+      int b = 0;
+      int ro = 0;
+      while (ro < total && b < PIPELINE) {
+        post_recv_all(call_id, sz, b);
+        b++;
+        ro += N;
+      }
+      prefill_buffs = b;
+    }
     ack_sync_pre(call_id);
-
-    // Prefill the pipeline
-    int buff = 0;
-    while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(call_id, sz, buff);
-      std::copy(
-          our_data + read_offset,
-          our_data + std::min(read_offset + N, total),
-          send_buffer(sz, buff).begin<char>());
-      post_send_all(call_id, sz, buff);
-
-      buff++;
-      in_flight += 2 * num_peers;
-      read_offset += N;
+    {
+      int b = 0;
+      int ro = 0;
+      while (ro < total && b < prefill_buffs) {
+        std::copy(
+            our_data + ro,
+            our_data + std::min(ro + N, total),
+            send_buffer(sz, b).begin<char>());
+        post_send_all(call_id, sz, b);
+        b++;
+        in_flight += 2 * num_peers;
+        ro += N;
+      }
+      read_offset = ro;
     }
 
     // Main loop
