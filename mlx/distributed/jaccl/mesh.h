@@ -55,8 +55,9 @@ class MeshGroup : public GroupImpl {
   MeshGroup(
       int rank,
       int size,
-      std::vector<ibv_context*> shared_ctxs,
+      std::vector<ibv_context*> ctxs,
       std::vector<std::string> device_names,
+      bool owns_ctxs,
       const ExchangeFn& exchange);
 
   Stream communication_stream(StreamOrDevice s) override {

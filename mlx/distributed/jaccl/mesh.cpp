@@ -64,8 +64,9 @@ MeshGroup::MeshGroup(
 MeshGroup::MeshGroup(
     int rank,
     int size,
-    std::vector<ibv_context*> shared_ctxs,
+    std::vector<ibv_context*> ctxs,
     std::vector<std::string> device_names,
+    bool owns_ctxs,
     const ExchangeFn& exchange)
     : rank_(rank),
       size_(size),
@@ -79,18 +80,17 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Build owning Connections from the per-peer ibv_contexts handed
-  // to us. split() opens fresh device contexts (a second
-  // ibv_open_device per device) for the subgroup, since macOS
-  // librdma does not isolate QPs sharing a context — sibling
-  // subgroups observed cross-talk in the smoke test (g2's recv
-  // matched against g1's posted recv WR).
+  // Build Connections from the per-peer ibv_contexts handed to us.
+  // owns_ctxs=true → caller opened a fresh context per peer for this
+  // subgroup; we close the device on destruction. owns_ctxs=false →
+  // we borrow parent's contexts; closing is parent's responsibility.
   connections_.reserve(static_cast<size_t>(size_));
-  for (auto* ctx : shared_ctxs) {
-    connections_.emplace_back(ctx, /*owns_ctx=*/true);
+  for (auto* ctx : ctxs) {
+    connections_.emplace_back(ctx, /*owns_ctx=*/owns_ctxs);
   }
   if (std::getenv("JACCL_TRACE_SPLIT")) {
-    std::cerr << "[jaccl] subgroup ctor rank=" << rank_;
+    std::cerr << "[jaccl] subgroup ctor rank=" << rank_
+              << " owns_ctxs=" << owns_ctxs;
     for (size_t i = 0; i < connections_.size(); i++) {
       std::cerr << " conn[" << i << "].ctx=" << connections_[i].ctx;
     }
@@ -156,23 +156,23 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   // supported. For all-ranks-join we keep parent's rank ordering.
   (void)key;
 
-  // Open FRESH per-peer ibv_contexts for the subgroup (a second
-  // ibv_open_device for each device on the system). macOS librdma
-  // does NOT isolate QPs that share a context — sibling subgroups
-  // observed cross-talk (rank 1's g2 all_sum returned its local
-  // input, the peer's send went to g1's recv WR and was discarded).
-  // With fresh contexts, each subgroup has its own kernel-side
-  // device handle and its own QP namespace.
-  //
-  // We pre-open the contexts here (before passing into the subgroup
-  // ctor) so the subgroup can take ownership via the standard
-  // owns_ctx=true path — it will close the device on destruction.
-  auto fresh_conns = create_connections(device_names_);
-  std::vector<ibv_context*> fresh_ctxs;
-  fresh_ctxs.reserve(static_cast<size_t>(size_));
-  for (auto& c : fresh_conns) {
-    fresh_ctxs.push_back(c.ctx);
-    c.ctx = nullptr; // transfer ownership to subgroup ctor
+  // Build context list for the subgroup. JACCL_SPLIT_FRESH_CTX=1
+  // opens fresh ibv_contexts per subgroup; default (unset) shares
+  // the parent's context. Toggle to test which mode actually isolates
+  // QPs on macOS librdma.
+  std::vector<ibv_context*> ctxs;
+  ctxs.reserve(static_cast<size_t>(size_));
+  bool fresh_ctx = std::getenv("JACCL_SPLIT_FRESH_CTX") != nullptr;
+  if (fresh_ctx) {
+    auto fresh_conns = create_connections(device_names_);
+    for (auto& c : fresh_conns) {
+      ctxs.push_back(c.ctx);
+      c.ctx = nullptr; // transfer ownership to subgroup ctor
+    }
+  } else {
+    for (auto& parent_conn : connections_) {
+      ctxs.push_back(parent_conn.ctx);
+    }
   }
 
   // Build the subgroup. Its ctor runs the full init pipeline (PD/CQ/QP
@@ -181,8 +181,9 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   return std::make_shared<MeshGroup>(
       rank_,
       size_,
-      std::move(fresh_ctxs),
+      std::move(ctxs),
       device_names_,
+      fresh_ctx,
       [this](const std::vector<Destination>& info) {
         return side_channel_->all_gather(info);
       });
