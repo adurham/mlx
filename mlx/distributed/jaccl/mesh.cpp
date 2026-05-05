@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
+#include <unistd.h>
 
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/distributed/reduction_ops.h"
@@ -62,7 +63,11 @@ void MeshGroup::open_trace_file_if_enabled() {
   }
   char path[128];
   std::snprintf(
-      path, sizeof(path), "/tmp/jaccl_trace_rank_%d.log", rank_);
+      path,
+      sizeof(path),
+      "/tmp/jaccl_trace_rank_%d_pid%d.log",
+      rank_,
+      static_cast<int>(getpid()));
   trace_file_ = std::fopen(path, "w");
   if (trace_file_ == nullptr) {
     std::cerr << "[jaccl] Failed to open trace file " << path << "\n";
