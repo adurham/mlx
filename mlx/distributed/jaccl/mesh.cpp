@@ -31,8 +31,12 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Initialize all the connections and allocate buffers
-  initialize();
+  // Initialize all the connections and allocate buffers. Top-level
+  // groups exchange QP destinations directly over their own side
+  // channel.
+  initialize([this](const std::vector<Destination>& info) {
+    return side_channel_->all_gather(info);
+  });
 
   // Make sure every node has reached here before continuing
   side_channel_->all_gather<int>(0);
@@ -60,14 +64,14 @@ MeshGroup::MeshGroup(
 MeshGroup::MeshGroup(
     int rank,
     int size,
-    std::vector<Connection>&& conns,
-    std::vector<std::string> device_names)
+    std::vector<ibv_context*> shared_ctxs,
+    std::vector<std::string> device_names,
+    const ExchangeFn& exchange)
     : rank_(rank),
       size_(size),
       communication_stream_(new_stream(Device::cpu)),
       side_channel_(std::nullopt),
-      device_names_(std::move(device_names)),
-      connections_(std::move(conns)) {
+      device_names_(std::move(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
     std::ostringstream msg;
     msg << "[jaccl] The JACCL mesh supports up to " << MESH_MAX_PEERS
@@ -75,10 +79,20 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Caller (split) has already opened device contexts, allocated PD/CQ/QP,
-  // and transitioned each QP to RTS. We just need to allocate this
-  // subgroup's own buffer pool against those PDs and wire up the impls.
-  allocate_buffers();
+  // Build borrowing Connections that share the parent's per-peer
+  // ibv_context (owns_ctx=false → destruction does not close the
+  // device). The caller (split) is responsible for keeping the
+  // owning parent group alive at least as long as this subgroup.
+  connections_.reserve(static_cast<size_t>(size_));
+  for (auto* ctx : shared_ctxs) {
+    connections_.emplace_back(ctx, /*owns_ctx=*/false);
+  }
+
+  // Run the same init sequence as the top-level path. The order
+  // (PD/CQ/QP → MRs → INIT → exchange → RTR/RTS) matters; macOS
+  // librdma locks the QP's MR table at the INIT transition, so MRs
+  // must be registered before that.
+  initialize(exchange);
 
   mesh_ = MeshImpl(
       rank_,
@@ -133,67 +147,28 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   // supported. For all-ranks-join we keep parent's rank ordering.
   (void)key;
 
-  // Build subgroup connections that SHARE the parent's ibv_context per
-  // peer (borrowing — owns_ctx=false), but allocate their OWN PD/CQ/QP.
-  // macOS librdma's ibv_open_device does not return independent
-  // contexts on a second call for the same device — recv WRs posted on
-  // a "second-open" context fail with IBV_WC_LOC_PROT_ERR despite the
-  // PD/MR/QP all being properly bound. The standard RDMA-multi-comm
-  // pattern (used by NCCL etc.) is one context per device, with fresh
-  // PD/CQ/QP per logical comm. The fresh QPs are what give the
-  // subgroup an isolated FIFO from the parent — collectives on the
-  // subgroup cannot race-mix posts/recvs with collectives on the
-  // parent or on a sibling subgroup.
-  std::vector<Connection> new_conns;
-  new_conns.reserve(size_);
+  // Borrow parent's per-peer ibv_contexts. The subgroup will allocate
+  // its own PD/CQ/QP on each shared context. The fresh QPs are what
+  // give the subgroup an isolated FIFO from the parent and from any
+  // sibling subgroup — collectives on different groups cannot
+  // race-mix posts/recvs into each other's recv WRs.
+  std::vector<ibv_context*> shared_ctxs;
+  shared_ctxs.reserve(static_cast<size_t>(size_));
   for (auto& parent_conn : connections_) {
-    new_conns.emplace_back(parent_conn.ctx, /*owns_ctx=*/false);
+    shared_ctxs.push_back(parent_conn.ctx);
   }
 
-  // Allocate PD/CQ/QP for each subgroup connection.
-  for (auto& conn : new_conns) {
-    if (conn.ctx == nullptr) {
-      continue;
-    }
-    conn.allocate_protection_domain();
-    conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
-    conn.create_queue_pair();
-  }
-
-  // Transition each peer's QP to INIT.
-  for (int peer = 0; peer < size_; peer++) {
-    if (peer == rank_) {
-      continue;
-    }
-    new_conns[peer].queue_pair_init();
-  }
-
-  // Exchange destination info via the parent's side channel. We hold
-  // the parent's collective_mutex_ so the all_gather has the side
-  // channel to itself — no parent collective is dispatching while
-  // we're on the wire.
-  std::vector<Destination> info;
-  for (auto& conn : new_conns) {
-    info.emplace_back(conn.info());
-  }
-  auto all_infos = side_channel_->all_gather(info);
-
-  // Transition each peer's QP to RTR/RTS.
-  for (int peer = 0; peer < size_; peer++) {
-    if (peer == rank_) {
-      continue;
-    }
-    auto peer_info = all_infos[peer][rank_];
-    new_conns[peer].queue_pair_rtr(peer_info);
-    new_conns[peer].queue_pair_rts();
-  }
-
-  // Subgroup takes ownership of the fresh, ready-to-go connections.
-  // It allocates its own buffer pool, gets its own MeshImpl/RingImpl,
-  // its own next_call_id_ counter, its own collective_mutex_, and
-  // its own communication_stream_.
+  // Build the subgroup. Its ctor runs the full init pipeline (PD/CQ/QP
+  // alloc → MR registration → INIT → exchange → RTR/RTS), with the
+  // exchange done over the parent's side channel under our mutex.
   return std::make_shared<MeshGroup>(
-      rank_, size_, std::move(new_conns), device_names_);
+      rank_,
+      size_,
+      std::move(shared_ctxs),
+      device_names_,
+      [this](const std::vector<Destination>& info) {
+        return side_channel_->all_gather(info);
+      });
 }
 
 void MeshGroup::open_trace_file_if_enabled() {
@@ -236,7 +211,7 @@ void MeshGroup::trace_call(
   std::fflush(trace_file_);
 }
 
-void MeshGroup::initialize() {
+void MeshGroup::initialize(const ExchangeFn& exchange) {
   // Create the queue pairs
   for (auto& conn : connections_) {
     if (conn.ctx == nullptr) {
@@ -257,14 +232,16 @@ void MeshGroup::initialize() {
     connections_[peer].queue_pair_init();
   }
 
-  // Gather the information to be exchanged, this also serves as a barrier so
-  // that all peers have initialized their connections before attempting to
-  // transition to RTS.
+  // Gather the information to be exchanged. This also serves as a
+  // barrier so all peers have initialized their connections before
+  // attempting to transition to RTS. Top-level groups exchange via
+  // their own side channel; subgroups built by split() exchange via
+  // the parent's side channel under the parent's collective_mutex_.
   std::vector<Destination> info;
   for (auto& conn : connections_) {
     info.emplace_back(conn.info());
   }
-  auto all_infos = side_channel_->all_gather(info);
+  auto all_infos = exchange(info);
 
   // Transition queue pairs to RTS
   for (int peer = 0; peer < size_; peer++) {

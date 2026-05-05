@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <optional>
 
@@ -27,23 +28,36 @@ namespace mlx::core::distributed::jaccl {
  */
 class MeshGroup : public GroupImpl {
  public:
+  // QP-destination exchange callback used by initialize(). Top-level
+  // groups pass a lambda that uses the local SideChannel; subgroups
+  // built by split() pass a lambda that uses the PARENT's SideChannel
+  // under the parent's collective_mutex_.
+  using ExchangeFn =
+      std::function<std::vector<std::vector<Destination>>(
+          const std::vector<Destination>&)>;
+
   MeshGroup(
       int rank,
       const std::vector<std::string>& device_names,
       const char* coordinator_addr);
 
-  // Subgroup ctor used by split(). The caller (parent group's split)
-  // is responsible for opening device contexts, allocating PD/CQ/QP,
-  // and transitioning each QP to RTS — i.e. populating `conns` with
-  // ready-to-use Connection objects. The subgroup then allocates its
-  // own buffer pool, wires up MeshImpl/RingImpl, and starts serving
-  // collectives. It does NOT own a SideChannel; subgroups can't
-  // sub-split (matches MPI semantics for our 1-level use case).
+  // Subgroup ctor used by split(). Builds Connections that BORROW the
+  // parent's per-peer ibv_context (one open per device on the system —
+  // macOS librdma's second ibv_open_device on the same device does
+  // not return a fully-isolated context), then runs the same init as
+  // the top-level path: allocate PD/CQ/QP per peer, register MRs to
+  // those PDs (via allocate_buffers), then INIT/RTR/RTS the QPs with
+  // destinations exchanged through `exchange` (which the caller wires
+  // up to the parent's SideChannel under the parent's collective
+  // mutex). The order is critical: register MRs BEFORE INIT/RTR/RTS,
+  // since macOS librdma locks the QP's MR table at the INIT
+  // transition.
   MeshGroup(
       int rank,
       int size,
-      std::vector<Connection>&& conns,
-      std::vector<std::string> device_names);
+      std::vector<ibv_context*> shared_ctxs,
+      std::vector<std::string> device_names,
+      const ExchangeFn& exchange);
 
   Stream communication_stream(StreamOrDevice s) override {
     // Pin every collective on this group to ONE shared process-wide
@@ -115,8 +129,11 @@ class MeshGroup : public GroupImpl {
    * Performs the connection initialization. Namely, after this call all
    * Connection objects should have a queue pair in RTS state and all buffers
    * should have been allocated.
+   *
+   * `exchange` performs the cross-rank gather of QP destination info and
+   * returns `result[peer][rank]` = peer's destination for our rank.
    */
-  void initialize();
+  void initialize(const ExchangeFn& exchange);
 
   /**
    * Allocate all the buffers that we will use in the communication group.
