@@ -4,6 +4,8 @@
 
 #include <infiniband/verbs.h>
 
+#include <cstdlib>
+#include <iostream>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -282,6 +284,16 @@ struct Connection {
     work_request.sg_list = &entry;
     work_request.num_sge = 1;
     work_request.next = nullptr;
+
+    if (std::getenv("JACCL_TRACE_SPLIT")) {
+      std::cerr << "[jaccl] post_recv qp=" << queue_pair
+                << " pd=" << protection_domain
+                << " lkey=" << entry.lkey
+                << " addr=0x" << std::hex << entry.addr << std::dec
+                << " len=" << entry.length
+                << " wr_id=0x" << std::hex << work_request_id << std::dec
+                << std::endl;
+    }
 
     if (int status =
             ibv_post_recv(queue_pair, &work_request, &bad_work_request);

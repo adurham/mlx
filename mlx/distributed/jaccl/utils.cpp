@@ -105,6 +105,13 @@ void SharedBuffer::register_to_protection_domain(ibv_pd* protection_domain) {
   if (!it->second) {
     throw std::runtime_error("[jaccl] Register memory region failed");
   }
+  if (std::getenv("JACCL_TRACE_SPLIT")) {
+    std::cerr << "[jaccl] reg_mr pd=" << protection_domain
+              << " mr=" << it->second
+              << " lkey=" << it->second->lkey
+              << " addr=" << data_
+              << " len=" << num_bytes_ << std::endl;
+  }
 }
 
 Connection::Connection(ibv_context* ctx_) : Connection(ctx_, true) {}
