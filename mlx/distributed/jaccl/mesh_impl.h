@@ -80,6 +80,26 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
+        // Diagnostic: catch any non-success completion or any RECV
+        // whose byte_len doesn't match the buffer size we posted.
+        // If UC is silently truncating a peer's foreign-collective
+        // send into our recv WR (the suspected mechanism behind the
+        // bf16-bytes-in-int-gather corruption), this fires.
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_reduce wc.status=" << wc[i].status
+              << " wr_id=0x" << std::hex << wc[i].wr_id
+              << " byte_len=" << std::dec << wc[i].byte_len;
+          throw std::runtime_error(msg.str());
+        }
+        if ((wr_id_work_type(wc[i].wr_id) == RECV_WR) &&
+            wc[i].byte_len != static_cast<uint32_t>(buffer_size)) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_reduce recv byte_len=" << wc[i].byte_len
+              << " expected=" << buffer_size << " wr_id=0x" << std::hex
+              << wc[i].wr_id;
+          throw std::runtime_error(msg.str());
+        }
         // Stale completion from a prior collective: ignore it. Do not
         // decrement in_flight (it does not belong to ours) and do not
         // touch the buffer it points at — that buffer is owned by a
@@ -193,6 +213,23 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
+        // Diagnostic: see all_reduce equivalent. Detect UC truncation
+        // / status errors that the prior code silently absorbed.
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_gather wc.status=" << wc[i].status
+              << " wr_id=0x" << std::hex << wc[i].wr_id
+              << " byte_len=" << std::dec << wc[i].byte_len;
+          throw std::runtime_error(msg.str());
+        }
+        if ((wr_id_work_type(wc[i].wr_id) == RECV_WR) &&
+            wc[i].byte_len != static_cast<uint32_t>(N)) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_gather recv byte_len=" << wc[i].byte_len
+              << " expected=" << N << " wr_id=0x" << std::hex
+              << wc[i].wr_id;
+          throw std::runtime_error(msg.str());
+        }
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
         }
