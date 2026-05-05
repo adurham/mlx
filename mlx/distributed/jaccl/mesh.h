@@ -31,7 +31,23 @@ class MeshGroup : public GroupImpl {
       const char* coordinator_addr);
 
   Stream communication_stream(StreamOrDevice s) override {
-    return to_stream(s, Device::cpu);
+    // Always pin every collective on this group to a single dedicated
+    // CPU stream — NOT the caller's stream. cpu::get_command_encoder
+    // is keyed by stream.index, so if model-attention all_sums end up
+    // on a GPU-derived stream while agree_on_tasks runs on the CPU
+    // default stream, the two collectives dispatch to different
+    // encoder worker threads. The local mutex still serializes their
+    // mesh_.X() bodies, but the order in which lambdas reach the
+    // mutex is decided by which encoder thread is faster — which
+    // varies between rank 0 and rank 1. The QP then sees a
+    // different post_send / post_recv interleaving on each rank, and
+    // UC's per-QP FIFO matching corrupts cross-collective sends into
+    // the wrong recv buffers (the c=2+γ=2 MTP corruption mechanism).
+    // Pinning everything to one stream forces a single FIFO dispatch
+    // queue per rank; both ranks run the same user code in the same
+    // order, so their dispatch orders match.
+    (void)s;
+    return default_stream(Device::cpu);
   }
 
   int rank() override {
