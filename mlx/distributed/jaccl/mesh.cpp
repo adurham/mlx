@@ -266,6 +266,12 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       continue;
     }
     auto peer_info = all_infos[peer][rank_];
+    if (std::getenv("JACCL_TRACE_SPLIT")) {
+      std::cerr << "[jaccl] init rank=" << rank_ << " peer=" << peer
+                << " our_qp_num=" << connections_[peer].src.queue_pair_number
+                << " peer_qp_num=" << peer_info.queue_pair_number
+                << " peer_lid=" << peer_info.local_id << std::endl;
+    }
     connections_[peer].queue_pair_rtr(peer_info);
     connections_[peer].queue_pair_rts();
   }
