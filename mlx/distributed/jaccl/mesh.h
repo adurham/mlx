@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <mutex>
 
 #include "mlx/distributed/distributed_impl.h"
@@ -85,7 +86,8 @@ class MeshGroup : public GroupImpl {
       const array& input,
       array& output,
       Stream stream,
-      ReduceOp reduce_op);
+      ReduceOp reduce_op,
+      const char* op_name);
 
   /**
    * Performs the connection initialization. Namely, after this call all
@@ -156,6 +158,22 @@ class MeshGroup : public GroupImpl {
   uint32_t next_call_id() {
     return next_call_id_.fetch_add(1, std::memory_order_relaxed);
   }
+
+  // Diagnostic per-call trace gated on JACCL_TRACE_CALLS=1. Each
+  // collective entry writes one line to /tmp/jaccl_trace_rank_${rank}.log
+  // identifying the call_id assigned + op name + element width +
+  // message bytes. The file is written from inside the dispatch lambda
+  // (after collective_mutex_), so writes are already serialized — no
+  // extra locking. Used to find the first cross-rank divergence in
+  // the call sequence on c=2 + γ=2 MTP corruption (see Phase 0 plan).
+  // trace_file_ is null when tracing is disabled; trace_call no-ops.
+  FILE* trace_file_ = nullptr;
+  void open_trace_file_if_enabled();
+  void trace_call(
+      uint32_t call_id,
+      const char* op,
+      int elem_size,
+      int64_t msg_bytes);
 };
 
 } // namespace mlx::core::distributed::jaccl
