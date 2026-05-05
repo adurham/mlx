@@ -89,6 +89,13 @@ MeshGroup::MeshGroup(
   for (auto* ctx : shared_ctxs) {
     connections_.emplace_back(ctx, /*owns_ctx=*/true);
   }
+  if (std::getenv("JACCL_TRACE_SPLIT")) {
+    std::cerr << "[jaccl] subgroup ctor rank=" << rank_;
+    for (size_t i = 0; i < connections_.size(); i++) {
+      std::cerr << " conn[" << i << "].ctx=" << connections_[i].ctx;
+    }
+    std::cerr << std::endl;
+  }
 
   // Run the same init sequence as the top-level path. The order
   // (PD/CQ/QP → MRs → INIT → exchange → RTR/RTS) matters; macOS
