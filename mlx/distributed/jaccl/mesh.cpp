@@ -110,11 +110,14 @@ void MeshGroup::allocate_buffers() {
       }
     }
   }
-  // Per-peer 4-byte ack buffers used by MeshImpl::ack_sync (one slot
-  // per peer including self for index alignment — self is unused).
+  // Per-peer ack buffers used by MeshImpl::ack_sync (one slot per
+  // peer including self for index alignment — self is unused). Size
+  // matches FRAME_SIZE so ibv_post_send / post_recv can't trip
+  // IBV_WC_LOC_PROT_ERR on a sub-page-size SGE — empirically a 4-byte
+  // SGE was rejected by macOS librdma at ack-recv time.
   for (int j = 0; j < size_; j++) {
-    ack_send_buffers_.emplace_back(4);
-    ack_recv_buffers_.emplace_back(4);
+    ack_send_buffers_.emplace_back(FRAME_SIZE);
+    ack_recv_buffers_.emplace_back(FRAME_SIZE);
   }
 
   for (int k = 0; k < BUFFER_SIZES; k++) {
