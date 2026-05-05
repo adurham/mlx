@@ -32,12 +32,9 @@ class RingGroup : public GroupImpl {
       const char* coordinator_addr);
 
   Stream communication_stream(StreamOrDevice s) override {
-    // See MeshGroup::communication_stream for the rationale — pin
-    // every collective on this group to one fixed CPU stream so all
-    // local dispatches FIFO-queue on a single encoder thread, and
-    // both ranks see a matching dispatch order.
+    // See MeshGroup::communication_stream for the rationale.
     (void)s;
-    return default_stream(Device::cpu);
+    return communication_stream_;
   }
 
   int rank() override {
@@ -86,6 +83,8 @@ class RingGroup : public GroupImpl {
   int rank_;
   int size_;
   int n_conns_;
+  // Shared CPU stream — see MeshGroup::communication_stream_.
+  Stream communication_stream_;
   SideChannel side_channel_;
   std::vector<Connection> left_;
   std::vector<Connection> right_;

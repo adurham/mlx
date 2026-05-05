@@ -16,6 +16,7 @@ RingGroup::RingGroup(
     : rank_(rank),
       size_(size),
       n_conns_(left_devices.size()),
+      communication_stream_(new_stream(Device::cpu)),
       side_channel_(rank_, size_, coordinator_addr),
       left_(create_connections(left_devices)),
       right_(create_connections(right_devices)) {

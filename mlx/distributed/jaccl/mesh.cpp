@@ -13,6 +13,7 @@ MeshGroup::MeshGroup(
     const char* coordinator_addr)
     : rank_(rank),
       size_(device_names.size()),
+      communication_stream_(new_stream(Device::cpu)),
       side_channel_(rank_, size_, coordinator_addr),
       connections_(create_connections(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
