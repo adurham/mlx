@@ -17,8 +17,15 @@ class MeshImpl {
       int rank,
       int size,
       std::vector<Connection>& conns,
-      std::vector<SharedBuffer>& buffers)
-      : rank_(rank), size_(size), connections_(conns), buffers_(buffers) {}
+      std::vector<SharedBuffer>& buffers,
+      std::vector<SharedBuffer>& ack_send_buffers,
+      std::vector<SharedBuffer>& ack_recv_buffers)
+      : rank_(rank),
+        size_(size),
+        connections_(conns),
+        buffers_(buffers),
+        ack_send_buffers_(ack_send_buffers),
+        ack_recv_buffers_(ack_recv_buffers) {}
 
   MeshImpl() : rank_(0), size_(1) {}
 
@@ -166,6 +173,7 @@ class MeshImpl {
         completed_recv_begin[r] = s;
       }
     }
+    ack_sync(call_id);
   }
 
   void all_gather(
@@ -273,6 +281,7 @@ class MeshImpl {
         }
       }
     }
+    ack_sync(call_id);
   }
 
   void send(uint32_t call_id, const char* in_ptr, int64_t n_bytes, int dst) {
@@ -325,6 +334,7 @@ class MeshImpl {
         }
       }
     }
+    ack_sync(call_id);
   }
 
   void recv(uint32_t call_id, char* out_ptr, int64_t n_bytes, int src) {
@@ -376,9 +386,69 @@ class MeshImpl {
         }
       }
     }
+    ack_sync(call_id);
   }
 
  private:
+  // End-of-lambda cross-rank synchronization. Each lambda calls this
+  // after its main loop (after in_flight reaches 0). Posts a 4-byte
+  // ack send + ack recv to every peer over the SAME QP and waits for
+  // both completions per peer. By the time this returns, peer has
+  // also drained its main loop and posted its ack — so both ranks
+  // are provably at the SAME end-of-lambda boundary.
+  //
+  // Why this is needed even with single-CPU-stream pinning: in_flight
+  // == 0 locally means our local NIC has reported completion for our
+  // posts; UC delivers send-completion when transmitted, not when
+  // peer received. So our lambda can return before peer's lambda has
+  // reached its main-loop exit. If we then start a new lambda with a
+  // different sz, our new lambda's sends arrive at peer's still-
+  // running lambda's recv WRs (different size → IBV_WC_LOC_LEN_ERR).
+  void ack_sync(uint32_t call_id) {
+    int num_peers = size_ - 1;
+    int in_flight = 2 * num_peers; // one send + one recv per peer
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& sbuf = ack_send_buffers_[peer];
+      auto& rbuf = ack_recv_buffers_[peer];
+      // Zero before post — defends against any stale recv-side bytes
+      // (same rationale as zero_recv_buffer in the data path).
+      std::memset(rbuf.data<char>(), 0, rbuf.size());
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_recv(
+          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+      connections_[peer].post_send(
+          sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+    }
+    while (in_flight > 0) {
+      ibv_wc wc[16];
+      int n = poll(connections_, 16, wc);
+      for (int i = 0; i < n; i++) {
+        // Skip stale completions from prior calls; never decrement
+        // in_flight or touch buffers for those.
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int wt = wr_id_work_type(wc[i].wr_id);
+        if (wt != ACK_SEND_WR && wt != ACK_RECV_WR) {
+          // Leftover data completion from this same call — drain
+          // without touching in_flight (the data side already
+          // accounted for it).
+          continue;
+        }
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::ostringstream msg;
+          msg << "[jaccl] ack_sync wc.status=" << wc[i].status
+              << " wr_id=0x" << std::hex << wc[i].wr_id;
+          throw std::runtime_error(msg.str());
+        }
+        in_flight--;
+      }
+    }
+  }
+
   void send_to(uint32_t call_id, int sz, int rank, int buff) {
     connections_[rank].post_send(
         send_buffer(sz, buff), make_wr_id(call_id, SEND_WR, buff, rank));
@@ -442,6 +512,8 @@ class MeshImpl {
   int size_;
   std::span<Connection> connections_;
   std::span<SharedBuffer> buffers_;
+  std::span<SharedBuffer> ack_send_buffers_;
+  std::span<SharedBuffer> ack_recv_buffers_;
 };
 
 } // namespace mlx::core::distributed::jaccl

@@ -30,7 +30,13 @@ MeshGroup::MeshGroup(
   side_channel_.all_gather<int>(0);
 
   // Create the mesh implementation object
-  mesh_ = MeshImpl(rank_, size_, connections_, buffers_);
+  mesh_ = MeshImpl(
+      rank_,
+      size_,
+      connections_,
+      buffers_,
+      ack_send_buffers_,
+      ack_recv_buffers_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -85,6 +91,8 @@ void MeshGroup::initialize() {
 void MeshGroup::allocate_buffers() {
   // Deregister any buffers and free the memory
   buffers_.clear();
+  ack_send_buffers_.clear();
+  ack_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
 
@@ -101,6 +109,12 @@ void MeshGroup::allocate_buffers() {
         ring_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
       }
     }
+  }
+  // Per-peer 4-byte ack buffers used by MeshImpl::ack_sync (one slot
+  // per peer including self for index alignment — self is unused).
+  for (int j = 0; j < size_; j++) {
+    ack_send_buffers_.emplace_back(4);
+    ack_recv_buffers_.emplace_back(4);
   }
 
   for (int k = 0; k < BUFFER_SIZES; k++) {
@@ -139,6 +153,18 @@ void MeshGroup::allocate_buffers() {
       ring_recv_buffers_[k * NUM_BUFFERS * 2 + i * 2 + 1]
           .register_to_protection_domain(connections_[right].protection_domain);
     }
+  }
+  // Register per-peer ack buffers to that peer's PD. Each ack
+  // send/recv goes over the data QP for that peer, so they need
+  // the same PD as that QP.
+  for (int j = 0; j < size_; j++) {
+    if (j == rank_ || connections_[j].ctx == nullptr) {
+      continue;
+    }
+    ack_send_buffers_[j].register_to_protection_domain(
+        connections_[j].protection_domain);
+    ack_recv_buffers_[j].register_to_protection_domain(
+        connections_[j].protection_domain);
   }
 }
 

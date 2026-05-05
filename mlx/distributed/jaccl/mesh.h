@@ -109,6 +109,17 @@ class MeshGroup : public GroupImpl {
   Stream communication_stream_;
   SideChannel side_channel_;
   std::vector<Connection> connections_;
+  // Tiny per-peer ack buffer (4 bytes). Used by MeshImpl's
+  // end-of-lambda ack barrier — see ack_sync() in mesh_impl.h.
+  // Without that barrier, in_flight==0 only proves OUR side
+  // drained; the peer can still be polling and we'd start the
+  // next lambda with different sz/buffer. The peer's pending
+  // lambda's recv WR then absorbs our new lambda's send,
+  // tripping IBV_WC_LOC_LEN_ERR. Pinning all collectives to
+  // one CPU stream alone wasn't enough — local FIFO order
+  // doesn't bound cross-rank phase drift between lambdas.
+  std::vector<SharedBuffer> ack_send_buffers_;
+  std::vector<SharedBuffer> ack_recv_buffers_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;
