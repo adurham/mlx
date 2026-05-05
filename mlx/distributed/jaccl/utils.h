@@ -211,6 +211,7 @@ class SharedBuffer {
  */
 struct Connection {
   ibv_context* ctx;
+  bool owns_ctx; // false for siblings — destructor must not close shared ctx
   ibv_pd* protection_domain;
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
@@ -221,6 +222,16 @@ struct Connection {
 
   Connection(const Connection&) = delete;
   Connection& operator=(Connection&) = delete;
+
+  // Create a "sibling" Connection that reuses an existing Connection's
+  // ibv_context but allocates its own PD/CQ/QP. Used to give each
+  // (sz, peer) tuple its own QP so that UC FIFO matching at the
+  // single per-peer QP level can no longer cross-pollinate small
+  // recv buffers with large foreign sends (the c=2+γ=2 MTP corruption
+  // mechanism). macOS librdma rejects multiple ibv_open_device calls
+  // for the same device's PD/CQ allocation, so we have to share the
+  // ctx and create independent PD/CQ/QP per sibling.
+  static Connection sibling_of(const Connection& parent);
 
   ~Connection();
   void allocate_protection_domain();

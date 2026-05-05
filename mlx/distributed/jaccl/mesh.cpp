@@ -22,6 +22,20 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
+  // Allocate per-(sz, peer) sibling connections that share the base
+  // connection's ibv_context. Layout matches mesh_connections_index().
+  mesh_connections_.reserve(BUFFER_SIZES * size_);
+  for (int sz = 0; sz < BUFFER_SIZES; sz++) {
+    for (int peer = 0; peer < size_; peer++) {
+      const Connection& base = connections_[peer];
+      if (base.ctx == nullptr) {
+        mesh_connections_.emplace_back(nullptr);
+      } else {
+        mesh_connections_.push_back(Connection::sibling_of(base));
+      }
+    }
+  }
+
   // Initialize all the connections and allocate buffers
   initialize();
 
@@ -29,7 +43,7 @@ MeshGroup::MeshGroup(
   side_channel_.all_gather<int>(0);
 
   // Create the mesh implementation object
-  mesh_ = MeshImpl(rank_, size_, connections_, buffers_);
+  mesh_ = MeshImpl(rank_, size_, mesh_connections_, buffers_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -41,43 +55,86 @@ MeshGroup::MeshGroup(
 }
 
 void MeshGroup::initialize() {
-  // Create the queue pairs
-  for (auto& conn : connections_) {
+  // Allocate PDs/CQs/QPs on every base connection (used by RingImpl)
+  // and every per-(sz, peer) sibling connection (used by MeshImpl).
+  auto setup_conn = [](Connection& conn) {
     if (conn.ctx == nullptr) {
-      continue;
+      return;
     }
     conn.allocate_protection_domain();
     conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
     conn.create_queue_pair();
+  };
+  for (auto& conn : connections_) {
+    setup_conn(conn);
+  }
+  for (auto& conn : mesh_connections_) {
+    setup_conn(conn);
   }
 
   allocate_buffers();
 
-  // First init all connections
-  for (int peer = 0; peer < size_; peer++) {
-    if (peer == rank_) {
-      continue;
+  // First init all connections.
+  auto init_conn = [&](std::vector<Connection>& conns) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      // For mesh_connections_, conns has BUFFER_SIZES * size_ entries.
+      // The base loop only runs over [0, size_); for mesh we iterate
+      // separately below.
+      if (peer < static_cast<int>(conns.size())) {
+        conns[peer].queue_pair_init();
+      }
     }
-    connections_[peer].queue_pair_init();
+  };
+  init_conn(connections_);
+  for (int sz = 0; sz < BUFFER_SIZES; sz++) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      mesh_connections_[sz * size_ + peer].queue_pair_init();
+    }
   }
 
-  // Gather the information to be exchanged, this also serves as a barrier so
-  // that all peers have initialized their connections before attempting to
-  // transition to RTS.
+  // Gather the information to be exchanged. We exchange (size_) base
+  // Destinations followed by (BUFFER_SIZES * size_) mesh Destinations,
+  // for a total of (BUFFER_SIZES + 1) * size_ entries per rank.
+  // This also serves as a barrier so that all peers have initialized
+  // their connections before transitioning to RTS.
   std::vector<Destination> info;
+  info.reserve(connections_.size() + mesh_connections_.size());
   for (auto& conn : connections_) {
+    info.emplace_back(conn.info());
+  }
+  for (auto& conn : mesh_connections_) {
     info.emplace_back(conn.info());
   }
   auto all_infos = side_channel_.all_gather(info);
 
-  // Transition queue pairs to RTS
+  // Transition base queue pairs to RTS.
   for (int peer = 0; peer < size_; peer++) {
     if (peer == rank_) {
       continue;
     }
+    // Peer's base info for connection to rank_ is at all_infos[peer][rank_].
     auto peer_info = all_infos[peer][rank_];
     connections_[peer].queue_pair_rtr(peer_info);
     connections_[peer].queue_pair_rts();
+  }
+  // Transition mesh sibling queue pairs to RTS. The peer's view of
+  // their (sz, my_rank) sibling is at all_infos[peer][size_ + sz * size_ + rank_].
+  for (int sz = 0; sz < BUFFER_SIZES; sz++) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto peer_info = all_infos[peer][size_ + sz * size_ + rank_];
+      auto& conn = mesh_connections_[sz * size_ + peer];
+      conn.queue_pair_rtr(peer_info);
+      conn.queue_pair_rts();
+    }
   }
 }
 
@@ -104,12 +161,18 @@ void MeshGroup::allocate_buffers() {
 
   for (int k = 0; k < BUFFER_SIZES; k++) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
-      // Mesh buffers
+      // Mesh buffers — register against the per-(sz, peer) sibling PDs
+      // so that send/recv on each sz uses its own QP. (Base connections
+      // are only used by Ring.)
       for (int j = 0; j < size_; j++) {
         // This is our send buffer so register it with all pds so we can send
         // it to all connected devices.
         if (j == rank_) {
-          for (auto& conn : connections_) {
+          for (int peer = 0; peer < size_; peer++) {
+            if (peer == rank_) {
+              continue;
+            }
+            auto& conn = mesh_connections_[k * size_ + peer];
             if (conn.ctx != nullptr) {
               buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
                   .register_to_protection_domain(conn.protection_domain);
@@ -118,10 +181,13 @@ void MeshGroup::allocate_buffers() {
         }
 
         // This is the recv buffer from rank j so register it to rank j's
-        // protection domain.
+        // (sz, peer=j) protection domain.
         else {
-          buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
-              .register_to_protection_domain(connections_[j].protection_domain);
+          auto& conn = mesh_connections_[k * size_ + j];
+          if (conn.ctx != nullptr) {
+            buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
+                .register_to_protection_domain(conn.protection_domain);
+          }
         }
       }
 

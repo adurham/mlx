@@ -78,7 +78,7 @@ class MeshImpl {
       // If a receive is completed then advance the pointer of completed
       // receives.
       ibv_wc wc[WC_NUM];
-      int n = poll(connections_, WC_NUM, wc);
+      int n = poll(conns_for_sz(sz), WC_NUM, wc);
       for (int i = 0; i < n; i++) {
         // Diagnostic: catch any non-success completion or any RECV
         // whose byte_len doesn't match the buffer size we posted.
@@ -211,7 +211,7 @@ class MeshImpl {
     // Keep going until we have no longer data in flight.
     while (in_flight > 0) {
       ibv_wc wc[WC_NUM];
-      int n = poll(connections_, WC_NUM, wc);
+      int n = poll(conns_for_sz(sz), WC_NUM, wc);
       for (int i = 0; i < n; i++) {
         // Diagnostic: see all_reduce equivalent. Detect UC truncation
         // / status errors that the prior code silently absorbed.
@@ -304,7 +304,7 @@ class MeshImpl {
       // If a send was completed and we have more data to send then go ahead
       // and send them.
       ibv_wc wc[WC_NUM];
-      int n = connections_[dst].poll(WC_NUM, wc);
+      int n = conn(sz, dst).poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
@@ -351,7 +351,7 @@ class MeshImpl {
       // If a recv was completed copy it to the output and if we have more
       // data to fetch post another recv.
       ibv_wc wc[WC_NUM];
-      int n = connections_[src].poll(WC_NUM, wc);
+      int n = conn(sz, src).poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
@@ -379,8 +379,20 @@ class MeshImpl {
   }
 
  private:
+  // connections_ layout: BUFFER_SIZES * size_ entries, indexed by
+  // (sz, peer) → connections_[sz * size_ + peer]. Each (sz, peer) has
+  // its own QP, so cross-sz collectives no longer share a FIFO at the
+  // QP level (the c=2+γ=2 MTP corruption mechanism).
+  Connection& conn(int sz, int peer) {
+    return connections_[sz * size_ + peer];
+  }
+
+  std::span<Connection> conns_for_sz(int sz) {
+    return std::span<Connection>(&connections_[sz * size_], size_);
+  }
+
   void send_to(uint32_t call_id, int sz, int rank, int buff) {
-    connections_[rank].post_send(
+    conn(sz, rank).post_send(
         send_buffer(sz, buff), make_wr_id(call_id, SEND_WR, buff, rank));
   }
 
@@ -403,7 +415,7 @@ class MeshImpl {
   void recv_from(uint32_t call_id, int sz, int rank, int buff) {
     auto& recv_buf = recv_buffer(sz, buff, rank);
     zero_recv_buffer(recv_buf);
-    connections_[rank].post_recv(
+    conn(sz, rank).post_recv(
         recv_buf, make_wr_id(call_id, RECV_WR, buff, rank));
   }
 
@@ -421,7 +433,7 @@ class MeshImpl {
       if (i == rank_) {
         continue;
       }
-      connections_[i].post_send(b, make_wr_id(call_id, SEND_WR, buff, i));
+      conn(sz, i).post_send(b, make_wr_id(call_id, SEND_WR, buff, i));
     }
   }
 
@@ -433,8 +445,7 @@ class MeshImpl {
       }
       auto& recv_buf = buffers_[b + i];
       zero_recv_buffer(recv_buf);
-      connections_[i].post_recv(
-          recv_buf, make_wr_id(call_id, RECV_WR, buff, i));
+      conn(sz, i).post_recv(recv_buf, make_wr_id(call_id, RECV_WR, buff, i));
     }
   }
 

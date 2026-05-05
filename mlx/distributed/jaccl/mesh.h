@@ -80,7 +80,16 @@ class MeshGroup : public GroupImpl {
   int rank_;
   int size_;
   SideChannel side_channel_;
+  // Original "base" connections — one per peer, owns the ibv_context.
+  // Used by RingImpl. mesh_ uses the per-sz siblings instead.
   std::vector<Connection> connections_;
+  // Per-(sz, peer) sibling connections. Each shares the base
+  // connection's ibv_context but has its own PD / CQ / QP. Layout:
+  // mesh_connections_[sz * size_ + peer]. Created so cross-sz
+  // collectives use different QPs and UC's per-QP FIFO matching can
+  // no longer truncate a foreign sz's send into a different sz's recv
+  // buffer (the c=2+γ=2 MTP corruption mechanism).
+  std::vector<Connection> mesh_connections_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;
