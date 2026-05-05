@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <mutex>
+#include <optional>
 
 #include "mlx/distributed/distributed_impl.h"
 #include "mlx/distributed/jaccl/mesh_impl.h"
@@ -30,6 +31,19 @@ class MeshGroup : public GroupImpl {
       int rank,
       const std::vector<std::string>& device_names,
       const char* coordinator_addr);
+
+  // Subgroup ctor used by split(). The caller (parent group's split)
+  // is responsible for opening device contexts, allocating PD/CQ/QP,
+  // and transitioning each QP to RTS — i.e. populating `conns` with
+  // ready-to-use Connection objects. The subgroup then allocates its
+  // own buffer pool, wires up MeshImpl/RingImpl, and starts serving
+  // collectives. It does NOT own a SideChannel; subgroups can't
+  // sub-split (matches MPI semantics for our 1-level use case).
+  MeshGroup(
+      int rank,
+      int size,
+      std::vector<Connection>&& conns,
+      std::vector<std::string> device_names);
 
   Stream communication_stream(StreamOrDevice s) override {
     // Pin every collective on this group to ONE shared process-wide
@@ -76,9 +90,17 @@ class MeshGroup : public GroupImpl {
     throw std::runtime_error("[jaccl] sum_scatter not supported.");
   }
 
-  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[jaccl] Group split not supported.");
-  }
+  // split(color, key) — current implementation requires all ranks to
+  // call with the same color (single subgroup per call). This covers
+  // the per-MLX-stream isolation use case (N parallel sub-meshes that
+  // each contain all ranks). Mixed-color partitioning is not yet
+  // supported and throws. `key` is currently unused; sub-rank ordering
+  // matches the parent's ordering. Subgroup is allocated with fresh
+  // device contexts (multiple opens of the same physical device),
+  // fresh PD/CQ/QP per peer, fresh buffer pool, fresh call_id counter
+  // and mutex. Cannot be called on a subgroup (subgroup has no
+  // SideChannel for the destination exchange).
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override;
 
  private:
   template <typename T, typename ReduceOp>
@@ -109,7 +131,18 @@ class MeshGroup : public GroupImpl {
   // cpu::CommandEncoder and serialize FIFO. See the comment on
   // communication_stream() for why default_stream() doesn't work.
   Stream communication_stream_;
-  SideChannel side_channel_;
+  // Top-level groups own a SideChannel (the TCP coordinator). Subgroups
+  // built by split() leave this empty — split() does the QP destination
+  // exchange over the parent's SideChannel and then hands the subgroup
+  // already-RTS Connections, so the subgroup never needs its own TCP
+  // exchange. The optional also gates split(): only top-level groups
+  // (which still have a SideChannel) can split.
+  std::optional<SideChannel> side_channel_;
+  // Per-peer librdma device names. Stored so split() can re-call
+  // create_connections() on the same devices to allocate fresh
+  // ibv_contexts for the subgroup. macOS librdma allows multiple
+  // ibv_open_device calls for the same physical device.
+  std::vector<std::string> device_names_;
   std::vector<Connection> connections_;
   // Tiny per-peer ack buffer (4 bytes). Used by MeshImpl's
   // end-of-lambda ack barrier — see ack_sync() in mesh_impl.h.

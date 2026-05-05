@@ -21,7 +21,8 @@ MeshGroup::MeshGroup(
     : rank_(rank),
       size_(device_names.size()),
       communication_stream_(new_stream(Device::cpu)),
-      side_channel_(rank_, size_, coordinator_addr),
+      side_channel_(std::in_place, rank_, size_, coordinator_addr),
+      device_names_(device_names),
       connections_(create_connections(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
     std::ostringstream msg;
@@ -34,7 +35,7 @@ MeshGroup::MeshGroup(
   initialize();
 
   // Make sure every node has reached here before continuing
-  side_channel_.all_gather<int>(0);
+  side_channel_->all_gather<int>(0);
 
   // Create the mesh implementation object
   mesh_ = MeshImpl(
@@ -54,6 +55,137 @@ MeshGroup::MeshGroup(
       ring_recv_buffers_);
 
   open_trace_file_if_enabled();
+}
+
+MeshGroup::MeshGroup(
+    int rank,
+    int size,
+    std::vector<Connection>&& conns,
+    std::vector<std::string> device_names)
+    : rank_(rank),
+      size_(size),
+      communication_stream_(new_stream(Device::cpu)),
+      side_channel_(std::nullopt),
+      device_names_(std::move(device_names)),
+      connections_(std::move(conns)) {
+  if (size_ > MESH_MAX_PEERS) {
+    std::ostringstream msg;
+    msg << "[jaccl] The JACCL mesh supports up to " << MESH_MAX_PEERS
+        << " peers but " << size_ << " were provided.";
+    throw std::runtime_error(msg.str());
+  }
+
+  // Caller (split) has already opened device contexts, allocated PD/CQ/QP,
+  // and transitioned each QP to RTS. We just need to allocate this
+  // subgroup's own buffer pool against those PDs and wire up the impls.
+  allocate_buffers();
+
+  mesh_ = MeshImpl(
+      rank_,
+      size_,
+      connections_,
+      buffers_,
+      ack_send_buffers_,
+      ack_recv_buffers_);
+  ring_ = RingImpl(
+      rank_,
+      size_,
+      &connections_[(rank_ + size_ - 1) % size_],
+      &connections_[(rank_ + 1) % size_],
+      1,
+      ring_send_buffers_,
+      ring_recv_buffers_);
+
+  open_trace_file_if_enabled();
+}
+
+std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
+  // split is itself a collective. Hold the mutex so no other
+  // collective on this parent group can race the side_channel
+  // exchange or the QP setup.
+  std::lock_guard<std::mutex> guard(collective_mutex_);
+
+  if (!side_channel_.has_value()) {
+    throw std::runtime_error(
+        "[jaccl] split is only supported on top-level groups (not on a "
+        "subgroup created by an earlier split).");
+  }
+
+  // Decide membership. For the per-MLX-stream isolation use case, all
+  // ranks call split with the same color and we build one new mesh
+  // containing all ranks. Mixed-color partitioning would require:
+  //   1) filtering device_names_ to the per-color subset of peers, and
+  //   2) renumbering ranks within each subgroup (this is what `key`
+  //      would feed into).
+  // Neither is needed today, so detect mixed colors and throw clearly.
+  auto colors = side_channel_->all_gather<int>(color);
+  for (int peer = 0; peer < size_; peer++) {
+    if (colors[peer] != color) {
+      std::ostringstream msg;
+      msg << "[jaccl] split requires every rank to use the same color "
+          << "(rank " << peer << " gave color=" << colors[peer]
+          << ", this rank gave color=" << color
+          << "). Mixed-color partitioning is not yet supported.";
+      throw std::runtime_error(msg.str());
+    }
+  }
+  // `key` is reserved for sub-rank reassignment when mixed-color is
+  // supported. For all-ranks-join we keep parent's rank ordering.
+  (void)key;
+
+  // Open fresh device contexts for the subgroup. macOS librdma allows
+  // multiple ibv_open_device calls for the same physical device; each
+  // call returns an independent ibv_context that owns its own PD/CQ/QP
+  // namespace. The fresh QPs are what gives the subgroup an isolated
+  // FIFO from the parent's QPs — collectives on the subgroup cannot
+  // race-mix posts/recvs with collectives on the parent or on a
+  // sibling subgroup.
+  auto new_conns = create_connections(device_names_);
+
+  // Allocate PD/CQ/QP for each fresh connection.
+  for (auto& conn : new_conns) {
+    if (conn.ctx == nullptr) {
+      continue;
+    }
+    conn.allocate_protection_domain();
+    conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
+    conn.create_queue_pair();
+  }
+
+  // Transition each peer's QP to INIT.
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    new_conns[peer].queue_pair_init();
+  }
+
+  // Exchange destination info via the parent's side channel. We hold
+  // the parent's collective_mutex_ so the all_gather has the side
+  // channel to itself — no parent collective is dispatching while
+  // we're on the wire.
+  std::vector<Destination> info;
+  for (auto& conn : new_conns) {
+    info.emplace_back(conn.info());
+  }
+  auto all_infos = side_channel_->all_gather(info);
+
+  // Transition each peer's QP to RTR/RTS.
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    auto peer_info = all_infos[peer][rank_];
+    new_conns[peer].queue_pair_rtr(peer_info);
+    new_conns[peer].queue_pair_rts();
+  }
+
+  // Subgroup takes ownership of the fresh, ready-to-go connections.
+  // It allocates its own buffer pool, gets its own MeshImpl/RingImpl,
+  // its own next_call_id_ counter, its own collective_mutex_, and
+  // its own communication_stream_.
+  return std::make_shared<MeshGroup>(
+      rank_, size_, std::move(new_conns), device_names_);
 }
 
 void MeshGroup::open_trace_file_if_enabled() {
@@ -124,7 +256,7 @@ void MeshGroup::initialize() {
   for (auto& conn : connections_) {
     info.emplace_back(conn.info());
   }
-  auto all_infos = side_channel_.all_gather(info);
+  auto all_infos = side_channel_->all_gather(info);
 
   // Transition queue pairs to RTS
   for (int peer = 0; peer < size_; peer++) {
