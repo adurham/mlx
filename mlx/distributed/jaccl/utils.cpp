@@ -109,7 +109,6 @@ void SharedBuffer::register_to_protection_domain(ibv_pd* protection_domain) {
 
 Connection::Connection(ibv_context* ctx_)
     : ctx(ctx_),
-      owns_ctx(true),
       protection_domain(nullptr),
       completion_queue(nullptr),
       queue_pair(nullptr) {
@@ -118,17 +117,10 @@ Connection::Connection(ibv_context* ctx_)
 
 Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(ctx, c.ctx);
-  std::swap(owns_ctx, c.owns_ctx);
   std::swap(protection_domain, c.protection_domain);
   std::swap(completion_queue, c.completion_queue);
   std::swap(queue_pair, c.queue_pair);
   std::swap(src, c.src);
-}
-
-Connection Connection::sibling_of(const Connection& parent) {
-  Connection sib(parent.ctx);
-  sib.owns_ctx = false;
-  return sib;
 }
 
 Connection::~Connection() {
@@ -141,7 +133,7 @@ Connection::~Connection() {
   if (protection_domain != nullptr) {
     ibv().dealloc_pd(protection_domain);
   }
-  if (ctx != nullptr && owns_ctx) {
+  if (ctx != nullptr) {
     ibv().close_device(ctx);
   }
 }
