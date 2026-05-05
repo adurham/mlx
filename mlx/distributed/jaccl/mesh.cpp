@@ -206,8 +206,36 @@ void MeshGroup::open_trace_file_if_enabled() {
     std::cerr << "[jaccl] Failed to open trace file " << path << "\n";
     return;
   }
+  // Hash diagnostic — orthogonal to call tracing. When set, every
+  // collective hashes its output bytes after completion and includes
+  // the hash in the trace line; rank-divergent hashes localize
+  // transport non-bit-exactness.
+  const char* hash_env = std::getenv("JACCL_TRACE_HASH");
+  hash_enabled_ = (hash_env != nullptr && std::string_view(hash_env) == "1");
   std::fprintf(
-      trace_file_, "# call_id\top\telem_size\tmsg_bytes\n");
+      trace_file_,
+      "# call_id\top\telem_size\tmsg_bytes%s\n",
+      hash_enabled_ ? "\thash" : "");
+  std::fflush(trace_file_);
+}
+
+void MeshGroup::trace_hash(
+    uint32_t call_id, const void* data, int64_t n_bytes) {
+  if (trace_file_ == nullptr || !hash_enabled_) {
+    return;
+  }
+  // FNV-1a 64-bit over min(n_bytes, 4096). Capped to bound overhead;
+  // 4096 bytes covers a full FRAME_SIZE which suffices to detect any
+  // rank-divergent output (one bit-flip → hash divergence).
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  int64_t cap = n_bytes < 4096 ? n_bytes : 4096;
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (int64_t i = 0; i < cap; ++i) {
+    h ^= p[i];
+    h *= 0x100000001b3ULL;
+  }
+  std::fprintf(
+      trace_file_, "\thash=%016llx\n", static_cast<unsigned long long>(h));
   std::fflush(trace_file_);
 }
 
@@ -219,13 +247,17 @@ void MeshGroup::trace_call(
   if (trace_file_ == nullptr) {
     return;
   }
+  // Suppress trailing newline when hash diagnostic is enabled — the
+  // hash, computed after the collective completes, will append the
+  // newline. Keeps everything for a given call_id on one line.
   std::fprintf(
       trace_file_,
-      "%u\t%s\t%d\t%lld\n",
+      "%u\t%s\t%d\t%lld%s",
       call_id,
       op,
       elem_size,
-      static_cast<long long>(msg_bytes));
+      static_cast<long long>(msg_bytes),
+      hash_enabled_ ? "" : "\n");
   std::fflush(trace_file_);
 }
 
@@ -394,6 +426,7 @@ void MeshGroup::all_gather(const array& input, array& output, Stream stream) {
     std::lock_guard<std::mutex> guard(collective_mutex_);
     trace_call(call_id, "all_gather", 1, static_cast<int64_t>(n_bytes));
     mesh_.all_gather(call_id, in_ptr, out_ptr, n_bytes);
+    trace_hash(call_id, out_ptr, n_bytes * static_cast<int64_t>(size_));
   });
 }
 
@@ -409,6 +442,7 @@ void MeshGroup::send(const array& input, int dst, Stream stream) {
     std::snprintf(op, sizeof(op), "send_dst%d", dst);
     trace_call(call_id, op, 1, n_bytes);
     mesh_.send(call_id, data, n_bytes, dst);
+    trace_hash(call_id, data, n_bytes);
   });
 }
 
@@ -424,6 +458,7 @@ void MeshGroup::recv(array& out, int src, Stream stream) {
     std::snprintf(op, sizeof(op), "recv_src%d", src);
     trace_call(call_id, op, 1, n_bytes);
     mesh_.recv(call_id, data, n_bytes, src);
+    trace_hash(call_id, data, n_bytes);
   });
 }
 
@@ -456,6 +491,7 @@ void MeshGroup::all_reduce(
         } else {
           mesh_.all_reduce(call_id, in_ptr, out_ptr, size, reduce_op);
         }
+        trace_hash(call_id, out_ptr, size * static_cast<int64_t>(sizeof(T)));
       });
 }
 

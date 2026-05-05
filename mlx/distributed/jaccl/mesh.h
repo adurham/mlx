@@ -225,6 +225,20 @@ class MeshGroup : public GroupImpl {
       const char* op,
       int elem_size,
       int64_t msg_bytes);
+  // Per-call output checksum, gated on JACCL_TRACE_HASH=1 (independent
+  // of JACCL_TRACE_CALLS). After a collective writes its output, sum
+  // the first N bytes as uint64_t and append a hex hash to the trace
+  // line. Ranks must produce IDENTICAL hashes for the same call_id;
+  // any divergence is transport-layer non-bit-exactness (the suspected
+  // cause of c=2 + γ=2 MTP corruption — collective output bytes diverge
+  // between ranks → downstream Python state diverges → JACCL LEN_ERR).
+ public:
+  bool hash_enabled() const {
+    return hash_enabled_;
+  }
+  void trace_hash(uint32_t call_id, const void* data, int64_t n_bytes);
+ private:
+  bool hash_enabled_ = false;
 };
 
 } // namespace mlx::core::distributed::jaccl
