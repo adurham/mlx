@@ -67,10 +67,24 @@ MeshGroup::MeshGroup(
     std::vector<ibv_context*> ctxs,
     std::vector<std::string> device_names,
     bool owns_ctxs,
-    const ExchangeFn& exchange)
+    const ExchangeFn& exchange,
+    std::optional<Stream> parent_stream)
     : rank_(rank),
       size_(size),
-      communication_stream_(new_stream(Device::cpu)),
+      // When JACCL_SPLIT_PARENT_STREAM=1 and the caller passed in the
+      // parent's stream, share it. Otherwise allocate a fresh CPU
+      // stream as before. Sharing funnels both groups' lambdas onto
+      // one cpu::CommandEncoder worker thread, FIFO-serialized at the
+      // dispatch level; this is needed on macOS where two distinct
+      // encoder threads dispatching concurrently into separate QP
+      // sets appears to deadlock at the librdma layer (observed
+      // 2026-05-07: rank 1 stalls in mesh_.all_reduce on the 4th coord
+      // call right after master's warmup forward completes).
+      communication_stream_(
+          (parent_stream.has_value() &&
+           std::getenv("JACCL_SPLIT_PARENT_STREAM") != nullptr)
+              ? *parent_stream
+              : new_stream(Device::cpu)),
       side_channel_(std::nullopt),
       device_names_(std::move(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
@@ -178,6 +192,8 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   // Build the subgroup. Its ctor runs the full init pipeline (PD/CQ/QP
   // alloc → MR registration → INIT → exchange → RTR/RTS), with the
   // exchange done over the parent's side channel under our mutex.
+  // Pass our stream so the subgroup ctor can opt into sharing it (per
+  // JACCL_SPLIT_PARENT_STREAM) — see ctor for rationale.
   return std::make_shared<MeshGroup>(
       rank_,
       size_,
@@ -186,7 +202,8 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
       fresh_ctx,
       [this](const std::vector<Destination>& info) {
         return side_channel_->all_gather(info);
-      });
+      },
+      communication_stream_);
 }
 
 void MeshGroup::open_trace_file_if_enabled() {

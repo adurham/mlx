@@ -58,7 +58,17 @@ class MeshGroup : public GroupImpl {
       std::vector<ibv_context*> ctxs,
       std::vector<std::string> device_names,
       bool owns_ctxs,
-      const ExchangeFn& exchange);
+      const ExchangeFn& exchange,
+      // Optional parent CPU stream for the subgroup's
+      // communication_stream_. When JACCL_SPLIT_PARENT_STREAM=1 is set
+      // and a parent_stream is provided, the subgroup re-uses the
+      // parent's CPU stream instead of allocating its own. This funnels
+      // master + subgroup collectives through one cpu::CommandEncoder
+      // worker thread (FIFO-serialized) — at the cost of cross-group
+      // ordering, but Apple's RDMA layer appears to deadlock when two
+      // distinct CPU encoder threads dispatch concurrently into
+      // separate QP sets. See dsv4_mtp_c2_split_attempt_2026_05_07.md.
+      std::optional<Stream> parent_stream = std::nullopt);
 
   Stream communication_stream(StreamOrDevice s) override {
     // Pin every collective on this group to ONE shared process-wide
