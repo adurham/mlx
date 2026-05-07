@@ -81,16 +81,31 @@ inline void check_error_deferred(MTL::CommandBuffer* cbuf) {
 // MLX_GPU_TIME is enabled. The Metal-recorded GPUStartTime/EndTime are
 // CFTimeInterval (seconds) and reflect actual GPU wall execution. This
 // is essentially free — Metal records them automatically on completion.
+//
+// Filter buffers with invalid timestamps. Buffers that never actually
+// hit the GPU (CPU-only command buffers, jaccl RDMA collective stubs,
+// errored buffers) report GPUStartTime/GPUEndTime=0 or near-zero, which
+// makes ``end - start`` either zero or a multi-billion-second nonsense
+// reading depending on the dispatcher. Reject anything where either
+// timestamp is non-positive or the delta exceeds 1 s (a single Metal
+// kernel realistically takes < 100 ms on Apple Silicon at the model
+// sizes we run; 1 s is a generous upper bound that catches the
+// pathological start=0 case).
 inline void accumulate_gpu_time_if_enabled(MTL::CommandBuffer* cbuf) {
   if (!metal::gpu_time_enabled()) {
     return;
   }
   double start_s = cbuf->GPUStartTime();
   double end_s = cbuf->GPUEndTime();
-  if (end_s > start_s) {
-    uint64_t ns = static_cast<uint64_t>((end_s - start_s) * 1e9);
-    metal::accumulate_gpu_time_ns(ns);
+  if (start_s <= 0.0 || end_s <= 0.0) {
+    return;
   }
+  double delta_s = end_s - start_s;
+  if (delta_s <= 0.0 || delta_s > 1.0) {
+    return;
+  }
+  uint64_t ns = static_cast<uint64_t>(delta_s * 1e9);
+  metal::accumulate_gpu_time_ns(ns);
 }
 
 void eval(array& arr) {
@@ -136,10 +151,16 @@ void eval(array& arr) {
         });
     encoder.commit();
   } else {
+    // Don't accumulate gpu_time here: we are still appending to the
+    // current command buffer (no commit yet). N successive eval()s on
+    // the same buffer would each register a completion handler, and
+    // each would observe the SAME GPUStartTime/GPUEndTime when the
+    // buffer eventually commits — overcounting busy time by N×. The
+    // single commit-time handler (the if-branch above, or finalize())
+    // is the canonical accumulation point.
     command_buffer->addCompletedHandler(
         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
           check_error_deferred(cbuf);
-          accumulate_gpu_time_if_enabled(cbuf);
         });
   }
 }
