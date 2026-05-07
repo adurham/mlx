@@ -52,6 +52,18 @@ bool dispatch_count_enabled() {
   return enabled;
 }
 
+// Total GPU-busy time accumulated across all completed command buffers,
+// in nanoseconds. Reflects actual GPU execution wall (gpu_end_time -
+// gpu_start_time per command buffer summed). Designed for cycle-level
+// utilization profiling: GPU% = gpu_time_ns() / wall_ns. Far cheaper
+// than per-span profilers that force mx.eval(); the GPU timestamps are
+// recorded by Metal automatically with zero added kernel work.
+//
+// Gated on the MLX_GPU_TIME env var so completion handlers stay
+// branch-predicted-free in production. Defined outside the anonymous
+// namespace so eval.cpp can call gpu_time_enabled() / accumulate.
+std::atomic<uint64_t> g_gpu_time_ns_{0};
+
 constexpr const char* default_mtllib_path = METAL_PATH;
 
 auto get_metal_version() {
@@ -879,6 +891,28 @@ uint64_t dispatch_count() {
 
 void reset_dispatch_count() {
   g_dispatch_count_.store(0, std::memory_order_relaxed);
+}
+
+bool gpu_time_enabled() {
+  static bool enabled = [] {
+    if (auto* env = std::getenv("MLX_GPU_TIME")) {
+      return std::atoi(env) != 0;
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+uint64_t gpu_time_ns() {
+  return g_gpu_time_ns_.load(std::memory_order_relaxed);
+}
+
+void reset_gpu_time() {
+  g_gpu_time_ns_.store(0, std::memory_order_relaxed);
+}
+
+void accumulate_gpu_time_ns(uint64_t ns) {
+  g_gpu_time_ns_.fetch_add(ns, std::memory_order_relaxed);
 }
 
 } // namespace mlx::core::metal

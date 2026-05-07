@@ -7,6 +7,7 @@
 
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
@@ -76,6 +77,22 @@ inline void check_error_deferred(MTL::CommandBuffer* cbuf) {
   }
 }
 
+// Accumulate GPU-busy time from a completed command buffer when
+// MLX_GPU_TIME is enabled. The Metal-recorded GPUStartTime/EndTime are
+// CFTimeInterval (seconds) and reflect actual GPU wall execution. This
+// is essentially free — Metal records them automatically on completion.
+inline void accumulate_gpu_time_if_enabled(MTL::CommandBuffer* cbuf) {
+  if (!metal::gpu_time_enabled()) {
+    return;
+  }
+  double start_s = cbuf->GPUStartTime();
+  double end_s = cbuf->GPUEndTime();
+  if (end_s > start_s) {
+    uint64_t ns = static_cast<uint64_t>((end_s - start_s) * 1e9);
+    metal::accumulate_gpu_time_ns(ns);
+  }
+}
+
 void eval(array& arr) {
   // Re-throw any deferred error from a prior completion handler.
   check_deferred_error();
@@ -115,12 +132,14 @@ void eval(array& arr) {
         [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
           scheduler::notify_task_completion(s);
           check_error_deferred(cbuf);
+          accumulate_gpu_time_if_enabled(cbuf);
         });
     encoder.commit();
   } else {
     command_buffer->addCompletedHandler(
         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
           check_error_deferred(cbuf);
+          accumulate_gpu_time_if_enabled(cbuf);
         });
   }
 }
@@ -130,8 +149,10 @@ void finalize(Stream s) {
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  cb->addCompletedHandler(
-      [](MTL::CommandBuffer* cbuf) { check_error_deferred(cbuf); });
+  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) {
+    check_error_deferred(cbuf);
+    accumulate_gpu_time_if_enabled(cbuf);
+  });
   encoder.commit();
 }
 

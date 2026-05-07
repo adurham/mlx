@@ -19,6 +19,14 @@ uint64_t dispatch_count() {
   return 0;
 }
 void reset_dispatch_count() {}
+uint64_t gpu_time_ns() {
+  return 0;
+}
+void reset_gpu_time() {}
+bool gpu_time_enabled() {
+  return false;
+}
+void accumulate_gpu_time_ns(uint64_t) {}
 
 const std::unordered_map<std::string, std::variant<std::string, size_t>>&
 device_info() {

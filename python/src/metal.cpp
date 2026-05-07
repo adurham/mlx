@@ -114,6 +114,29 @@ void init_metal(nb::module_& m) {
       R"pbdoc(
       Reset the global dispatch counter to zero.
       )pbdoc");
+  metal.def(
+      "gpu_time_ns",
+      &mx::metal::gpu_time_ns,
+      R"pbdoc(
+      Total GPU-busy time accumulated across all completed command
+      buffers, in nanoseconds. Sum of ``GPUEndTime - GPUStartTime`` per
+      command buffer since the last reset. Designed for cycle-level
+      utilization profiling — divide by wall time to get GPU% busy.
+
+      Gated on the ``MLX_GPU_TIME=1`` env var (default off) so the
+      completion handlers stay branch-predicted-free in production.
+      When unset, always returns 0. Set the env var before importing
+      ``mlx`` to enable.
+
+      Call ``mx.eval(...)`` (or ``mx.synchronize()``) before reading so
+      in-flight command buffers complete and update the counter.
+      )pbdoc");
+  metal.def(
+      "reset_gpu_time",
+      &mx::metal::reset_gpu_time,
+      R"pbdoc(
+      Reset the GPU-busy time accumulator to zero.
+      )pbdoc");
   metal.def("device_info", []() {
     DEPRECATE("mx.metal.device_info", "mx.device_info");
     return mx::device_info(mx::Device(mx::Device::gpu, 0));
