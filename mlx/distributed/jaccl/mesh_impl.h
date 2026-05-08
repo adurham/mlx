@@ -498,6 +498,11 @@ class MeshImpl {
   static constexpr int ACK_RECV_POOL = 64;
 
   void post_ack_recvs(uint32_t call_id) {
+    // No-op when ack_connections_ is empty (top-level group: uses the
+    // original inline ack_sync_post on data QP, no pre-posting needed).
+    if (ack_connections_.empty()) {
+      return;
+    }
     for (int peer = 0; peer < size_; peer++) {
       if (peer == rank_) {
         continue;
@@ -565,30 +570,43 @@ class MeshImpl {
     bool _prog = jaccl_progress_enabled();
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers; // one send + one recv per peer
-    // ACK_RECV WRs are pre-posted (post_ack_recvs at MeshGroup ctor,
-    // re-posted by drain_acks after each consumption). Posting only
-    // ACK_SEND here. Without pre-posting, the ack_sync_post recv was
-    // posted in this same lambda — racing with the peer's ack_send
-    // arrival. Under UC (IBV_QPT_UC, no retransmit) any send hitting
-    // a QP without a posted recv WR is silently dropped: rank 0 ack
-    // for call N could fire microseconds before rank 1 had posted
-    // its call-N ack_recv → byte lost → rank 1's drain spins forever.
-    // Pre-post + replenish ensures the recv WR is ALWAYS waiting.
+    bool has_ack = !ack_connections_.empty();
     for (int peer = 0; peer < size_; peer++) {
       if (peer == rank_) {
         continue;
       }
       auto& sbuf = ack_send_buffers_[peer];
-      ack_connections_[peer].post_send(
-          sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+      if (has_ack) {
+        // Dedicated ACK QP path (subgroups). ACK_RECV WRs are
+        // pre-posted at QP setup (post_ack_recvs) and replenished by
+        // drain_acks. Posting only ACK_SEND here.
+        ack_connections_[peer].post_send(
+            sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+      } else {
+        // Original inline ack barrier on data QP (top-level group).
+        // Post recv + send for THIS call. drain_acks polls data CQ.
+        // This avoids the per-collective overhead of polling a
+        // separate ACK CQ on the master TP hot path. Safe because
+        // top-level group's calls are uniform-size-class (all
+        // FRAME_SIZE buffers), so the cross-call FIFO mismatch
+        // motivating the ACK QP fix doesn't manifest.
+        auto& rbuf = ack_recv_buffers_[peer];
+        std::memset(rbuf.data<char>(), 0, rbuf.size());
+        JACCL_DMA_BARRIER();
+        connections_[peer].post_recv(
+            rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+        connections_[peer].post_send(
+            sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+      }
     }
     if (_prog) {
       std::fprintf(
           stderr,
-          "[jaccl-prog] ack_sync_post POSTED rank=%d call_id=%u in_flight=%d\n",
+          "[jaccl-prog] ack_sync_post POSTED rank=%d call_id=%u in_flight=%d has_ack_qp=%d\n",
           rank_,
           call_id,
-          in_flight);
+          in_flight,
+          has_ack ? 1 : 0);
       std::fflush(stderr);
     }
     drain_acks(call_id, in_flight);
@@ -651,28 +669,30 @@ class MeshImpl {
         break;
       }
       ibv_wc wc[16];
-      // Poll only the ACK QPs' CQs. Data CQs are handled by the data
-      // path's own poll loop (mesh_impl all_reduce, ring_impl, etc.).
-      int n = poll(ack_connections_, 16, wc);
+      // Poll the relevant CQs. With dedicated ACK QPs (subgroups),
+      // poll only the ACK CQs. Without (top-level group, original
+      // path), the ack barrier rides the data CQ alongside data
+      // completions — poll connections_ instead.
+      int n = ack_connections_.empty()
+          ? poll(connections_, 16, wc)
+          : poll(ack_connections_, 16, wc);
+      bool has_ack = !ack_connections_.empty();
       for (int i = 0; i < n; i++) {
         int wt = wr_id_work_type(wc[i].wr_id);
         if (wt == ACK_RECV_WR) {
-          // ACK_RECV completions are call_id-AGNOSTIC. The recv WRs
-          // are pre-posted at QP setup time (with sentinel call_id=0)
-          // and replenished here on each completion, to avoid the
-          // race where peer's ACK_SEND arrives before our call-N
-          // ACK_RECV is posted (UC drops the byte). recv WRs are
-          // FIFO-matched on the dedicated ACK QP, so the firing one
-          // is from peer's most recent unprocessed ACK_SEND.
-          //
-          // CRITICAL: we replenish a fresh ACK_RECV WR (so the pool
-          // stays at depth ACK_RECV_POOL) but we only count the
-          // completion against `need_recv` IF it's still > 0. Excess
-          // CQEs get cached for the NEXT drain — they belong to the
-          // next call's barrier, not this one. Without this caching,
-          // an over-eager peer's pre-emptive ack_send for call N+1
-          // would be consumed by this drain (call N), and call N+1's
-          // drain would block waiting for an ack that's already gone.
+          // With dedicated ACK QP: ACK_RECVs are call_id-agnostic
+          // (sentinel call_id=0 from pre-post pool). Replenish a
+          // fresh recv on the ACK QP after each consumption.
+          // Without (top-level group): ACK_RECV WRs are per-call
+          // (posted with this call's call_id in ack_sync_post),
+          // matched once, no replenish — and stale ones from prior
+          // calls must be filtered out.
+          if (!has_ack) {
+            // Filter stale: only this call's ack_recv counts.
+            if (wr_id_call_id(wc[i].wr_id) != call_id) {
+              continue;
+            }
+          }
           if (wc[i].status != IBV_WC_SUCCESS) {
             std::ostringstream msg;
             msg << "[jaccl] ack drain (recv) wc.status=" << wc[i].status
@@ -680,14 +700,15 @@ class MeshImpl {
             throw std::runtime_error(msg.str());
           }
           int peer = wr_id_peer(wc[i].wr_id);
-          // Replenish: post a fresh ACK_RECV on the ACK QP for the
-          // next barrier. Sentinel call_id=0 since these are
-          // call_id-agnostic.
-          auto& rbuf = ack_recv_buffers_[peer];
-          std::memset(rbuf.data<char>(), 0, rbuf.size());
-          JACCL_DMA_BARRIER();
-          ack_connections_[peer].post_recv(
-              rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
+          if (has_ack) {
+            // Replenish: post a fresh ACK_RECV on the ACK QP for the
+            // next barrier. Sentinel call_id=0.
+            auto& rbuf = ack_recv_buffers_[peer];
+            std::memset(rbuf.data<char>(), 0, rbuf.size());
+            JACCL_DMA_BARRIER();
+            ack_connections_[peer].post_recv(
+                rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
+          }
           if (need_recv > 0) {
             if (_prog) {
               std::fprintf(

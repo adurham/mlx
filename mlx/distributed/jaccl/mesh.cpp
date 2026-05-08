@@ -31,15 +31,19 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Build ack_connections_ from the same ibv_contexts as data
-  // connections_. owns_ctx=false because data conns own those ctxs;
-  // we just borrow them. Each ack_connection_ will get its own
-  // PD/CQ/QP in initialize() — separate FIFO recv queue is the
-  // whole point.
-  ack_connections_.reserve(static_cast<size_t>(size_));
-  for (auto& data_conn : connections_) {
-    ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
-  }
+  // Top-level groups (color=0) skip the dedicated ACK QP. Their data
+  // QP traffic is uniform-size-class (model TP all_sums all use
+  // FRAME_SIZE buffers), so the cross-call FIFO mismatch that
+  // motivated the ACK QP fix doesn't manifest here. Falling back to
+  // the original ack_sync_post (post recv+send inline on data QP,
+  // drain from data CQ) eliminates the ~6ms/forward overhead from
+  // the separate ACK CQ poll at BS=2 hot path.
+  //
+  // ack_connections_ left empty → MeshImpl::ack_sync_post / drain_acks
+  // fall back to the original data-QP path. Subgroups created via
+  // split() build their own ack_connections_ in the other ctor —
+  // those NEED the dedicated ACK QP because coord-vs-master call_id
+  // race was the original wedge.
 
   // Initialize all the connections and allocate buffers. Top-level
   // groups exchange QP destinations directly over their own side
@@ -69,13 +73,8 @@ MeshGroup::MeshGroup(
       ring_send_buffers_,
       ring_recv_buffers_);
 
-  // Pre-post one ACK_RECV per peer on the dedicated ack QPs. With
-  // separate ACK QPs, the pre-posted recv sits at the head of the
-  // ACK QP recv queue (where it belongs) without interfering with
-  // the data path. drain_acks replenishes after each consumption.
-  // Without this pre-post the very first ack_sync_post on each
-  // collective races with peer's ack_send arrival under UC and
-  // silently drops bytes (observed 2026-05-07 on coord call 4).
+  // No-op when ack_connections_ is empty — top-level group uses the
+  // original inline ack_sync_post and doesn't need pre-posted recvs.
   mesh_.post_ack_recvs(0);
 
   open_trace_file_if_enabled();
@@ -329,29 +328,33 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
     conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
     conn.create_queue_pair();
   }
-  // Create PD/CQ/QP for the ACK connections. Same ibv_context as the
-  // data conn (set up in MeshGroup ctor) but separate PD/CQ/QP so the
-  // ACK QP has its own FIFO recv queue. CQ is sized to comfortably
-  // hold the ack-recv pool plus per-call ack_send completions
-  // without overflowing if drain_acks lags peer's send rate.
-  for (auto& conn : ack_connections_) {
-    if (conn.ctx == nullptr) {
-      continue;
+  // Create PD/CQ/QP for the ACK connections — only if the caller
+  // populated ack_connections_ (subgroup ctor does; top-level ctor
+  // skips it to avoid the per-collective overhead of polling a
+  // separate ACK CQ on the master TP hot path).
+  bool has_ack = !ack_connections_.empty();
+  if (has_ack) {
+    for (auto& conn : ack_connections_) {
+      if (conn.ctx == nullptr) {
+        continue;
+      }
+      conn.allocate_protection_domain();
+      conn.create_completion_queue(256);
+      conn.create_queue_pair();
     }
-    conn.allocate_protection_domain();
-    conn.create_completion_queue(256);
-    conn.create_queue_pair();
   }
 
   allocate_buffers();
 
-  // INIT data + ack QPs.
+  // INIT data QPs. INIT ack QPs only if present.
   for (int peer = 0; peer < size_; peer++) {
     if (peer == rank_) {
       continue;
     }
     connections_[peer].queue_pair_init();
-    ack_connections_[peer].queue_pair_init();
+    if (has_ack) {
+      ack_connections_[peer].queue_pair_init();
+    }
   }
 
   // Exchange data QP destinations across ranks.
@@ -361,16 +364,15 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
   }
   auto data_all_infos = exchange(data_info);
 
-  // Exchange ACK QP destinations across ranks. Separate exchange so
-  // ack QP-num doesn't collide with data QP-num in the destination
-  // record. Both exchanges run over the same SideChannel (or parent
-  // SideChannel for subgroups) — second call serves as an additional
-  // implicit barrier.
-  std::vector<Destination> ack_info;
-  for (auto& conn : ack_connections_) {
-    ack_info.emplace_back(conn.info());
+  // Exchange ACK QP destinations across ranks (only if present).
+  std::vector<std::vector<Destination>> ack_all_infos;
+  if (has_ack) {
+    std::vector<Destination> ack_info;
+    for (auto& conn : ack_connections_) {
+      ack_info.emplace_back(conn.info());
+    }
+    ack_all_infos = exchange(ack_info);
   }
-  auto ack_all_infos = exchange(ack_info);
 
   // RTR/RTS data QPs.
   for (int peer = 0; peer < size_; peer++) {
@@ -388,21 +390,23 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
     connections_[peer].queue_pair_rts();
   }
 
-  // RTR/RTS ack QPs.
-  for (int peer = 0; peer < size_; peer++) {
-    if (peer == rank_) {
-      continue;
+  // RTR/RTS ack QPs (only if present).
+  if (has_ack) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto peer_ack_info = ack_all_infos[peer][rank_];
+      if (std::getenv("JACCL_TRACE_SPLIT")) {
+        std::cerr << "[jaccl] init rank=" << rank_ << " peer=" << peer
+                  << " ack_qp_num="
+                  << ack_connections_[peer].src.queue_pair_number
+                  << " peer_ack_qp_num=" << peer_ack_info.queue_pair_number
+                  << std::endl;
+      }
+      ack_connections_[peer].queue_pair_rtr(peer_ack_info);
+      ack_connections_[peer].queue_pair_rts();
     }
-    auto peer_ack_info = ack_all_infos[peer][rank_];
-    if (std::getenv("JACCL_TRACE_SPLIT")) {
-      std::cerr << "[jaccl] init rank=" << rank_ << " peer=" << peer
-                << " ack_qp_num="
-                << ack_connections_[peer].src.queue_pair_number
-                << " peer_ack_qp_num=" << peer_ack_info.queue_pair_number
-                << std::endl;
-    }
-    ack_connections_[peer].queue_pair_rtr(peer_ack_info);
-    ack_connections_[peer].queue_pair_rts();
   }
 }
 
@@ -475,18 +479,21 @@ void MeshGroup::allocate_buffers() {
           .register_to_protection_domain(connections_[right].protection_domain);
     }
   }
-  // Register per-peer ack buffers to that peer's ACK PD. ACK traffic
-  // runs on a dedicated ACK QP (with its own PD/CQ) so the ACK_RECV
-  // WR sits at the head of an isolated recv queue without absorbing
-  // data sends.
+  // Register per-peer ack buffers. If we have a dedicated ACK
+  // connection for this peer (subgroup), register to its PD (separate
+  // FIFO recv queue). Otherwise (top-level group), register to the
+  // data conn's PD — the original ack barrier on data QP path.
   for (int j = 0; j < size_; j++) {
-    if (j == rank_ || ack_connections_[j].ctx == nullptr) {
+    if (j == rank_ || connections_[j].ctx == nullptr) {
       continue;
     }
-    ack_send_buffers_[j].register_to_protection_domain(
-        ack_connections_[j].protection_domain);
-    ack_recv_buffers_[j].register_to_protection_domain(
-        ack_connections_[j].protection_domain);
+    bool has_ack_for_peer =
+        !ack_connections_.empty() && ack_connections_[j].ctx != nullptr;
+    auto* pd = has_ack_for_peer
+        ? ack_connections_[j].protection_domain
+        : connections_[j].protection_domain;
+    ack_send_buffers_[j].register_to_protection_domain(pd);
+    ack_recv_buffers_[j].register_to_protection_domain(pd);
   }
 }
 
