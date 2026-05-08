@@ -599,19 +599,50 @@ class MeshImpl {
   void drain_acks(uint32_t call_id, int in_flight) {
     bool _prog = jaccl_progress_enabled();
     int _iters = 0;
-    while (in_flight > 0) {
+    // Per-peer accounting for what THIS call's barrier requires.
+    // Each call needs 1 own ACK_SEND completion and 1 ACK_RECV
+    // (peer's send arriving) per remote peer. Track them separately
+    // so we don't accidentally over-consume ACK_RECVs that belong to
+    // future calls' barriers when peer is running ahead.
+    // in_flight from callers is always 2 * num_peers (one send + one
+    // recv per peer); split it.
+    int need_send = in_flight / 2;
+    int need_recv = in_flight / 2;
+    while (need_send > 0 || need_recv > 0) {
       if (_prog) {
         ++_iters;
         if (_iters <= 4 || (_iters % 1000000) == 0) {
           std::fprintf(
               stderr,
-              "[jaccl-prog] drain_acks POLL rank=%d call_id=%u iter=%d in_flight=%d\n",
+              "[jaccl-prog] drain_acks POLL rank=%d call_id=%u iter=%d need_send=%d need_recv=%d cached_recvs=%d\n",
               rank_,
               call_id,
               _iters,
-              in_flight);
+              need_send,
+              need_recv,
+              static_cast<int>(cached_ack_recvs_.size()));
           std::fflush(stderr);
         }
+      }
+      // Use up any ACK_RECV completions cached by prior drains
+      // before polling fresh CQEs.
+      while (need_recv > 0 && !cached_ack_recvs_.empty()) {
+        int peer = cached_ack_recvs_.back();
+        cached_ack_recvs_.pop_back();
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] drain_acks CACHED rank=%d call_id=%u type=ACK_RECV peer=%d need_recv=%d\n",
+              rank_,
+              call_id,
+              peer,
+              need_recv - 1);
+          std::fflush(stderr);
+        }
+        need_recv--;
+      }
+      if (need_send == 0 && need_recv == 0) {
+        break;
       }
       ibv_wc wc[16];
       // Poll only the ACK QPs' CQs. Data CQs are handled by the data
@@ -624,10 +655,18 @@ class MeshImpl {
           // are pre-posted at QP setup time (with sentinel call_id=0)
           // and replenished here on each completion, to avoid the
           // race where peer's ACK_SEND arrives before our call-N
-          // ACK_RECV is posted (UC drops the byte). Any ACK_RECV
-          // completion satisfies the current barrier — recv WRs are
+          // ACK_RECV is posted (UC drops the byte). recv WRs are
           // FIFO-matched on the dedicated ACK QP, so the firing one
-          // is from peer's most recent ACK_SEND.
+          // is from peer's most recent unprocessed ACK_SEND.
+          //
+          // CRITICAL: we replenish a fresh ACK_RECV WR (so the pool
+          // stays at depth ACK_RECV_POOL) but we only count the
+          // completion against `need_recv` IF it's still > 0. Excess
+          // CQEs get cached for the NEXT drain — they belong to the
+          // next call's barrier, not this one. Without this caching,
+          // an over-eager peer's pre-emptive ack_send for call N+1
+          // would be consumed by this drain (call N), and call N+1's
+          // drain would block waiting for an ack that's already gone.
           if (wc[i].status != IBV_WC_SUCCESS) {
             std::ostringstream msg;
             msg << "[jaccl] ack drain (recv) wc.status=" << wc[i].status
@@ -643,17 +682,32 @@ class MeshImpl {
           JACCL_DMA_BARRIER();
           ack_connections_[peer].post_recv(
               rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
-          if (_prog) {
-            std::fprintf(
-                stderr,
-                "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_RECV peer=%d in_flight=%d (replenished)\n",
-                rank_,
-                call_id,
-                peer,
-                in_flight - 1);
-            std::fflush(stderr);
+          if (need_recv > 0) {
+            if (_prog) {
+              std::fprintf(
+                  stderr,
+                  "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_RECV peer=%d need_recv=%d (replenished)\n",
+                  rank_,
+                  call_id,
+                  peer,
+                  need_recv - 1);
+              std::fflush(stderr);
+            }
+            need_recv--;
+          } else {
+            // Excess — peer is ahead. Cache for the next drain.
+            cached_ack_recvs_.push_back(peer);
+            if (_prog) {
+              std::fprintf(
+                  stderr,
+                  "[jaccl-prog] drain_acks EXCESS rank=%d call_id=%u type=ACK_RECV peer=%d cached=%d\n",
+                  rank_,
+                  call_id,
+                  peer,
+                  static_cast<int>(cached_ack_recvs_.size()));
+              std::fflush(stderr);
+            }
           }
-          in_flight--;
         } else if (wt == ACK_SEND_WR) {
           // ACK_SEND completions DO carry the call_id we used to post.
           // Filter out stale ones from prior calls.
@@ -669,13 +723,13 @@ class MeshImpl {
           if (_prog) {
             std::fprintf(
                 stderr,
-                "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_SEND in_flight=%d\n",
+                "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_SEND need_send=%d\n",
                 rank_,
                 call_id,
-                in_flight - 1);
+                need_send - 1);
             std::fflush(stderr);
           }
-          in_flight--;
+          need_send--;
         } else {
           // Leftover non-ack completion (data send/recv from this or
           // a stale call). Don't touch in_flight or buffers.
@@ -802,6 +856,13 @@ class MeshImpl {
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> ack_send_buffers_;
   std::span<SharedBuffer> ack_recv_buffers_;
+  // Software queue of ACK_RECV completions that arrived early (peer
+  // ran ahead and pre-emptively sent ack for a future call). drain_acks
+  // pulls from here first before polling the CQ. Element = peer index
+  // of the cached completion. drain_acks already replenished the recv
+  // WR for these — the buffer is consumed; we just owe the future call
+  // a "barrier passed" signal.
+  std::vector<int> cached_ack_recvs_;
 };
 
 } // namespace mlx::core::distributed::jaccl
