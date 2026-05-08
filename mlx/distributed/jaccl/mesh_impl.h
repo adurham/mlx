@@ -524,18 +524,20 @@ class MeshImpl {
     bool _prog = jaccl_progress_enabled();
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers; // one send + one recv per peer
+    // ACK_RECV WRs are pre-posted (post_ack_recvs at MeshGroup ctor,
+    // re-posted by drain_acks after each consumption). Posting only
+    // ACK_SEND here. Without pre-posting, the ack_sync_post recv was
+    // posted in this same lambda — racing with the peer's ack_send
+    // arrival. Under UC (IBV_QPT_UC, no retransmit) any send hitting
+    // a QP without a posted recv WR is silently dropped: rank 0 ack
+    // for call N could fire microseconds before rank 1 had posted
+    // its call-N ack_recv → byte lost → rank 1's drain spins forever.
+    // Pre-post + replenish ensures the recv WR is ALWAYS waiting.
     for (int peer = 0; peer < size_; peer++) {
       if (peer == rank_) {
         continue;
       }
       auto& sbuf = ack_send_buffers_[peer];
-      auto& rbuf = ack_recv_buffers_[peer];
-      // Zero before post — defends against any stale recv-side bytes
-      // (same rationale as zero_recv_buffer in the data path).
-      std::memset(rbuf.data<char>(), 0, rbuf.size());
-      JACCL_DMA_BARRIER();
-      connections_[peer].post_recv(
-          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
       connections_[peer].post_send(
           sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
     }
@@ -595,35 +597,68 @@ class MeshImpl {
       ibv_wc wc[16];
       int n = poll(connections_, 16, wc);
       for (int i = 0; i < n; i++) {
-        // Skip stale completions from prior calls; never decrement
-        // in_flight or touch buffers for those.
-        if (wr_id_call_id(wc[i].wr_id) != call_id) {
-          continue;
-        }
         int wt = wr_id_work_type(wc[i].wr_id);
-        if (wt != ACK_SEND_WR && wt != ACK_RECV_WR) {
-          // Leftover data completion from this same call — drain
-          // without touching in_flight (the data side already
-          // accounted for it).
+        if (wt == ACK_RECV_WR) {
+          // ACK_RECV completions are call_id-AGNOSTIC. The recv WRs
+          // are pre-posted at QP setup time (with sentinel call_id=0)
+          // and replenished here on each completion, to avoid the
+          // race where peer's ACK_SEND arrives before our call-N
+          // ACK_RECV is posted (UC drops the byte). Any ACK_RECV
+          // completion satisfies the current barrier — recv WRs are
+          // FIFO-matched, so the firing one is from peer's most
+          // recent ACK_SEND.
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            std::ostringstream msg;
+            msg << "[jaccl] ack drain (recv) wc.status=" << wc[i].status
+                << " wr_id=0x" << std::hex << wc[i].wr_id;
+            throw std::runtime_error(msg.str());
+          }
+          int peer = wr_id_peer(wc[i].wr_id);
+          // Replenish: post a fresh ACK_RECV for the next barrier.
+          // Sentinel call_id=0 since these are call_id-agnostic.
+          auto& rbuf = ack_recv_buffers_[peer];
+          std::memset(rbuf.data<char>(), 0, rbuf.size());
+          JACCL_DMA_BARRIER();
+          connections_[peer].post_recv(
+              rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_RECV peer=%d in_flight=%d (replenished)\n",
+                rank_,
+                call_id,
+                peer,
+                in_flight - 1);
+            std::fflush(stderr);
+          }
+          in_flight--;
+        } else if (wt == ACK_SEND_WR) {
+          // ACK_SEND completions DO carry the call_id we used to post.
+          // Filter out stale ones from prior calls.
+          if (wr_id_call_id(wc[i].wr_id) != call_id) {
+            continue;
+          }
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            std::ostringstream msg;
+            msg << "[jaccl] ack drain (send) wc.status=" << wc[i].status
+                << " wr_id=0x" << std::hex << wc[i].wr_id;
+            throw std::runtime_error(msg.str());
+          }
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_SEND in_flight=%d\n",
+                rank_,
+                call_id,
+                in_flight - 1);
+            std::fflush(stderr);
+          }
+          in_flight--;
+        } else {
+          // Leftover non-ack completion (data send/recv from this or
+          // a stale call). Don't touch in_flight or buffers.
           continue;
         }
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          std::ostringstream msg;
-          msg << "[jaccl] ack drain wc.status=" << wc[i].status
-              << " wr_id=0x" << std::hex << wc[i].wr_id;
-          throw std::runtime_error(msg.str());
-        }
-        if (_prog) {
-          std::fprintf(
-              stderr,
-              "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=%s in_flight=%d\n",
-              rank_,
-              call_id,
-              wt == ACK_SEND_WR ? "ACK_SEND" : "ACK_RECV",
-              in_flight - 1);
-          std::fflush(stderr);
-        }
-        in_flight--;
       }
     }
   }

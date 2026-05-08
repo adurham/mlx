@@ -58,6 +58,16 @@ MeshGroup::MeshGroup(
       ring_send_buffers_,
       ring_recv_buffers_);
 
+  // Pre-post one ACK_RECV per peer so the very first ack_sync_post's
+  // ACK_SEND from peer always finds a posted recv WR. Without this,
+  // peer's ACK_SEND can arrive before we've gotten around to posting
+  // our ACK_RECV — under UC (IBV_QPT_UC, no retransmit) the byte is
+  // silently dropped and our drain_acks spins forever waiting for a
+  // completion that will never fire. drain_acks replenishes after
+  // each ACK_RECV consumption. Race observed 2026-05-07 on coord
+  // call 4 of c=2 MTP wire-up.
+  mesh_.post_ack_recvs(0);
+
   open_trace_file_if_enabled();
 }
 
@@ -134,6 +144,12 @@ MeshGroup::MeshGroup(
       1,
       ring_send_buffers_,
       ring_recv_buffers_);
+
+  // Pre-post ACK_RECVs — same rationale as the top-level ctor; the
+  // ack_sync_post race (UC byte drop) applies equally to subgroups.
+  // The exchange callback above already barriers via the parent's
+  // SideChannel, so QPs are RTS on both ranks before we get here.
+  mesh_.post_ack_recvs(0);
 
   open_trace_file_if_enabled();
 }
