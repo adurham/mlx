@@ -339,7 +339,7 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       continue;
     }
     conn.allocate_protection_domain();
-    conn.create_completion_queue(64);
+    conn.create_completion_queue(256);
     conn.create_queue_pair();
   }
 

@@ -486,10 +486,16 @@ class MeshImpl {
   // replenishes one ACK_RECV per consumption, keeping steady-state
   // depth at ACK_RECV_POOL. Without enough depth, peer's ack_send
   // can arrive on a QP with no posted recv WR → UC drops → wedge.
-  // 16 is comfortably above the per-collective ack rate observed at
-  // c=2 MTP=1 (~50 collectives/sec from runner-coord on coord
-  // subgroup) given typical per-call drain latency (<1ms).
-  static constexpr int ACK_RECV_POOL = 16;
+  //
+  // c=2 with master + coord groups running on separate CPU encoder
+  // threads can cause one rank's coord lambdas to race well ahead of
+  // the other rank's (e.g. one rank's master is busy with model
+  // forwards while the other's master is idle, freeing the encoder
+  // thread to dispatch coord lambdas at full rate). Empirically,
+  // pool=16 was insufficient on c=2 trial 3 — wedge appeared after
+  // stream1 hit EOS and timing diverged further. 64 is sized for the
+  // observed cross-rank coord-lambda lead.
+  static constexpr int ACK_RECV_POOL = 64;
 
   void post_ack_recvs(uint32_t call_id) {
     for (int peer = 0; peer < size_; peer++) {
