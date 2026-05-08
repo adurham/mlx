@@ -331,14 +331,15 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
   }
   // Create PD/CQ/QP for the ACK connections. Same ibv_context as the
   // data conn (set up in MeshGroup ctor) but separate PD/CQ/QP so the
-  // ACK QP has its own FIFO recv queue. ACK CQ is small — only ever
-  // holds at most 2 in-flight per peer (one ACK_RECV + one ACK_SEND).
+  // ACK QP has its own FIFO recv queue. CQ is sized to comfortably
+  // hold the ack-recv pool plus per-call ack_send completions
+  // without overflowing if drain_acks lags peer's send rate.
   for (auto& conn : ack_connections_) {
     if (conn.ctx == nullptr) {
       continue;
     }
     conn.allocate_protection_domain();
-    conn.create_completion_queue(16);
+    conn.create_completion_queue(64);
     conn.create_queue_pair();
   }
 

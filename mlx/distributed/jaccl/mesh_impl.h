@@ -477,23 +477,36 @@ class MeshImpl {
     ack_sync_post(call_id);
   }
 
-  // Pre-post one ACK_RECV per peer with a sentinel call_id (0). Called
-  // from MeshGroup ctor right after MeshImpl construction so the very
-  // first ack_sync_post's incoming ACK_SEND from peer always finds a
-  // posted recv WR. drain_acks replenishes after each consumption.
-  // Public because MeshGroup is the natural caller, not a friend.
+  // Pre-post a pool of ACK_RECVs per peer at QP setup time. Called
+  // from MeshGroup ctor so the very first ack_sync_post's incoming
+  // ACK_SEND from peer always finds a posted recv WR.
+  //
+  // Pool depth (ACK_RECV_POOL): if peer's ACK_SEND rate exceeds our
+  // drain_acks rate, the pool absorbs the burst. drain_acks
+  // replenishes one ACK_RECV per consumption, keeping steady-state
+  // depth at ACK_RECV_POOL. Without enough depth, peer's ack_send
+  // can arrive on a QP with no posted recv WR → UC drops → wedge.
+  // 16 is comfortably above the per-collective ack rate observed at
+  // c=2 MTP=1 (~50 collectives/sec from runner-coord on coord
+  // subgroup) given typical per-call drain latency (<1ms).
+  static constexpr int ACK_RECV_POOL = 16;
+
   void post_ack_recvs(uint32_t call_id) {
     for (int peer = 0; peer < size_; peer++) {
       if (peer == rank_) {
         continue;
       }
+      // Post `ACK_RECV_POOL` recv WRs on the dedicated ACK QP. Each
+      // shares the single per-peer ack_recv_buffer (ACK payload is
+      // a single sentinel byte; we only need to know "an ack
+      // arrived" — the buffer contents don't matter).
       auto& rbuf = ack_recv_buffers_[peer];
       std::memset(rbuf.data<char>(), 0, rbuf.size());
       JACCL_DMA_BARRIER();
-      // Post on the ACK QP, not the data QP. Separate FIFO recv queue
-      // ⇒ pre-posting at QP setup time can't absorb data sends.
-      ack_connections_[peer].post_recv(
-          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+      for (int i = 0; i < ACK_RECV_POOL; i++) {
+        ack_connections_[peer].post_recv(
+            rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+      }
     }
   }
 
