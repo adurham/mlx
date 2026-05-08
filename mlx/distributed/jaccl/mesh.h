@@ -68,7 +68,11 @@ class MeshGroup : public GroupImpl {
       // ordering, but Apple's RDMA layer appears to deadlock when two
       // distinct CPU encoder threads dispatch concurrently into
       // separate QP sets. See dsv4_mtp_c2_split_attempt_2026_05_07.md.
-      std::optional<Stream> parent_stream = std::nullopt);
+      std::optional<Stream> parent_stream = std::nullopt,
+      // Subgroup color (split's color arg). Top-level groups pass 0.
+      // Embedded into the trace filename so master + subgroup traces
+      // don't share a path.
+      int color = 0);
 
   Stream communication_stream(StreamOrDevice s) override {
     // Pin every collective on this group to ONE shared process-wide
@@ -153,6 +157,12 @@ class MeshGroup : public GroupImpl {
 
   int rank_;
   int size_;
+  // Group color identifier — top-level groups use 0; subgroups
+  // created by split() carry the split's color (e.g. 0xC00D for the
+  // runner-coord subgroup). Used to disambiguate per-group trace
+  // files so master + coord don't both clobber
+  // /tmp/jaccl_trace_rank_${rank}_pid${pid}.log.
+  int color_ = 0;
   // One shared CPU stream owned by this group. Created once at
   // construction so every caller thread gets the SAME stream from
   // communication_stream(); all collectives funnel through one

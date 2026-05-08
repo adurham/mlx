@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -10,6 +12,21 @@
 constexpr int MESH_MAX_PEERS = 8;
 
 namespace mlx::core::distributed::jaccl {
+
+// Per-stage RDMA progress logging gated on JACCL_TRACE_PROGRESS=1.
+// Output goes to stderr. Inline so the gate-check inlines and the
+// branch is dead-code eliminated when the env var is unset (runtime
+// check is once per call site, not once per WC).
+inline bool jaccl_progress_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char* e = std::getenv("JACCL_TRACE_PROGRESS");
+    enabled = (e != nullptr && e[0] == '1' && e[1] == '\0');
+    checked = true;
+  }
+  return enabled;
+}
 
 class MeshImpl {
  public:
@@ -36,6 +53,17 @@ class MeshImpl {
       T* out_ptr,
       int64_t size,
       ReduceOp reduce_op) {
+    bool _prog = jaccl_progress_enabled();
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce ENTER rank=%d call_id=%u size=%lld T_bytes=%zu\n",
+          rank_,
+          call_id,
+          (long long)size,
+          sizeof(T));
+      std::fflush(stderr);
+    }
     // If not inplace all reduce then copy the input to the output first
     if (in_ptr != out_ptr) {
       std::memcpy(out_ptr, in_ptr, size * sizeof(T));
@@ -72,10 +100,38 @@ class MeshImpl {
       read_offset += N;
     }
 
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce PREFILL_DONE rank=%d call_id=%u in_flight=%d N=%lld total=%lld\n",
+          rank_,
+          call_id,
+          in_flight,
+          (long long)N,
+          (long long)total);
+      std::fflush(stderr);
+    }
+
     // Main loop
     //
     // Keep going until we have no longer data in flight.
+    int _poll_iters = 0;
     while (in_flight > 0) {
+      if (_prog) {
+        ++_poll_iters;
+        // Log only the first few + every 1M iterations so we don't
+        // drown the wedge in noise but still see progress when stuck.
+        if (_poll_iters <= 4 || (_poll_iters % 1000000) == 0) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] all_reduce POLL rank=%d call_id=%u iter=%d in_flight=%d\n",
+              rank_,
+              call_id,
+              _poll_iters,
+              in_flight);
+          std::fflush(stderr);
+        }
+      }
       // Poll the hardware for completions.
       //
       // If a send was completed mark how many completions we have received
@@ -121,6 +177,19 @@ class MeshImpl {
         int rank = wr_id_peer(wc[i].wr_id);
 
         in_flight--;
+
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] all_reduce CQE rank=%d call_id=%u type=%s peer=%d buff=%d in_flight=%d\n",
+              rank_,
+              call_id,
+              work_type == SEND_WR ? "SEND" : "RECV",
+              rank,
+              buff,
+              in_flight);
+          std::fflush(stderr);
+        }
 
         if (work_type == SEND_WR && read_offset < total) {
           completed_send_count[buff]++;
@@ -173,7 +242,24 @@ class MeshImpl {
         completed_recv_begin[r] = s;
       }
     }
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce DATA_DONE rank=%d call_id=%u poll_iters=%d -> ack_sync_post\n",
+          rank_,
+          call_id,
+          _poll_iters);
+      std::fflush(stderr);
+    }
     ack_sync_post(call_id);
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce DONE rank=%d call_id=%u\n",
+          rank_,
+          call_id);
+      std::fflush(stderr);
+    }
   }
 
   void all_gather(
@@ -435,6 +521,7 @@ class MeshImpl {
   }
 
   void ack_sync_post(uint32_t call_id) {
+    bool _prog = jaccl_progress_enabled();
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers; // one send + one recv per peer
     for (int peer = 0; peer < size_; peer++) {
@@ -452,7 +539,24 @@ class MeshImpl {
       connections_[peer].post_send(
           sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
     }
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] ack_sync_post POSTED rank=%d call_id=%u in_flight=%d\n",
+          rank_,
+          call_id,
+          in_flight);
+      std::fflush(stderr);
+    }
     drain_acks(call_id, in_flight);
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] ack_sync_post DRAINED rank=%d call_id=%u\n",
+          rank_,
+          call_id);
+      std::fflush(stderr);
+    }
   }
 
   // Helper used by post_ack_recvs() to put ack_recv as the FIRST
@@ -472,7 +576,22 @@ class MeshImpl {
   }
 
   void drain_acks(uint32_t call_id, int in_flight) {
+    bool _prog = jaccl_progress_enabled();
+    int _iters = 0;
     while (in_flight > 0) {
+      if (_prog) {
+        ++_iters;
+        if (_iters <= 4 || (_iters % 1000000) == 0) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] drain_acks POLL rank=%d call_id=%u iter=%d in_flight=%d\n",
+              rank_,
+              call_id,
+              _iters,
+              in_flight);
+          std::fflush(stderr);
+        }
+      }
       ibv_wc wc[16];
       int n = poll(connections_, 16, wc);
       for (int i = 0; i < n; i++) {
@@ -493,6 +612,16 @@ class MeshImpl {
           msg << "[jaccl] ack drain wc.status=" << wc[i].status
               << " wr_id=0x" << std::hex << wc[i].wr_id;
           throw std::runtime_error(msg.str());
+        }
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=%s in_flight=%d\n",
+              rank_,
+              call_id,
+              wt == ACK_SEND_WR ? "ACK_SEND" : "ACK_RECV",
+              in_flight - 1);
+          std::fflush(stderr);
         }
         in_flight--;
       }

@@ -68,9 +68,11 @@ MeshGroup::MeshGroup(
     std::vector<std::string> device_names,
     bool owns_ctxs,
     const ExchangeFn& exchange,
-    std::optional<Stream> parent_stream)
+    std::optional<Stream> parent_stream,
+    int color)
     : rank_(rank),
       size_(size),
+      color_(color),
       // When JACCL_SPLIT_PARENT_STREAM=1 and the caller passed in the
       // parent's stream, share it. Otherwise allocate a fresh CPU
       // stream as before. Sharing funnels both groups' lambdas onto
@@ -193,7 +195,9 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
   // alloc → MR registration → INIT → exchange → RTR/RTS), with the
   // exchange done over the parent's side channel under our mutex.
   // Pass our stream so the subgroup ctor can opt into sharing it (per
-  // JACCL_SPLIT_PARENT_STREAM) — see ctor for rationale.
+  // JACCL_SPLIT_PARENT_STREAM) — see ctor for rationale. Pass `color`
+  // through so the subgroup's trace filename doesn't collide with the
+  // parent's.
   return std::make_shared<MeshGroup>(
       rank_,
       size_,
@@ -203,7 +207,8 @@ std::shared_ptr<GroupImpl> MeshGroup::split(int color, int key) {
       [this](const std::vector<Destination>& info) {
         return side_channel_->all_gather(info);
       },
-      communication_stream_);
+      communication_stream_,
+      color);
 }
 
 void MeshGroup::open_trace_file_if_enabled() {
@@ -211,12 +216,13 @@ void MeshGroup::open_trace_file_if_enabled() {
   if (env == nullptr || std::string_view(env) != "1") {
     return;
   }
-  char path[128];
+  char path[160];
   std::snprintf(
       path,
       sizeof(path),
-      "/tmp/jaccl_trace_rank_%d_pid%d.log",
+      "/tmp/jaccl_trace_rank_%d_color%x_pid%d.log",
       rank_,
+      static_cast<unsigned int>(color_),
       static_cast<int>(getpid()));
   trace_file_ = std::fopen(path, "w");
   if (trace_file_ == nullptr) {
