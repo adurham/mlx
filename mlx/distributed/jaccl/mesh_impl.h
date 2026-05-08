@@ -475,6 +475,24 @@ class MeshImpl {
     ack_sync_post(call_id);
   }
 
+  // Pre-post one ACK_RECV per peer with a sentinel call_id (0). Called
+  // from MeshGroup ctor right after MeshImpl construction so the very
+  // first ack_sync_post's incoming ACK_SEND from peer always finds a
+  // posted recv WR. drain_acks replenishes after each consumption.
+  // Public because MeshGroup is the natural caller, not a friend.
+  void post_ack_recvs(uint32_t call_id) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& rbuf = ack_recv_buffers_[peer];
+      std::memset(rbuf.data<char>(), 0, rbuf.size());
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_recv(
+          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+    }
+  }
+
  private:
   // Cross-rank ack barrier — used at BOTH ends of every lambda.
   // Posts a small ack send + ack recv to every peer over the data
@@ -558,22 +576,6 @@ class MeshImpl {
           rank_,
           call_id);
       std::fflush(stderr);
-    }
-  }
-
-  // Helper used by post_ack_recvs() to put ack_recv as the FIRST
-  // recv WR on each peer's QP queue, before any data recv WRs. This
-  // makes peer's ack_send hit our ack_recv first (FIFO matching).
-  void post_ack_recvs(uint32_t call_id) {
-    for (int peer = 0; peer < size_; peer++) {
-      if (peer == rank_) {
-        continue;
-      }
-      auto& rbuf = ack_recv_buffers_[peer];
-      std::memset(rbuf.data<char>(), 0, rbuf.size());
-      JACCL_DMA_BARRIER();
-      connections_[peer].post_recv(
-          rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
     }
   }
 
