@@ -34,12 +34,14 @@ class MeshImpl {
       int rank,
       int size,
       std::vector<Connection>& conns,
+      std::vector<Connection>& ack_conns,
       std::vector<SharedBuffer>& buffers,
       std::vector<SharedBuffer>& ack_send_buffers,
       std::vector<SharedBuffer>& ack_recv_buffers)
       : rank_(rank),
         size_(size),
         connections_(conns),
+        ack_connections_(ack_conns),
         buffers_(buffers),
         ack_send_buffers_(ack_send_buffers),
         ack_recv_buffers_(ack_recv_buffers) {}
@@ -488,7 +490,9 @@ class MeshImpl {
       auto& rbuf = ack_recv_buffers_[peer];
       std::memset(rbuf.data<char>(), 0, rbuf.size());
       JACCL_DMA_BARRIER();
-      connections_[peer].post_recv(
+      // Post on the ACK QP, not the data QP. Separate FIFO recv queue
+      // ⇒ pre-posting at QP setup time can't absorb data sends.
+      ack_connections_[peer].post_recv(
           rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
     }
   }
@@ -532,7 +536,7 @@ class MeshImpl {
         continue;
       }
       auto& sbuf = ack_send_buffers_[peer];
-      connections_[peer].post_send(
+      ack_connections_[peer].post_send(
           sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
     }
     drain_acks(call_id, in_flight);
@@ -556,7 +560,7 @@ class MeshImpl {
         continue;
       }
       auto& sbuf = ack_send_buffers_[peer];
-      connections_[peer].post_send(
+      ack_connections_[peer].post_send(
           sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
     }
     if (_prog) {
@@ -597,7 +601,9 @@ class MeshImpl {
         }
       }
       ibv_wc wc[16];
-      int n = poll(connections_, 16, wc);
+      // Poll only the ACK QPs' CQs. Data CQs are handled by the data
+      // path's own poll loop (mesh_impl all_reduce, ring_impl, etc.).
+      int n = poll(ack_connections_, 16, wc);
       for (int i = 0; i < n; i++) {
         int wt = wr_id_work_type(wc[i].wr_id);
         if (wt == ACK_RECV_WR) {
@@ -607,8 +613,8 @@ class MeshImpl {
           // race where peer's ACK_SEND arrives before our call-N
           // ACK_RECV is posted (UC drops the byte). Any ACK_RECV
           // completion satisfies the current barrier — recv WRs are
-          // FIFO-matched, so the firing one is from peer's most
-          // recent ACK_SEND.
+          // FIFO-matched on the dedicated ACK QP, so the firing one
+          // is from peer's most recent ACK_SEND.
           if (wc[i].status != IBV_WC_SUCCESS) {
             std::ostringstream msg;
             msg << "[jaccl] ack drain (recv) wc.status=" << wc[i].status
@@ -616,12 +622,13 @@ class MeshImpl {
             throw std::runtime_error(msg.str());
           }
           int peer = wr_id_peer(wc[i].wr_id);
-          // Replenish: post a fresh ACK_RECV for the next barrier.
-          // Sentinel call_id=0 since these are call_id-agnostic.
+          // Replenish: post a fresh ACK_RECV on the ACK QP for the
+          // next barrier. Sentinel call_id=0 since these are
+          // call_id-agnostic.
           auto& rbuf = ack_recv_buffers_[peer];
           std::memset(rbuf.data<char>(), 0, rbuf.size());
           JACCL_DMA_BARRIER();
-          connections_[peer].post_recv(
+          ack_connections_[peer].post_recv(
               rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
           if (_prog) {
             std::fprintf(
@@ -775,6 +782,10 @@ class MeshImpl {
   int rank_;
   int size_;
   std::span<Connection> connections_;
+  // Dedicated per-peer ACK connections — separate PD/CQ/QP from data
+  // connections so the ack barrier's pre-posted ACK_RECV doesn't sit
+  // at the head of the data recv FIFO. See MeshGroup::initialize.
+  std::span<Connection> ack_connections_;
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> ack_send_buffers_;
   std::span<SharedBuffer> ack_recv_buffers_;

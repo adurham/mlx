@@ -182,6 +182,17 @@ class MeshGroup : public GroupImpl {
   // ibv_open_device calls for the same physical device.
   std::vector<std::string> device_names_;
   std::vector<Connection> connections_;
+  // Per-peer ACK QP — separate from data QP so ACK_RECV WRs can be
+  // pre-posted at QP setup without sitting at the head of the data
+  // recv queue (where they would absorb the first incoming data send
+  // and starve the data path). Same ibv_context as data QPs (no need
+  // to open new device); separate PD/CQ/QP ⇒ separate FIFO recv queue.
+  // Diagnosed 2026-05-07 via JACCL_TRACE_PROGRESS=1: rank 1 stalled
+  // in drain_acks of coord call 4 because its ACK_RECV was posted
+  // microseconds AFTER rank 0's ACK_SEND arrived → UC silently
+  // dropped the byte. Pre-posting on a separate QP fixes this
+  // structurally.
+  std::vector<Connection> ack_connections_;
   // Tiny per-peer ack buffer (4 bytes). Used by MeshImpl's
   // end-of-lambda ack barrier — see ack_sync() in mesh_impl.h.
   // Without that barrier, in_flight==0 only proves OUR side
