@@ -1480,14 +1480,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
-  // Threshold lowered from B>=16,B/E>=4 to B>=8 (no B/E gate). At c=2
-  // batched decode (DSv4 MoE: B=12=2tokens*topk6, E=64), the original
-  // gates failed and dispatched gather_qmv with bn=8/bk=32 small tiles,
-  // ~6K threadgroups for one switch_mlp call. The fast path batches into
-  // ~B large tiles (bm=16,bn=32,bk=32) — net less dispatch overhead and
-  // better cache reuse. B>=8 keeps c=1 (B=topk=6) on the existing slow
-  // path so the change is scoped to c>=2 in the worst case.
-  if (M == 1 && B >= 8 && right_sorted_ == true) {
+  // TODO: Tune 16 and 4 here a bit better.
+  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
