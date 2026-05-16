@@ -51,27 +51,6 @@ void Event::signal(Stream stream) {
     command_buffer->encodeSignalEvent(
         static_cast<MTL::Event*>(event_.get()), value());
     command_buffer->addCompletedHandler([*this](MTL::CommandBuffer*) {});
-    // exo-mlx-tune (2026-05-16): commit the command buffer immediately
-    // after attaching a signal event. Without this commit, the buffer
-    // (with the signal embedded) sits unsubmitted until CommandEncoder
-    // sees enough subsequent ops/bytes to trigger needs_commit(). On
-    // M4 Max with EXO_MAX_ACTIVE_TASKS=5, this can leave the signal
-    // sitting behind 4+ queued command buffers, deferring its firing
-    // by 5-15 ms. The CPU stream worker, blocked in
-    // waitUntilSignaledValue() inside Event::wait(), then can't start
-    // a downstream distributed all_reduce until the signal fires —
-    // RDMA send-post is delayed, peer's CQE arrives ~10ms late, and
-    // we see the asymmetric "bistable stall" diagnosed on DSv4 MTP
-    // γ=2 100K c=1 decode: clean 32 t/s flips to stalled 6 t/s
-    // depending on whether the queue happens to be shallow or deep
-    // when the iter starts.
-    //
-    // Forcing commit here makes signal latency proportional to GPU
-    // compute time, not queue depth, which decouples it from the
-    // bistability mechanism. Trade-off: more commit() calls means
-    // more, smaller command buffers — slight loss in batch efficiency
-    // for in-process GPU work. Acceptable trade vs the stall.
-    encoder.commit();
   }
 }
 
