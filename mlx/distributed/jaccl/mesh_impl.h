@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <mach/mach_time.h>
 
 #include "mlx/distributed/jaccl/utils.h"
 
@@ -26,6 +27,60 @@ inline bool jaccl_progress_enabled() {
     checked = true;
   }
   return enabled;
+}
+
+// Poll-loop instrumentation gated on JACCL_POLL_INSTRUMENT=1.
+//
+// Captures per-call statistics that distinguish thread-was-not-scheduled
+// (Mach RT class would fix) from time-spent-inside-driver (Mach RT class
+// CANNOT fix; the stall is in librdma/Apple kernel). For each poll call
+// we record:
+//   total_wall_us       — total elapsed time of the while-loop
+//   total_iters         — how many times the loop body ran
+//   iters_with_cqes     — iterations where ibv_poll_cq returned ≥ 1 CQE
+//   wall_us_in_poll     — cumulative time spent INSIDE ibv_poll_cq
+//   max_single_poll_us  — slowest single ibv_poll_cq call
+//
+// If wall_us_in_poll ≈ total_wall_us, the thread WAS running the poll
+// continuously — time vanished inside the driver. Mach RT (already
+// tested 2026-05-16 and FAILED to fix the stall) cannot help here.
+//
+// If wall_us_in_poll ≪ total_wall_us, the thread was descheduled
+// between iterations. Mach RT should have fixed this.
+//
+// If max_single_poll_us is in the seconds range, librdma is blocking
+// inside ibv_poll_cq for some reason (driver lock, NIC interrupt
+// coalescing, etc).
+//
+// Emits one stderr line per call whose total_wall_us exceeds
+// JACCL_POLL_INSTRUMENT_THRESHOLD_US (default 100000 = 100 ms).
+inline bool jaccl_poll_instrument_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("JACCL_POLL_INSTRUMENT");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return v;
+}
+
+inline uint64_t jaccl_poll_instrument_threshold_us() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("JACCL_POLL_INSTRUMENT_THRESHOLD_US");
+    if (e == nullptr) return (uint64_t)100000;
+    char* end = nullptr;
+    unsigned long long n = std::strtoull(e, &end, 10);
+    return (end == e) ? (uint64_t)100000 : (uint64_t)n;
+  }();
+  return v;
+}
+
+inline uint64_t mach_ticks_to_us(uint64_t ticks) {
+  static const mach_timebase_info_data_t tbi = [] {
+    mach_timebase_info_data_t t;
+    mach_timebase_info(&t);
+    return t;
+  }();
+  // ticks * numer / denom = nanoseconds; / 1000 = microseconds.
+  return (ticks * tbi.numer) / (tbi.denom * 1000ULL);
 }
 
 class MeshImpl {
@@ -118,9 +173,15 @@ class MeshImpl {
     //
     // Keep going until we have no longer data in flight.
     int _poll_iters = 0;
+    // Instrumentation locals — zero-cost when JACCL_POLL_INSTRUMENT off.
+    bool _instr = jaccl_poll_instrument_enabled();
+    uint64_t _instr_t0 = _instr ? mach_absolute_time() : 0;
+    uint64_t _instr_total_in_poll_ticks = 0;
+    uint64_t _instr_max_single_poll_ticks = 0;
+    uint64_t _instr_iters_with_cqes = 0;
     while (in_flight > 0) {
+      ++_poll_iters;
       if (_prog) {
-        ++_poll_iters;
         // Log only the first few + every 1M iterations so we don't
         // drown the wedge in noise but still see progress when stuck.
         if (_poll_iters <= 4 || (_poll_iters % 1000000) == 0) {
@@ -143,7 +204,14 @@ class MeshImpl {
       // If a receive is completed then advance the pointer of completed
       // receives.
       ibv_wc wc[WC_NUM];
+      uint64_t _instr_poll_start = _instr ? mach_absolute_time() : 0;
       int n = poll(connections_, WC_NUM, wc);
+      if (_instr) {
+        uint64_t _dt = mach_absolute_time() - _instr_poll_start;
+        _instr_total_in_poll_ticks += _dt;
+        if (_dt > _instr_max_single_poll_ticks) _instr_max_single_poll_ticks = _dt;
+        if (n > 0) ++_instr_iters_with_cqes;
+      }
       for (int i = 0; i < n; i++) {
         // Diagnostic: catch any non-success completion or any RECV
         // whose byte_len doesn't match the buffer size we posted.
@@ -252,6 +320,27 @@ class MeshImpl {
           call_id,
           _poll_iters);
       std::fflush(stderr);
+    }
+    if (_instr) {
+      uint64_t total_wall_us = mach_ticks_to_us(mach_absolute_time() - _instr_t0);
+      if (total_wall_us > jaccl_poll_instrument_threshold_us()) {
+        uint64_t in_poll_us = mach_ticks_to_us(_instr_total_in_poll_ticks);
+        uint64_t max_poll_us = mach_ticks_to_us(_instr_max_single_poll_ticks);
+        std::fprintf(
+            stderr,
+            "[jaccl-instr] all_reduce SLOW rank=%d call_id=%u total_wall_us=%llu "
+            "iters=%d iters_with_cqes=%llu in_poll_us=%llu (=%llu%% of wall) "
+            "max_single_poll_us=%llu\n",
+            rank_,
+            call_id,
+            (unsigned long long)total_wall_us,
+            _poll_iters,
+            (unsigned long long)_instr_iters_with_cqes,
+            (unsigned long long)in_poll_us,
+            (unsigned long long)(total_wall_us > 0 ? (in_poll_us * 100ULL / total_wall_us) : 0),
+            (unsigned long long)max_poll_us);
+        std::fflush(stderr);
+      }
     }
     ack_sync_post(call_id);
     if (_prog) {
