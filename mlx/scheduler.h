@@ -15,11 +15,6 @@
 
 #if defined(__APPLE__)
 #include <pthread/qos.h>
-#include <mach/mach_init.h>
-#include <mach/mach_port.h>
-#include <mach/mach_time.h>
-#include <mach/thread_act.h>
-#include <mach/thread_policy.h>
 #endif
 
 #include "mlx/api.h"
@@ -74,86 +69,6 @@ struct StreamThread {
     }();
     if (qos_class != -1) {
       pthread_set_qos_class_self_np((qos_class_t)qos_class, 0);
-    }
-
-    // exo-mlx-tune: Mach real-time time-constraint thread policy.
-    //
-    // Background: USER_INTERACTIVE QoS is a hint, not a hard pin.
-    // Under prefill GPU-enqueue contention the macOS scheduler still
-    // preempts the comm-stream worker thread mid-busy-poll, producing
-    // the asymmetric JACCL stalls diagnosed 2026-05-15 (one rank's
-    // poll_iters in 5-28M while peer rank polls 1-10 for the same
-    // call_id; hardware CQE was ready, the poll thread just wasn't
-    // running).
-    //
-    // THREAD_TIME_CONSTRAINT_POLICY is the real-time class macOS
-    // uses for CoreAudio HAL threads — the OS will NOT preempt a
-    // thread in this class during its computation window. It's a
-    // hard contract: "give me <computation> µs of CPU within
-    // <constraint> µs of the trigger, do not deschedule."
-    //
-    // We're not periodic, so period=0. The computation budget should
-    // exceed typical all_reduce CPU wall (a few hundred µs for the
-    // 1 MB main-model TP all_sums) but not be so large that the
-    // scheduler refuses to admit us. constraint = computation +
-    // tolerance.
-    //
-    // Defaults: computation=500µs, constraint=2000µs. Tunable via
-    // env (microseconds): MLX_STREAM_RT_COMPUTATION_US,
-    // MLX_STREAM_RT_CONSTRAINT_US, MLX_STREAM_RT_PERIOD_US.
-    //
-    // Set MLX_STREAM_RT=1 to enable. Off by default (RT priority
-    // is system-wide; if the contract numbers are wrong it can starve
-    // other threads).
-    static const bool rt_enabled = [] {
-      const char* v = std::getenv("MLX_STREAM_RT");
-      return v != nullptr && v[0] == '1' && v[1] == '\0';
-    }();
-    if (rt_enabled) {
-      // Cache the timebase ratio (ns → mach absolute time units).
-      static const mach_timebase_info_data_t tbi = [] {
-        mach_timebase_info_data_t t;
-        mach_timebase_info(&t);
-        return t;
-      }();
-      auto us_to_abs = [](uint64_t us) -> uint32_t {
-        // abs = ns * denom / numer; convert µs first.
-        return static_cast<uint32_t>((us * 1000ULL * tbi.denom) / tbi.numer);
-      };
-      auto getenv_us = [](const char* name, uint64_t dflt) -> uint64_t {
-        const char* v = std::getenv(name);
-        if (v == nullptr) return dflt;
-        char* end = nullptr;
-        unsigned long long n = std::strtoull(v, &end, 10);
-        return (end == v) ? dflt : static_cast<uint64_t>(n);
-      };
-
-      thread_time_constraint_policy_data_t policy;
-      policy.period = us_to_abs(getenv_us("MLX_STREAM_RT_PERIOD_US", 0));
-      policy.computation = us_to_abs(getenv_us("MLX_STREAM_RT_COMPUTATION_US", 500));
-      policy.constraint = us_to_abs(getenv_us("MLX_STREAM_RT_CONSTRAINT_US", 2000));
-      policy.preemptible = TRUE; // IGNORED per docs, but set for clarity.
-
-      mach_port_t self_port = mach_thread_self();
-      kern_return_t kr = thread_policy_set(
-          self_port,
-          THREAD_TIME_CONSTRAINT_POLICY,
-          reinterpret_cast<thread_policy_t>(&policy),
-          THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-      mach_port_deallocate(mach_task_self(), self_port);
-      if (kr != KERN_SUCCESS) {
-        std::fprintf(
-            stderr,
-            "[mlx scheduler] thread_policy_set(TIME_CONSTRAINT) failed: kr=%d "
-            "(period=%u computation=%u constraint=%u abs-units)\n",
-            kr,
-            policy.period,
-            policy.computation,
-            policy.constraint);
-        std::fflush(stderr);
-        // Non-fatal: fall through; if RT setup failed the worker
-        // still runs under whatever QoS was set above.
-      }
     }
 #endif
     while (true) {
