@@ -91,6 +91,11 @@ class MLX_API CommandEncoder {
   void barrier();
   void end_encoding();
   bool needs_commit() const;
+  // Accessor for MLX_SIGNAL_PROBE diagnostic: how many ops are accumulated
+  // in the current command buffer. Cheap (single int read), no side effects.
+  int buffer_ops() const {
+    return buffer_ops_;
+  }
   void commit();
   void synchronize();
 
