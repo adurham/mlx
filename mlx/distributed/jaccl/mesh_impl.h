@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
-#include <unistd.h>
 
 #include "mlx/distributed/jaccl/utils.h"
 
@@ -27,49 +26,6 @@ inline bool jaccl_progress_enabled() {
     checked = true;
   }
   return enabled;
-}
-
-// Stall-mitigation backoff: after N busy-poll iterations on a single
-// all_reduce/all_gather/send/recv/ack_sync call with no completion,
-// switch to usleep(1) between polls. Bounds the worst-case wall
-// time when the macOS scheduler deschedules the comm-stream thread
-// mid-poll (the asymmetric-stall pattern diagnosed 2026-05-15:
-// JACCL_TRACE_PROGRESS captured one rank polling 5-28M iterations
-// while the peer rank completed the same call_id in 1-10 iters,
-// indicating the hardware CQE was already ready but the poll thread
-// was simply not scheduled. See references/mtp-poll-stall-diagnosis.md
-// in the exo-cluster-operations skill for the full forensics and
-// the explanation of why the proper fix — completion-channel-based
-// kernel events via ibv_req_notify_cq + ibv_get_cq_event — is
-// blocked on macOS Thunderbolt RDMA: librdma.dylib ships the
-// symbols but ibv_req_notify_cq returns 102 (ENOTSOCK) and
-// comp_channel.fd is permanently POLLIN|POLLHUP.
-//
-// Threshold default 100,000 iters ≈ 1-10 ms of busy-poll at typical
-// rate. Normal CQE arrival on local Thunderbolt RDMA completes in
-// 1-10 iters; anything above 100K is structurally a stall, not
-// regular hardware latency. usleep(1) on macOS has ~10-50 µs minimum
-// granularity so once backoff engages, the poll rate drops by ~100x
-// — that's the point. It bounds the runaway tail at usleep_us *
-// iters-after-threshold instead of unbounded scheduler quantum.
-//
-// Set JACCL_STALL_BACKOFF_THRESHOLD=0 to disable entirely (revert
-// to pure busy-poll). Set to a different positive integer to tune.
-inline int jaccl_stall_backoff_threshold() {
-  static const int v = [] {
-    const char* e = std::getenv("JACCL_STALL_BACKOFF_THRESHOLD");
-    if (e == nullptr) return 100000;
-    int n = std::atoi(e);
-    return n < 0 ? 0 : n;
-  }();
-  return v;
-}
-
-inline void jaccl_maybe_backoff(int iters) {
-  static const int thresh = jaccl_stall_backoff_threshold();
-  if (thresh > 0 && iters > thresh) {
-    usleep(1);
-  }
 }
 
 class MeshImpl {
@@ -163,9 +119,8 @@ class MeshImpl {
     // Keep going until we have no longer data in flight.
     int _poll_iters = 0;
     while (in_flight > 0) {
-      ++_poll_iters;  // always count for stall backoff (cheap int incr)
-      jaccl_maybe_backoff(_poll_iters);
       if (_prog) {
+        ++_poll_iters;
         // Log only the first few + every 1M iterations so we don't
         // drown the wedge in noise but still see progress when stuck.
         if (_poll_iters <= 4 || (_poll_iters % 1000000) == 0) {
@@ -350,10 +305,7 @@ class MeshImpl {
     // Main loop
     //
     // Keep going until we have no longer data in flight.
-    int _poll_iters = 0;
     while (in_flight > 0) {
-      ++_poll_iters;
-      jaccl_maybe_backoff(_poll_iters);
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
@@ -443,10 +395,7 @@ class MeshImpl {
     }
 
     // Main loop
-    int _poll_iters = 0;
     while (in_flight > 0) {
-      ++_poll_iters;
-      jaccl_maybe_backoff(_poll_iters);
       // Poll the hardware for completions.
       //
       // If a send was completed and we have more data to send then go ahead
@@ -494,10 +443,7 @@ class MeshImpl {
     }
 
     // Main loop
-    int _poll_iters = 0;
     while (in_flight > 0) {
-      ++_poll_iters;
-      jaccl_maybe_backoff(_poll_iters);
       // Poll the hardware for completions.
       //
       // If a recv was completed copy it to the output and if we have more
@@ -687,9 +633,8 @@ class MeshImpl {
     int need_send = in_flight / 2;
     int need_recv = in_flight / 2;
     while (need_send > 0 || need_recv > 0) {
-      ++_iters;
-      jaccl_maybe_backoff(_iters);
       if (_prog) {
+        ++_iters;
         if (_iters <= 4 || (_iters % 1000000) == 0) {
           std::fprintf(
               stderr,
@@ -842,10 +787,7 @@ class MeshImpl {
       connections_[peer].post_send(
           sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
     }
-    int _poll_iters = 0;
     while (in_flight > 0) {
-      ++_poll_iters;
-      jaccl_maybe_backoff(_poll_iters);
       ibv_wc wc[16];
       int n = poll(connections_, 16, wc);
       for (int i = 0; i < n; i++) {
