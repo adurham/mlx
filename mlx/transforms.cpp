@@ -39,6 +39,18 @@ static int MAX_ACTIVE_TASKS = []() {
   return 10;
 }();
 
+// MLX_EAGER_COMMIT_BEFORE_CPU_COLLECTIVE=1: when a CPU primitive depends
+// on an array whose producing event lives on a GPU stream, force an
+// immediate gpu::finalize() of that GPU stream before waiting on the
+// event. Commits the pending Metal command buffer so the encoded signal
+// fires as soon as the GPU drains it, instead of waiting for mlx's
+// batched commit. Targets the bistable stall in distributed AllReduce
+// where peer ibv_post_send was gated on a delayed signal. Default off.
+static bool EAGER_COMMIT_BEFORE_CPU_COLLECTIVE = []() {
+  const char* env = std::getenv("MLX_EAGER_COMMIT_BEFORE_CPU_COLLECTIVE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}();
+
 namespace {
 
 // Create a tracer copy of a primal for use in vjp/jvp. If the primal is a
@@ -264,6 +276,15 @@ array eval_impl(std::vector<array> outputs, bool async) {
         if (in.event().is_signaled()) {
           in.detach_event();
         } else if (in.event().stream() != stream) {
+          // Optionally force-commit the producing GPU stream so the
+          // shared-event signal isn't blocked behind mlx's batched
+          // command-buffer commit. Only when the consumer primitive is
+          // on a CPU stream (e.g. distributed AllReduce).
+          if (EAGER_COMMIT_BEFORE_CPU_COLLECTIVE &&
+              stream.device == Device::cpu &&
+              in.event().stream().device == Device::gpu) {
+            gpu::finalize(in.event().stream());
+          }
           // Use event to wait across async eval
           in.event().wait(stream);
         }
