@@ -571,8 +571,29 @@ class MeshImpl {
   // peer received. So our lambda can return before peer's lambda has
   // reached its main-loop exit. The ack barrier closes that window.
   void ack_sync_pre(uint32_t call_id) {
-    // Caller has already posted ack_recvs as the FIRST recv WRs.
-    // Now post our ack_sends and wait for both completions per peer.
+    // Fast-skip path: when the immediately-preceding collective on this
+    // MeshGroup was its own ack_sync_post, the cross-rank barrier the
+    // pre would re-establish is already in place. See post_chain_valid_
+    // docstring for the invariant chain. Env-gated; defaults OFF.
+    if (ack_pre_fastskip_enabled_ == -1) {
+      const char* env = std::getenv("EXO_JACCL_ACK_PRE_FASTSKIP");
+      ack_pre_fastskip_enabled_ =
+          (env != nullptr && env[0] == '1') ? 1 : 0;
+    }
+    if (ack_pre_fastskip_enabled_ == 1 &&
+        post_chain_valid_ &&
+        last_post_call_id_ + 1 == call_id) {
+      // Contiguous predecessor was ack_sync_post for call_id - 1.
+      // Prior post already proved peer drained AND posted recv-state.
+      // Skip the round-trip.
+      return;
+    }
+
+    // Slow path: re-establish the barrier explicitly. Caller has
+    // already posted ack_recvs as the FIRST recv WRs (top-level: via
+    // ack_sync_post on prior call which posted them; dedicated ACK QP:
+    // via post_ack_recvs pool). Now post our ack_sends and wait for
+    // both completions per peer.
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers;
     for (int peer = 0; peer < size_; peer++) {
@@ -638,6 +659,11 @@ class MeshImpl {
           call_id);
       std::fflush(stderr);
     }
+
+    // Mark the chain invariant: a subsequent ack_sync_pre for
+    // call_id+1 can skip its own round-trip (see ack_pre_fastskip).
+    last_post_call_id_ = call_id;
+    post_chain_valid_ = true;
   }
 
   void drain_acks(uint32_t call_id, int in_flight) {
@@ -910,6 +936,27 @@ class MeshImpl {
   // WR for these — the buffer is consumed; we just owe the future call
   // a "barrier passed" signal.
   std::vector<int> cached_ack_recvs_;
+
+  // Optimization: skip the ack_sync_pre cross-rank barrier when the
+  // immediately-preceding collective on this MeshGroup was its own
+  // ack_sync_post. In steady-state (e.g. the chain of 86 all_reduce
+  // calls in the DSv4 verify forward), the prior call's ack_sync_post
+  // already established the invariants ack_sync_pre re-establishes:
+  //   - Both ranks drained the prior call (post's drain_acks proved it).
+  //   - Peer has a posted ACK_RECV WR (top-level path: post posts a
+  //     fresh one at line 614-617; dedicated ACK QP: pool stays full
+  //     via drain_acks's replenish at line 705-711).
+  // The pre is only genuinely needed at chain boundaries: first call
+  // after MeshGroup ctor, or when something non-collective could have
+  // happened on the QP between calls. Contiguous call_ids on the same
+  // MeshGroup is a precise sufficient condition (call_id is monotonic
+  // per MeshGroup at MeshGroup::next_call_id_).
+  //
+  // Env-gated via EXO_JACCL_ACK_PRE_FASTSKIP=1. Initialized lazily on
+  // first ack_sync_pre call so MeshImpl default-ctor stays trivial.
+  uint32_t last_post_call_id_ = 0;
+  bool post_chain_valid_ = false;
+  signed char ack_pre_fastskip_enabled_ = -1; // -1 = uninit, 0 = off, 1 = on
 };
 
 } // namespace mlx::core::distributed::jaccl
