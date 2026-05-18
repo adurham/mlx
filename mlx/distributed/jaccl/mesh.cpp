@@ -31,19 +31,42 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Top-level groups (color=0) skip the dedicated ACK QP. Their data
-  // QP traffic is uniform-size-class (model TP all_sums all use
-  // FRAME_SIZE buffers), so the cross-call FIFO mismatch that
-  // motivated the ACK QP fix doesn't manifest here. Falling back to
-  // the original ack_sync_post (post recv+send inline on data QP,
-  // drain from data CQ) eliminates the ~6ms/forward overhead from
-  // the separate ACK CQ poll at BS=2 hot path.
+  // 2026-05-17 PM: restore dedicated ACK QP for top-level groups too.
   //
-  // ack_connections_ left empty → MeshImpl::ack_sync_post / drain_acks
-  // fall back to the original data-QP path. Subgroups created via
-  // split() build their own ack_connections_ in the other ctor —
-  // those NEED the dedicated ACK QP because coord-vs-master call_id
-  // race was the original wedge.
+  // The previous comment (commit 95b1d8d6) argued top-level groups
+  // could safely use the legacy inline-ack-on-data-QP path because
+  // their traffic is uniform-FRAME_SIZE so cross-call FIFO mismatch
+  // wouldn't manifest. That reasoning missed the in-call race:
+  // ack_sync_post()'s legacy branch (mesh_impl.h:584-599) posts the
+  // ACK_RECV WR *after* the data drain completes. On UC QPs (no
+  // retransmit), if peer's ACK_SEND arrives in the window between
+  // drain-done and recv-posted, it is silently dropped, drain_acks
+  // spins forever on a strict per-call_id filter (mesh_impl.h:690-693),
+  // and the collective_mutex_ wedges the cluster until the iter is
+  // abandoned. This is the structural mechanism behind the residual
+  // gamma>=2 MTP bistability: the chained-collective depth in the
+  // draft path multiplies the per-call race opportunities until one
+  // hits.
+  //
+  // The dedicated ACK QP path (subgroups have it via the split() ctor
+  // below) pre-posts a pool of ACK_RECV WRs at QP-RTS time
+  // (post_ack_recvs called below), replenishes them as they consume,
+  // and stashes early-arrival CQEs into cached_ack_recvs_
+  // (mesh_impl.h:679-686). No race window, no permanent off-by-one.
+  //
+  // The 6ms/forward overhead claim that motivated 95b1d8d6 predated
+  // the ACK pool deepening to 64 (commit 44d1c40b) and CQ-256 sizing.
+  // Actual cost is one extra ibv_poll_cq on a CQ already sized for
+  // batch drain -- tens of microseconds, not milliseconds. Net win:
+  // eliminate the bistability for a non-measurable perf cost.
+  //
+  // Each ack-connection borrows its peer's data-connection ibv_context
+  // (owns_ctx=false) -- the data Connection owns the ctx lifecycle,
+  // the ack Connection just opens its own PD/CQ/QP on top.
+  ack_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
 
   // Initialize all the connections and allocate buffers. Top-level
   // groups exchange QP destinations directly over their own side
@@ -73,8 +96,9 @@ MeshGroup::MeshGroup(
       ring_send_buffers_,
       ring_recv_buffers_);
 
-  // No-op when ack_connections_ is empty — top-level group uses the
-  // original inline ack_sync_post and doesn't need pre-posted recvs.
+  // Pre-post ACK_RECVs into the dedicated ACK QPs so peer's ACK_SEND
+  // never arrives at an empty recv FIFO. Same call as the subgroup
+  // ctor below.
   mesh_.post_ack_recvs(0);
 
   open_trace_file_if_enabled();
