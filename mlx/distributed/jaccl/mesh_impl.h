@@ -586,7 +586,21 @@ class MeshImpl {
       // Contiguous predecessor was ack_sync_post for call_id - 1.
       // Prior post already proved peer drained AND posted recv-state.
       // Skip the round-trip.
+      fastskip_hit_count_++;
+      if ((fastskip_hit_count_ + fastskip_miss_count_) % 500 == 0) {
+        std::fprintf(stderr,
+            "[ack-fastskip] rank=%d hits=%llu misses=%llu hit_rate=%.3f\n",
+            rank_,
+            (unsigned long long)fastskip_hit_count_,
+            (unsigned long long)fastskip_miss_count_,
+            (double)fastskip_hit_count_ /
+                (double)(fastskip_hit_count_ + fastskip_miss_count_));
+        std::fflush(stderr);
+      }
       return;
+    }
+    if (ack_pre_fastskip_enabled_ == 1) {
+      fastskip_miss_count_++;
     }
 
     // Slow path: re-establish the barrier explicitly. Caller has
@@ -957,6 +971,8 @@ class MeshImpl {
   uint32_t last_post_call_id_ = 0;
   bool post_chain_valid_ = false;
   signed char ack_pre_fastskip_enabled_ = -1; // -1 = uninit, 0 = off, 1 = on
+  uint64_t fastskip_hit_count_ = 0;
+  uint64_t fastskip_miss_count_ = 0;
 };
 
 } // namespace mlx::core::distributed::jaccl
