@@ -87,6 +87,17 @@ class MeshImpl {
     int completed_recv_begin[MESH_MAX_PEERS] = {0};
     int completed_recv_end[MESH_MAX_PEERS] = {0};
 
+    // Start-of-lambda cross-rank barrier on the dedicated ACK QP.
+    // Confirms peer has entered THIS call before we post our first
+    // data send. Without it, the inter-lambda window is an empty
+    // recv-queue on UC -> silent drop -> permanent wedge in the
+    // in_flight>0 poll. See ack_sync_pre doc above. The pre-posted
+    // ACK_RECV pool (post_ack_recvs at MeshGroup ctor) and the
+    // sentinel-call_id replenish path in drain_acks keep the ACK QP
+    // recv queue full across lambdas, so ack_sync_pre always finds
+    // a posted recv on peer's side.
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
@@ -287,6 +298,9 @@ class MeshImpl {
     int completed_send_count[PIPELINE] = {0};
     int write_offset[MESH_MAX_PEERS] = {0};
 
+    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
@@ -380,6 +394,9 @@ class MeshImpl {
     int in_flight = 0;
     int64_t read_offset = 0;
 
+    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < n_bytes && buff < PIPELINE) {
@@ -432,6 +449,9 @@ class MeshImpl {
 
     int in_flight = 0;
     int64_t write_offset = 0;
+
+    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+    ack_sync_pre(call_id);
 
     // Prefill the pipeline
     int buff = 0;
