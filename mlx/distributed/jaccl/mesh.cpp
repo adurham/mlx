@@ -101,6 +101,16 @@ MeshGroup::MeshGroup(
   // ctor below.
   mesh_.post_ack_recvs(0);
 
+  // Bootstrap barrier: guarantee both ranks have completed
+  // post_ack_recvs(0) before any rank can return from the ctor and
+  // issue its first ack_sync_pre. Without this, RANK_A can return
+  // first, fire its first lambda's ack_sync_pre, post ACK_SEND to
+  // RANK_B's still-empty ACK recv queue, UC silently drops the
+  // ACK_SEND, and both ranks wedge. Cheap: one TCP all_gather of one
+  // int, called once per group lifetime. Closes the warmup-decode
+  // hang that broke b87bddd6 and reappears with ce5c64fd.
+  side_channel_->all_gather<int>(0);
+
   open_trace_file_if_enabled();
 }
 
@@ -192,6 +202,18 @@ MeshGroup::MeshGroup(
   // The exchange callback above already barriers via the parent's
   // SideChannel, so QPs are RTS on both ranks before we get here.
   mesh_.post_ack_recvs(0);
+
+  // Bootstrap barrier: same rationale as the top-level ctor — without
+  // a barrier AFTER post_ack_recvs(0), RANK_A can return from this
+  // ctor first, fire its first ack_sync_pre on the subgroup, and
+  // post ACK_SEND to RANK_B's still-empty ACK recv queue (UC silent
+  // drop → wedge). The exchange() callback uses the parent's
+  // SideChannel under the parent's collective_mutex_, mirroring the
+  // QP-destination exchange calls above. Sentinel payload: one
+  // default-constructed Destination per rank (the lambda's contract
+  // is "all-gather this vector"; size=1 is the smallest non-empty
+  // payload that avoids any zero-length socket path).
+  (void)exchange(std::vector<Destination>{Destination{}});
 
   open_trace_file_if_enabled();
 }

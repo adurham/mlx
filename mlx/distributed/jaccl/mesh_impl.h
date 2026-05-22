@@ -29,6 +29,33 @@ inline bool jaccl_progress_enabled() {
   return enabled;
 }
 
+// Pre-lambda ack barrier gate. Default OFF.
+//
+// ce5c64fd added `ack_sync_pre()` calls at the top of every collective
+// lambda (all_reduce, all_gather, send, recv) to close the inter-lambda
+// race window where peer SEND lands at our empty data-QP recv FIFO and
+// UC silently drops. The protocol fix is sound in principle but the
+// cluster bench post-c=1 100K MTP-on γ=2 (commit-author's own data)
+// showed only ~17% → ~12.5% stall rate reduction — bimodality
+// persisted. At c=2 (2× payload per collective) deploying it ALONE
+// (without the bootstrap barrier in MeshGroup ctor) made things worse
+// (33.93 → 15.30 agg t/s iter 0, MTP acceptance crashed). And with
+// the bootstrap barrier in place it wedges warmup (the bootstrap fix
+// closes the ctor race but does not validate the call_id-keyed
+// recv-FIFO machinery is rock-solid). So gate it behind a runtime env
+// so the cluster can A/B test it once bootstrap is healthy. Default
+// OFF preserves the existing (post-Plan-A) baseline.
+inline bool jaccl_ack_sync_pre_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char* e = std::getenv("MLX_JACCL_ACK_SYNC_PRE");
+    enabled = (e != nullptr && e[0] == '1' && e[1] == '\0');
+    checked = true;
+  }
+  return enabled;
+}
+
 // Poll-loop instrumentation gated on JACCL_POLL_INSTRUMENT=1.
 //
 // Captures per-call statistics that distinguish thread-was-not-scheduled
@@ -151,7 +178,9 @@ class MeshImpl {
     // sentinel-call_id replenish path in drain_acks keep the ACK QP
     // recv queue full across lambdas, so ack_sync_pre always finds
     // a posted recv on peer's side.
-    ack_sync_pre(call_id);
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
 
     // Prefill the pipeline
     int buff = 0;
@@ -388,7 +417,9 @@ class MeshImpl {
     int write_offset[MESH_MAX_PEERS] = {0};
 
     // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
-    ack_sync_pre(call_id);
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
 
     // Prefill the pipeline
     int buff = 0;
@@ -484,7 +515,9 @@ class MeshImpl {
     int64_t read_offset = 0;
 
     // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
-    ack_sync_pre(call_id);
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
 
     // Prefill the pipeline
     int buff = 0;
@@ -540,7 +573,9 @@ class MeshImpl {
     int64_t write_offset = 0;
 
     // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
-    ack_sync_pre(call_id);
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
 
     // Prefill the pipeline
     int buff = 0;
@@ -660,6 +695,15 @@ class MeshImpl {
   // peer received. So our lambda can return before peer's lambda has
   // reached its main-loop exit. The ack barrier closes that window.
   void ack_sync_pre(uint32_t call_id) {
+    // Symmetric with ack_sync_post's `has_ack` branch: if no dedicated
+    // ACK QP exists (a future code path that doesn't allocate one),
+    // skip the pre-barrier rather than UB on the empty span.
+    // Top-level groups (since 05545d38) and subgroups always populate
+    // ack_connections_; this guard is defensive against future
+    // regressions to the ctor paths.
+    if (ack_connections_.empty()) {
+      return;
+    }
     // Caller has already posted ack_recvs as the FIRST recv WRs.
     // Now post our ack_sends and wait for both completions per peer.
     int num_peers = size_ - 1;
