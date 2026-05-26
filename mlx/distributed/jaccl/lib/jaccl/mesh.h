@@ -2,6 +2,12 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdio>
+#include <functional>
+#include <mutex>
+#include <optional>
+
 #include "jaccl/group.h"
 #include "jaccl/mesh_impl.h"
 #include "jaccl/rdma.h"
@@ -20,10 +26,38 @@ namespace jaccl {
  */
 class MeshGroup : public Group {
  public:
+  // QP-destination exchange callback used by initialize(). Top-level
+  // groups pass a lambda that uses the local SideChannel; subgroups
+  // built by split() pass a lambda that uses the PARENT's SideChannel
+  // under the parent's collective_mutex_.
+  using ExchangeFn =
+      std::function<std::vector<std::vector<Destination>>(
+          const std::vector<Destination>&)>;
+
   MeshGroup(
       int rank,
       const std::vector<std::string>& device_names,
       const std::string& coordinator_addr);
+
+  // Subgroup ctor used by split(). Builds Connections that BORROW the
+  // parent's per-peer ibv_context (one open per device on the system —
+  // macOS librdma's second ibv_open_device on the same device does
+  // not return a fully-isolated context), then runs the same init as
+  // the top-level path: allocate PD/CQ/QP per peer, register MRs to
+  // those PDs (via allocate_buffers), then INIT/RTR/RTS the QPs with
+  // destinations exchanged through `exchange` (which the caller wires
+  // up to the parent's SideChannel under the parent's collective
+  // mutex). The order is critical: register MRs BEFORE INIT/RTR/RTS,
+  // since macOS librdma locks the QP's MR table at the INIT
+  // transition.
+  MeshGroup(
+      int rank,
+      int size,
+      std::vector<ibv_context*> ctxs,
+      std::vector<std::string> device_names,
+      bool owns_ctxs,
+      const ExchangeFn& exchange,
+      int color = 0);
 
   int rank() override {
     return rank_;
@@ -49,36 +83,53 @@ class MeshGroup : public Group {
 
   void barrier() override;
 
+  // split(color, key) — current implementation requires all ranks to
+  // call with the same color (single subgroup per call). Cannot be called
+  // on a subgroup (subgroup has no SideChannel for the destination exchange).
+  std::shared_ptr<Group> split(int color, int key = -1) override;
+
  private:
   template <typename T, typename ReduceOp>
   void all_reduce(
+      uint32_t call_id,
       const void* input,
       void* output,
       size_t n_bytes,
       ReduceOp reduce_op);
 
-  /**
-   * Performs the connection initialization. Namely, after this call all
-   * Connection objects should have a queue pair in RTS state and all buffers
-   * should have been allocated.
-   */
-  void initialize();
+  void initialize(const ExchangeFn& exchange);
 
-  /**
-   * Allocate all the buffers that we will use in the communication group.
-   */
   void allocate_buffers();
+
+  void open_trace_file_if_enabled();
+  void trace_call(uint32_t call_id, const char* op, int64_t msg_bytes);
+  void trace_hash(uint32_t call_id, const void* data, int64_t n_bytes);
 
   int rank_;
   int size_;
-  SideChannel side_channel_;
+  int color_ = 0;
+  std::optional<SideChannel> side_channel_;
+  std::vector<std::string> device_names_;
   std::vector<Connection> connections_;
+  std::vector<Connection> ack_connections_;
+  std::vector<SharedBuffer> ack_send_buffers_;
+  std::vector<SharedBuffer> ack_recv_buffers_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;
 
   MeshImpl mesh_;
   RingImpl ring_;
+
+  std::mutex collective_mutex_;
+
+  std::atomic<uint32_t> next_call_id_{1};
+  uint32_t next_call_id() {
+    return next_call_id_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  FILE* trace_file_ = nullptr;
+  bool hash_enabled_ = false;
 };
 
 } // namespace jaccl
