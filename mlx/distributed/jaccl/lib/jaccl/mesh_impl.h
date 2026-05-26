@@ -16,6 +16,23 @@ constexpr int64_t MAX_BUFFER_SIZE = FRAME_SIZE * (1 << (BUFFER_SIZES - 1));
 
 namespace jaccl {
 
+// Pre-lambda ack barrier gate. Default OFF.
+//
+// Adds ack_sync_pre() calls at the top of every collective lambda to
+// close the inter-lambda window where peer SEND lands at our empty
+// data-QP recv FIFO and UC silently drops → permanent wedge.
+// Gated behind a runtime env for A/B testing once bootstrap is stable.
+inline bool jaccl_ack_sync_pre_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char* e = std::getenv("MLX_JACCL_ACK_SYNC_PRE");
+    enabled = (e != nullptr && e[0] == '1' && e[1] == '\0');
+    checked = true;
+  }
+  return enabled;
+}
+
 // Per-stage RDMA progress logging gated on JACCL_TRACE_PROGRESS=1.
 // Output goes to stderr. Inline so the gate-check inlines and the
 // branch is dead-code eliminated when the env var is unset (runtime
@@ -143,6 +160,15 @@ class MeshImpl {
     int completed_send_count[PIPELINE] = {0};
     int completed_recv_begin[MESH_MAX_PEERS] = {0};
     int completed_recv_end[MESH_MAX_PEERS] = {0};
+
+    // Start-of-lambda cross-rank barrier on the dedicated ACK QP.
+    // Confirms peer has entered THIS call before we post our first
+    // data send. The pre-posted ACK_RECV pool (post_ack_recvs) and
+    // sentinel-call_id replenish path in drain_acks keep the ACK QP
+    // recv queue full across lambdas.
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
 
     // Prefill the pipeline
     int buff = 0;
@@ -358,6 +384,11 @@ class MeshImpl {
     int completed_send_count[PIPELINE] = {0};
     int write_offset[MESH_MAX_PEERS] = {0};
 
+    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
@@ -446,6 +477,11 @@ class MeshImpl {
     int in_flight = 0;
     int64_t read_offset = 0;
 
+    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < n_bytes && buff < PIPELINE) {
@@ -494,6 +530,11 @@ class MeshImpl {
 
     int in_flight = 0;
     int64_t write_offset = 0;
+
+    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
+    }
 
     // Prefill the pipeline
     int buff = 0;
@@ -582,6 +623,12 @@ class MeshImpl {
   // other recvs in the lambda so the ack is at the head of the QP
   // recv queue and matches peer's ack_send first.
   void ack_sync_pre(uint32_t call_id) {
+    // Defensive guard: skip if no dedicated ACK QP exists. Both
+    // top-level and subgroup groups populate ack_connections_ when
+    // ackqp-net is in effect; this guards against future regressions.
+    if (ack_connections_.empty()) {
+      return;
+    }
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers;
     for (int peer = 0; peer < size_; peer++) {
