@@ -11,14 +11,63 @@
 
 #include "jaccl/tcp.h"
 
+#if defined(__aarch64__) || defined(__arm64__)
+#include <arm_acle.h>
+// Full-system data-synchronization barrier. On ARM (Apple Silicon) the
+// CPU has weak memory ordering and a regular std::copy into a buffer
+// is not guaranteed to be visible to a NIC that reads the same buffer
+// via DMA. Without this barrier, JACCL's send path reads stale bytes
+// (typically leftover bf16 from a prior all_reduce in the same FRAME-
+// sized buffer slot), and the receiver gets float-bit-pattern garbage
+// in what was supposed to be an int message. Same idiom mlx already
+// uses in metal/fence.cpp for CPU<->GPU coherency.
+#define JACCL_DMA_BARRIER() __dsb(0xF)
+#else
+#define JACCL_DMA_BARRIER() ((void)0)
+#endif
+
 constexpr const char* IBV_TAG = "[jaccl]";
 constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
+constexpr int ACK_SEND_WR = 3;
+constexpr int ACK_RECV_WR = 4;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;
 constexpr int NUM_BUFFERS = 2;
 constexpr int FRAME_SIZE = 4096;
+
+// wr_id layout (64 bits):
+//   [63..32]  call_id  — unique per collective invocation on a group
+//   [23..16]  work_type (SEND_WR | RECV_WR | ACK_SEND_WR | ACK_RECV_WR)
+//   [15..8]   buff index (0..NUM_BUFFERS-1)
+//   [7..0]    peer rank or wire index (0..255)
+inline uint64_t make_wr_id(
+    uint32_t call_id,
+    int work_type,
+    int buff,
+    int peer_or_wire) {
+  return (static_cast<uint64_t>(call_id) << 32) |
+      (static_cast<uint64_t>(work_type & 0xff) << 16) |
+      (static_cast<uint64_t>(buff & 0xff) << 8) |
+      static_cast<uint64_t>(peer_or_wire & 0xff);
+}
+
+inline uint32_t wr_id_call_id(uint64_t wr_id) {
+  return static_cast<uint32_t>(wr_id >> 32);
+}
+
+inline int wr_id_work_type(uint64_t wr_id) {
+  return static_cast<int>((wr_id >> 16) & 0xff);
+}
+
+inline int wr_id_buff(uint64_t wr_id) {
+  return static_cast<int>((wr_id >> 8) & 0xff);
+}
+
+inline int wr_id_peer(uint64_t wr_id) {
+  return static_cast<int>(wr_id & 0xff);
+}
 
 namespace {
 
@@ -157,8 +206,10 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
+  bool owns_ctx;
 
   Connection(ibv_context* ctx_);
+  Connection(ibv_context* ctx_, bool owns_ctx_);
   Connection(Connection&& c);
 
   Connection(const Connection&) = delete;
@@ -175,6 +226,11 @@ struct Connection {
   void queue_pair_rts();
 
   void post_send(const SharedBuffer& buff, uint64_t work_request_id) {
+    // Make sure every prior CPU write to `buff` is visible to the NIC
+    // before we hand the buffer over for DMA. Without this, the NIC may
+    // race the CPU and DMA stale bytes.
+    JACCL_DMA_BARRIER();
+
     ibv_send_wr work_request, *bad_work_request;
 
     auto entry = buff.to_scatter_gather_entry(protection_domain);
