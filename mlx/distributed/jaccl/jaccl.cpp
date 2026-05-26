@@ -61,10 +61,37 @@ int dtype_to_jaccl_dtype(Dtype dt) {
 class JACCLGroup : public GroupImpl {
  public:
   JACCLGroup(std::shared_ptr<::jaccl::Group> group)
-      : group_(std::move(group)) {}
+      : group_(std::move(group)),
+        // One shared CPU stream owned by this group. Created once at
+        // construction so every caller thread gets the SAME stream
+        // from communication_stream(); all collectives funnel through
+        // one cpu::CommandEncoder and serialize FIFO.
+        //
+        // Why pinning at all: cpu::get_command_encoder is keyed by
+        // stream.index. If model-attention all_sums dispatch on a
+        // GPU-derived stream and agree_on_tasks runs on the CPU
+        // default stream, those go to different encoder worker
+        // threads. The per-group mutex still serializes mesh_.X()
+        // bodies, but the order in which lambdas reach the mutex is
+        // decided by which encoder thread races faster — which varies
+        // between rank 0 and rank 1. The QP then sees a different
+        // post_send / post_recv interleaving on each rank, and UC's
+        // per-QP FIFO matching corrupts cross-collective sends into
+        // the wrong recv buffers (the c=2+γ=2 MTP corruption
+        // mechanism, surfaced by IBV_WC_LOC_LEN_ERR).
+        //
+        // Pinning to a single owned stream forces one FIFO dispatch
+        // queue per rank; both ranks run the same user code in the
+        // same order, so their queues match. NOT default_stream()
+        // (which is thread_local and produces different streams per
+        // caller thread, defeating the whole point).
+        communication_stream_(new_stream(Device::cpu)) {}
 
   Stream communication_stream(StreamOrDevice s) override {
-    return to_stream(s, Device::cpu);
+    // Always return our pinned stream, ignoring whatever the caller
+    // passed in. See ctor comment for rationale.
+    (void)s;
+    return communication_stream_;
   }
 
   int rank() override {
@@ -158,6 +185,7 @@ class JACCLGroup : public GroupImpl {
 
  private:
   std::shared_ptr<::jaccl::Group> group_;
+  Stream communication_stream_;
 };
 
 } // namespace
