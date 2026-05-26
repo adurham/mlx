@@ -2,7 +2,9 @@
 
 #pragma once
 
-#include <memory>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <span>
 
 #include "jaccl/rdma.h"
@@ -13,32 +15,66 @@ constexpr int64_t MAX_BUFFER_SIZE = FRAME_SIZE * (1 << (BUFFER_SIZES - 1));
 
 namespace jaccl {
 
+// Per-stage RDMA progress logging gated on JACCL_TRACE_PROGRESS=1.
+// Output goes to stderr. Inline so the gate-check inlines and the
+// branch is dead-code eliminated when the env var is unset (runtime
+// check is once per call site, not once per WC).
+inline bool jaccl_progress_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char* e = std::getenv("JACCL_TRACE_PROGRESS");
+    enabled = (e != nullptr && e[0] == '1' && e[1] == '\0');
+    checked = true;
+  }
+  return enabled;
+}
+
 class MeshImpl {
  public:
   MeshImpl(
       int rank,
       int size,
       std::vector<Connection>& conns,
-      std::vector<SharedBuffer>& buffers)
+      std::vector<Connection>& ack_conns,
+      std::vector<SharedBuffer>& buffers,
+      std::vector<SharedBuffer>& ack_send_buffers,
+      std::vector<SharedBuffer>& ack_recv_buffers)
       : rank_(rank),
         size_(size),
         connections_(conns),
+        ack_connections_(ack_conns),
         buffers_(buffers),
-        staging_mem_(
-            std::make_unique<char[]>(MESH_PIPELINE * MAX_BUFFER_SIZE)) {}
+        ack_send_buffers_(ack_send_buffers),
+        ack_recv_buffers_(ack_recv_buffers) {}
 
   MeshImpl() : rank_(0), size_(1) {}
 
   template <typename T, typename ReduceOp>
-  void all_reduce(const T* in, T* out, int64_t size, ReduceOp reduce_op) {
-    // Fully connected all reduce with deterministic reduction order.
-    //
-    // We copy rank 0's data to the output buffer and then we reduce every
-    // subsequent rank in-place in the output.
-    //
-    // Our own data is copied to a staging buffer to ensure we can reduce it in
-    // the output when needed.
+  void all_reduce(
+      uint32_t call_id,
+      const T* in_ptr,
+      T* out_ptr,
+      int64_t size,
+      ReduceOp reduce_op) {
+    bool _prog = jaccl_progress_enabled();
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce ENTER rank=%d call_id=%u size=%lld T_bytes=%zu\n",
+          rank_,
+          call_id,
+          (long long)size,
+          sizeof(T));
+      std::fflush(stderr);
+    }
+    // If not inplace all reduce then copy the input to the output first
+    if (in_ptr != out_ptr) {
+      std::memcpy(out_ptr, in_ptr, size * sizeof(T));
+    }
 
+    // Fully connected all reduce
+    T* data = out_ptr;
     auto [sz, buffer_size] = buffer_size_from_message(size * sizeof(T));
     int64_t N = buffer_size / sizeof(T);
     constexpr int PIPELINE = 2;
@@ -46,74 +82,110 @@ class MeshImpl {
     int64_t total = static_cast<int64_t>(size);
     int num_peers = size_ - 1;
 
-    // A helper for convenient access to the staging buffer.
-    auto local_staging = [&](int buff) -> T* {
-      return reinterpret_cast<T*>(staging_mem_.get() + buff * MAX_BUFFER_SIZE);
-    };
-
     // Counters to maintain the state of transfers
     int in_flight = 0;
     int64_t read_offset = 0;
     int completed_send_count[PIPELINE] = {0};
-    int recv_end[MESH_MAX_PEERS] = {0};
-    int reduce_chunk = 0;
-    int reduce_rank = 0;
-
-    // Total number of chunks
-    int64_t total_chunks = (total + N - 1) / N;
+    int completed_recv_begin[MESH_MAX_PEERS] = {0};
+    int completed_recv_end[MESH_MAX_PEERS] = {0};
 
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(sz, buff);
-
-      // Copy the local data to send buffer and staging buffer
-      int64_t elems = std::min(N, total - read_offset);
+      post_recv_all(call_id, sz, buff);
       std::copy(
-          in + read_offset, in + read_offset + elems, local_staging(buff));
-      std::copy(
-          in + read_offset,
-          in + read_offset + elems,
+          data + read_offset,
+          data + std::min(read_offset + N, total),
           send_buffer(sz, buff).begin<T>());
-      recv_end[rank_]++;
-      post_send_all(sz, buff);
+      post_send_all(call_id, sz, buff);
 
       buff++;
       in_flight += 2 * num_peers;
       read_offset += N;
     }
 
-    // Main loop
-    while (reduce_chunk < total_chunks) {
-      // Poll the hardware for completions.
-      //
-      // If a send was completed mark how many completions we have received
-      // for that buffer. If we have sent the buffer to all peers we can
-      // reuse the send buffer so copy the next chunk of data into it and
-      // post the next send. local_staging is refilled later in the reduce
-      // loop, since the chunk in it may still be needed for the own-rank
-      // reduction step.
-      //
-      // If a receive is completed then advance the pointer of completed
-      // receives.
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce PREFILL_DONE rank=%d call_id=%u in_flight=%d N=%lld total=%lld\n",
+          rank_,
+          call_id,
+          in_flight,
+          (long long)N,
+          (long long)total);
+      std::fflush(stderr);
+    }
+
+    // Main loop: keep going until we have no data in flight.
+    int _poll_iters = 0;
+    while (in_flight > 0) {
+      ++_poll_iters;
+      if (_prog) {
+        if (_poll_iters <= 4 || (_poll_iters % 1000000) == 0) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] all_reduce POLL rank=%d call_id=%u iter=%d in_flight=%d\n",
+              rank_,
+              call_id,
+              _poll_iters,
+              in_flight);
+          std::fflush(stderr);
+        }
+      }
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int work_type = wc[i].wr_id >> 16;
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        // Catch any non-success completion or RECV whose byte_len
+        // doesn't match the buffer size we posted. UC silent-drop of a
+        // foreign-collective send into our recv WR shows up here.
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_reduce wc.status=" << wc[i].status
+              << " wr_id=0x" << std::hex << wc[i].wr_id
+              << " byte_len=" << std::dec << wc[i].byte_len;
+          throw std::runtime_error(msg.str());
+        }
+        if ((wr_id_work_type(wc[i].wr_id) == RECV_WR) &&
+            wc[i].byte_len != static_cast<uint32_t>(buffer_size)) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_reduce recv byte_len=" << wc[i].byte_len
+              << " expected=" << buffer_size << " wr_id=0x" << std::hex
+              << wc[i].wr_id;
+          throw std::runtime_error(msg.str());
+        }
+        // Stale completion from a prior collective: ignore it. Do not
+        // decrement in_flight; that buffer belongs to a call that has
+        // already returned.
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int work_type = wr_id_work_type(wc[i].wr_id);
+        int buff = wr_id_buff(wc[i].wr_id);
+        int rank = wr_id_peer(wc[i].wr_id);
 
         in_flight--;
+
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] all_reduce CQE rank=%d call_id=%u type=%s peer=%d buff=%d in_flight=%d\n",
+              rank_,
+              call_id,
+              work_type == SEND_WR ? "SEND" : "RECV",
+              rank,
+              buff,
+              in_flight);
+          std::fflush(stderr);
+        }
 
         if (work_type == SEND_WR && read_offset < total) {
           completed_send_count[buff]++;
           if (completed_send_count[buff] == num_peers) {
-            int64_t elems = std::min(N, total - read_offset);
             std::copy(
-                in + read_offset,
-                in + read_offset + elems,
+                data + read_offset,
+                data + std::min(read_offset + N, total),
                 send_buffer(sz, buff).begin<T>());
-            post_send_all(sz, buff);
+            post_send_all(call_id, sz, buff);
 
             completed_send_count[buff] = 0;
             in_flight += num_peers;
@@ -122,84 +194,63 @@ class MeshImpl {
         }
 
         else if (work_type == RECV_WR) {
-          recv_end[rank]++;
+          // The NIC has DMA'd into recv_buffer; ensure those writes are
+          // visible to the CPU before we read from the buffer below.
+          JACCL_DMA_BARRIER();
+          completed_recv_end[rank]++;
         }
       }
 
-      // Process the received chunks in order.
+      // Process completed recvs.
       //
-      // Rank 0 is always copied as is. Our rank is always read from the
-      // staging area.
-      while (reduce_chunk < total_chunks) {
-        // w is our write location so break if it is ahead of the read location.
-        int64_t w = static_cast<int64_t>(reduce_chunk) * N;
-        if (w >= read_offset) {
-          break;
-        }
-        // We want to reduce the 'reduce_chunk' chunk but it hasn't arrived
-        // yet.
-        if (recv_end[reduce_rank] <= reduce_chunk) {
-          break;
-        }
-        int b = reduce_chunk % PIPELINE;
-        int64_t elems = std::min(N, total - w);
-
-        // Data is read from the staging area
-        if (reduce_rank == rank_) {
-          if (reduce_rank == 0) {
-            std::copy_n(local_staging(b), elems, out + w);
-          } else {
-            reduce_op(local_staging(b), out + w, elems);
-          }
-
-          // Refill local_staging(b) for the next own-rank chunk and bump
-          // recv_end[rank_] to unblock its reduction.
-          int64_t next_local_chunk =
-              static_cast<int64_t>(reduce_chunk) + PIPELINE;
-          if (next_local_chunk < total_chunks) {
-            int64_t off = next_local_chunk * N;
-            int64_t next_elems = std::min(N, total - off);
-            std::copy(in + off, in + off + next_elems, local_staging(b));
-            recv_end[rank_]++;
-          }
-        }
-
-        // Data is read from the recv buffers
-        else {
-          if (reduce_rank == 0) {
-            std::copy_n(
-                recv_buffer(sz, b, reduce_rank).begin<T>(), elems, out + w);
-          } else {
-            reduce_op(
-                recv_buffer(sz, b, reduce_rank).begin<T>(), out + w, elems);
-          }
-
-          // Check if we need to post another receive
-          int64_t next_chunk = static_cast<int64_t>(reduce_chunk) + PIPELINE;
-          if (next_chunk < total_chunks) {
-            recv_from(sz, reduce_rank, b);
+      // For each rank we have a range [begin, end) of completed chunks.
+      // When we have an unprocessed recv AND the write location is behind
+      // read_offset, reduce in-place and optionally post another recv.
+      for (int r = 0; r < size_; r++) {
+        int s = completed_recv_begin[r];
+        int e = completed_recv_end[r];
+        int w = s * N;
+        while (w < read_offset && e - s > 0) {
+          int buff = s % PIPELINE;
+          reduce_op(
+              recv_buffer(sz, buff, r).begin<T>(),
+              data + w,
+              std::min(N, total - w));
+          w += N;
+          s++;
+          if (w + (PIPELINE - 1) * N < total) {
+            recv_from(call_id, sz, r, buff);
             in_flight++;
           }
         }
-
-        // Means we processed that chunk so move to the next one
-        reduce_rank++;
-        if (reduce_rank >= size_) {
-          reduce_rank = 0;
-          reduce_chunk++;
-        }
+        completed_recv_begin[r] = s;
       }
     }
-
-    // Drain remaining in-flight completions (outstanding sends).
-    while (in_flight > 0) {
-      ibv_wc wc[WC_NUM];
-      int n = poll(connections_, WC_NUM, wc);
-      in_flight -= n;
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce DATA_DONE rank=%d call_id=%u poll_iters=%d -> ack_sync_post\n",
+          rank_,
+          call_id,
+          _poll_iters);
+      std::fflush(stderr);
+    }
+    ack_sync_post(call_id);
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] all_reduce DONE rank=%d call_id=%u\n",
+          rank_,
+          call_id);
+      std::fflush(stderr);
     }
   }
 
-  void all_gather(const char* in_ptr, char* out_ptr, int64_t n_bytes) {
+  void all_gather(
+      uint32_t call_id,
+      const char* in_ptr,
+      char* out_ptr,
+      int64_t n_bytes) {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
@@ -221,32 +272,48 @@ class MeshImpl {
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(sz, buff);
+      post_recv_all(call_id, sz, buff);
       std::copy(
           our_data + read_offset,
           our_data + std::min(read_offset + N, total),
           send_buffer(sz, buff).begin<char>());
-      post_send_all(sz, buff);
+      post_send_all(call_id, sz, buff);
 
       buff++;
       in_flight += 2 * num_peers;
       read_offset += N;
     }
 
-    // Main loop
-    //
-    // Keep going until we have no longer data in flight.
+    // Main loop: keep going until we have no data in flight.
     while (in_flight > 0) {
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int work_type = wc[i].wr_id >> 16;
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_gather wc.status=" << wc[i].status
+              << " wr_id=0x" << std::hex << wc[i].wr_id
+              << " byte_len=" << std::dec << wc[i].byte_len;
+          throw std::runtime_error(msg.str());
+        }
+        if ((wr_id_work_type(wc[i].wr_id) == RECV_WR) &&
+            wc[i].byte_len != static_cast<uint32_t>(N)) {
+          std::ostringstream msg;
+          msg << "[jaccl] all_gather recv byte_len=" << wc[i].byte_len
+              << " expected=" << N << " wr_id=0x" << std::hex
+              << wc[i].wr_id;
+          throw std::runtime_error(msg.str());
+        }
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int work_type = wr_id_work_type(wc[i].wr_id);
+        int buff = wr_id_buff(wc[i].wr_id);
+        int rank = wr_id_peer(wc[i].wr_id);
 
         in_flight--;
 
-        // Send completed. If all sends completed then send the next chunk.
+        // Send completed: send the next chunk if any.
         if (work_type == SEND_WR && read_offset < total) {
           completed_send_count[buff]++;
           if (completed_send_count[buff] == num_peers) {
@@ -254,7 +321,7 @@ class MeshImpl {
                 our_data + read_offset,
                 our_data + std::min(read_offset + N, total),
                 send_buffer(sz, buff).begin<char>());
-            post_send_all(sz, buff);
+            post_send_all(call_id, sz, buff);
 
             completed_send_count[buff] = 0;
             in_flight += num_peers;
@@ -262,8 +329,10 @@ class MeshImpl {
           }
         }
 
-        // Recv completed. If we have more chunks then post another recv.
+        // Recv completed: copy to output and post another recv if needed.
         else if (work_type == RECV_WR) {
+          // Ensure the NIC's DMA writes to recv_buffer are visible to CPU.
+          JACCL_DMA_BARRIER();
           std::copy(
               recv_buffer(sz, buff, rank).begin<char>(),
               recv_buffer(sz, buff, rank).begin<char>() +
@@ -271,15 +340,16 @@ class MeshImpl {
               data + rank * n_bytes + write_offset[rank]);
           write_offset[rank] += N;
           if (write_offset[rank] + N * (PIPELINE - 1) < total) {
-            recv_from(sz, rank, buff);
+            recv_from(call_id, sz, rank, buff);
             in_flight++;
           }
         }
       }
     }
+    ack_sync_post(call_id);
   }
 
-  void send(const char* in_ptr, int64_t n_bytes, int dst) {
+  void send(uint32_t call_id, const char* in_ptr, int64_t n_bytes, int dst) {
     constexpr int PIPELINE = 2;
     constexpr int WC_NUM = PIPELINE;
     auto [sz, N] = buffer_size_from_message(n_bytes);
@@ -294,7 +364,7 @@ class MeshImpl {
           in_ptr + read_offset,
           in_ptr + std::min(read_offset + N, n_bytes),
           send_buffer(sz, buff).begin<char>());
-      send_to(sz, dst, buff);
+      send_to(call_id, sz, dst, buff);
 
       buff++;
       read_offset += N;
@@ -303,15 +373,13 @@ class MeshImpl {
 
     // Main loop
     while (in_flight > 0) {
-      // Poll the hardware for completions.
-      //
-      // If a send was completed and we have more data to send then go ahead
-      // and send them.
       ibv_wc wc[WC_NUM];
       int n = connections_[dst].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int buff = wr_id_buff(wc[i].wr_id);
 
         in_flight--;
 
@@ -320,16 +388,17 @@ class MeshImpl {
               in_ptr + read_offset,
               in_ptr + std::min(read_offset + N, n_bytes),
               send_buffer(sz, buff).begin<char>());
-          send_to(sz, dst, buff);
+          send_to(call_id, sz, dst, buff);
 
           read_offset += N;
           in_flight++;
         }
       }
     }
+    ack_sync_post(call_id);
   }
 
-  void recv(char* out_ptr, int64_t n_bytes, int src) {
+  void recv(uint32_t call_id, char* out_ptr, int64_t n_bytes, int src) {
     constexpr int PIPELINE = 2;
     constexpr int WC_NUM = PIPELINE;
     auto [sz, N] = buffer_size_from_message(n_bytes);
@@ -340,26 +409,25 @@ class MeshImpl {
     // Prefill the pipeline
     int buff = 0;
     while (N * buff < n_bytes && buff < PIPELINE) {
-      recv_from(sz, src, buff);
-
+      recv_from(call_id, sz, src, buff);
       in_flight++;
       buff++;
     }
 
     // Main loop
     while (in_flight > 0) {
-      // Poll the hardware for completions.
-      //
-      // If a recv was completed copy it to the output and if we have more
-      // data to fetch post another recv.
       ibv_wc wc[WC_NUM];
       int n = connections_[src].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        int buff = (wc[i].wr_id >> 8) & 0xff;
-        int rank = wc[i].wr_id & 0xff;
+        if (wr_id_call_id(wc[i].wr_id) != call_id) {
+          continue;
+        }
+        int buff = wr_id_buff(wc[i].wr_id);
 
         in_flight--;
 
+        // Ensure NIC DMA writes to recv_buffer are visible to the CPU.
+        JACCL_DMA_BARRIER();
         std::copy(
             recv_buffer(sz, buff, src).begin<char>(),
             recv_buffer(sz, buff, src).begin<char>() +
@@ -368,23 +436,279 @@ class MeshImpl {
         write_offset += N;
 
         if (write_offset + (PIPELINE - 1) * N < n_bytes) {
-          recv_from(sz, src, buff);
-
+          recv_from(call_id, sz, src, buff);
           in_flight++;
         }
+      }
+    }
+    ack_sync_post(call_id);
+  }
+
+  // Pre-post a pool of ACK_RECVs per peer at QP setup time. Called
+  // from MeshGroup ctor so the very first ack_sync_post's incoming
+  // ACK_SEND from peer always finds a posted recv WR.
+  //
+  // Pool depth (ACK_RECV_POOL): if peer's ACK_SEND rate exceeds our
+  // drain_acks rate, the pool absorbs the burst. drain_acks replenishes
+  // one ACK_RECV per consumption. Without enough depth, peer's ack_send
+  // can arrive on a QP with no posted recv WR → UC drops → wedge.
+  //
+  // Pool of 64 is sized for the observed cross-rank coord-lambda lead
+  // at c=2 when one rank's master is busy and the other's is idle.
+  static constexpr int ACK_RECV_POOL = 64;
+
+  void post_ack_recvs(uint32_t call_id) {
+    // No-op when ack_connections_ is empty (top-level group: uses the
+    // original inline ack_sync_post on data QP, no pre-posting needed).
+    if (ack_connections_.empty()) {
+      return;
+    }
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& rbuf = ack_recv_buffers_[peer];
+      std::memset(rbuf.data<char>(), 0, rbuf.size());
+      JACCL_DMA_BARRIER();
+      for (int i = 0; i < ACK_RECV_POOL; i++) {
+        ack_connections_[peer].post_recv(
+            rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
       }
     }
   }
 
  private:
-  void send_to(int sz, int rank, int buff) {
-    connections_[rank].post_send(
-        send_buffer(sz, buff), SEND_WR << 16 | buff << 8 | rank);
+  // Cross-rank ack barrier — used at BOTH ends of every lambda.
+  //
+  //   ack_sync_pre(): called BEFORE the data prefill posts. Confirms
+  //     peer has reached the same lambda boundary AND posted its
+  //     ack_recv as the very first WR on its QP recv queue.
+  //   ack_sync_post(): called AFTER the data main loop. Confirms peer
+  //     also drained its main loop. Without this, in_flight==0 only
+  //     proves OUR side drained; peer might still be polling, and
+  //     our next-lambda send could arrive at peer's still-posted
+  //     prior-lambda recv WR (different sz → IBV_WC_LOC_LEN_ERR).
+  //
+  // CRITICAL: callers MUST post the per-peer ack_recv BEFORE any
+  // other recvs in the lambda so the ack is at the head of the QP
+  // recv queue and matches peer's ack_send first.
+  void ack_sync_pre(uint32_t call_id) {
+    int num_peers = size_ - 1;
+    int in_flight = 2 * num_peers;
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& sbuf = ack_send_buffers_[peer];
+      ack_connections_[peer].post_send(
+          sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+    }
+    drain_acks(call_id, in_flight);
   }
 
-  void recv_from(int sz, int rank, int buff) {
+  void ack_sync_post(uint32_t call_id) {
+    bool _prog = jaccl_progress_enabled();
+    int num_peers = size_ - 1;
+    int in_flight = 2 * num_peers;
+    bool has_ack = !ack_connections_.empty();
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto& sbuf = ack_send_buffers_[peer];
+      if (has_ack) {
+        // Dedicated ACK QP path (subgroups). ACK_RECV WRs are
+        // pre-posted at QP setup and replenished by drain_acks.
+        ack_connections_[peer].post_send(
+            sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+      } else {
+        // Original inline ack barrier on data QP (top-level group).
+        // Post recv + send for THIS call. drain_acks polls data CQ.
+        // This avoids per-collective overhead of polling a separate
+        // ACK CQ on the master TP hot path. Safe because top-level
+        // group's calls are uniform-size-class (all FRAME_SIZE buffers),
+        // so the cross-call FIFO mismatch motivating the ACK QP fix
+        // doesn't manifest.
+        auto& rbuf = ack_recv_buffers_[peer];
+        std::memset(rbuf.data<char>(), 0, rbuf.size());
+        JACCL_DMA_BARRIER();
+        connections_[peer].post_recv(
+            rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+        connections_[peer].post_send(
+            sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+      }
+    }
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] ack_sync_post POSTED rank=%d call_id=%u in_flight=%d has_ack_qp=%d\n",
+          rank_,
+          call_id,
+          in_flight,
+          has_ack ? 1 : 0);
+      std::fflush(stderr);
+    }
+    drain_acks(call_id, in_flight);
+    if (_prog) {
+      std::fprintf(
+          stderr,
+          "[jaccl-prog] ack_sync_post DRAINED rank=%d call_id=%u\n",
+          rank_,
+          call_id);
+      std::fflush(stderr);
+    }
+  }
+
+  void drain_acks(uint32_t call_id, int in_flight) {
+    bool _prog = jaccl_progress_enabled();
+    int _iters = 0;
+    // Split in_flight into per-side accounting (always 2 * num_peers).
+    int need_send = in_flight / 2;
+    int need_recv = in_flight / 2;
+    while (need_send > 0 || need_recv > 0) {
+      if (_prog) {
+        ++_iters;
+        if (_iters <= 4 || (_iters % 1000000) == 0) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] drain_acks POLL rank=%d call_id=%u iter=%d need_send=%d need_recv=%d cached_recvs=%d\n",
+              rank_,
+              call_id,
+              _iters,
+              need_send,
+              need_recv,
+              static_cast<int>(cached_ack_recvs_.size()));
+          std::fflush(stderr);
+        }
+      }
+      // Consume cached ACK_RECV completions before polling fresh CQEs.
+      while (need_recv > 0 && !cached_ack_recvs_.empty()) {
+        int peer = cached_ack_recvs_.back();
+        cached_ack_recvs_.pop_back();
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] drain_acks CACHED rank=%d call_id=%u type=ACK_RECV peer=%d need_recv=%d\n",
+              rank_,
+              call_id,
+              peer,
+              need_recv - 1);
+          std::fflush(stderr);
+        }
+        need_recv--;
+      }
+      if (need_send == 0 && need_recv == 0) {
+        break;
+      }
+      ibv_wc wc[16];
+      // With dedicated ACK QPs (subgroups), poll only the ACK CQs.
+      // Without (top-level group), the ack barrier rides the data CQ
+      // alongside data completions — poll connections_ instead.
+      int n = ack_connections_.empty()
+          ? poll(connections_, 16, wc)
+          : poll(ack_connections_, 16, wc);
+      bool has_ack = !ack_connections_.empty();
+      for (int i = 0; i < n; i++) {
+        int wt = wr_id_work_type(wc[i].wr_id);
+        if (wt == ACK_RECV_WR) {
+          if (!has_ack) {
+            // Top-level group: ACK_RECV WRs are per-call; filter stale.
+            if (wr_id_call_id(wc[i].wr_id) != call_id) {
+              continue;
+            }
+          }
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            std::ostringstream msg;
+            msg << "[jaccl] ack drain (recv) wc.status=" << wc[i].status
+                << " wr_id=0x" << std::hex << wc[i].wr_id;
+            throw std::runtime_error(msg.str());
+          }
+          int peer = wr_id_peer(wc[i].wr_id);
+          if (has_ack) {
+            // Replenish: post a fresh ACK_RECV on the dedicated ACK QP.
+            // Sentinel call_id=0 — ACK_RECVs are call_id-agnostic.
+            auto& rbuf = ack_recv_buffers_[peer];
+            std::memset(rbuf.data<char>(), 0, rbuf.size());
+            JACCL_DMA_BARRIER();
+            ack_connections_[peer].post_recv(
+                rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
+          }
+          if (need_recv > 0) {
+            if (_prog) {
+              std::fprintf(
+                  stderr,
+                  "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_RECV peer=%d need_recv=%d (replenished)\n",
+                  rank_,
+                  call_id,
+                  peer,
+                  need_recv - 1);
+              std::fflush(stderr);
+            }
+            need_recv--;
+          } else {
+            // Excess — peer is ahead. Cache for the next drain.
+            cached_ack_recvs_.push_back(peer);
+            if (_prog) {
+              std::fprintf(
+                  stderr,
+                  "[jaccl-prog] drain_acks EXCESS rank=%d call_id=%u type=ACK_RECV peer=%d cached=%d\n",
+                  rank_,
+                  call_id,
+                  peer,
+                  static_cast<int>(cached_ack_recvs_.size()));
+              std::fflush(stderr);
+            }
+          }
+        } else if (wt == ACK_SEND_WR) {
+          if (wr_id_call_id(wc[i].wr_id) != call_id) {
+            continue;
+          }
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            std::ostringstream msg;
+            msg << "[jaccl] ack drain (send) wc.status=" << wc[i].status
+                << " wr_id=0x" << std::hex << wc[i].wr_id;
+            throw std::runtime_error(msg.str());
+          }
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-prog] drain_acks CQE rank=%d call_id=%u type=ACK_SEND need_send=%d\n",
+                rank_,
+                call_id,
+                need_send - 1);
+            std::fflush(stderr);
+          }
+          need_send--;
+        } else {
+          // Leftover non-ack completion (data send/recv). Don't touch
+          // in_flight or buffers.
+          continue;
+        }
+      }
+    }
+  }
+
+  void send_to(uint32_t call_id, int sz, int rank, int buff) {
+    connections_[rank].post_send(
+        send_buffer(sz, buff), make_wr_id(call_id, SEND_WR, buff, rank));
+  }
+
+  // Zero the recv buffer before posting it. Buffer slots are reused
+  // across consecutive collectives; if DMA fails to fully overwrite the
+  // slot, the reader gets stale bytes. Pre-zeroing means we read zeros
+  // if the DMA never lands, which upper layers can detect/route. The DSB
+  // after memset ensures the zero is visible to the NIC before it
+  // accepts a matching send.
+  void zero_recv_buffer(SharedBuffer& buf) {
+    std::memset(buf.data<char>(), 0, buf.size());
+    JACCL_DMA_BARRIER();
+  }
+
+  void recv_from(uint32_t call_id, int sz, int rank, int buff) {
+    auto& recv_buf = recv_buffer(sz, buff, rank);
+    zero_recv_buffer(recv_buf);
     connections_[rank].post_recv(
-        recv_buffer(sz, buff, rank), RECV_WR << 16 | buff << 8 | rank);
+        recv_buf, make_wr_id(call_id, RECV_WR, buff, rank));
   }
 
   SharedBuffer& send_buffer(int sz, int buff) {
@@ -395,33 +719,44 @@ class MeshImpl {
     return buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank];
   }
 
-  void post_send_all(int sz, int buff) {
+  void post_send_all(uint32_t call_id, int sz, int buff) {
     auto& b = send_buffer(sz, buff);
-    int wr_id = SEND_WR << 16 | buff << 8;
     for (int i = 0; i < size_; i++) {
       if (i == rank_) {
         continue;
       }
-      connections_[i].post_send(b, wr_id | i);
+      connections_[i].post_send(b, make_wr_id(call_id, SEND_WR, buff, i));
     }
   }
 
-  void post_recv_all(int sz, int buff) {
+  void post_recv_all(uint32_t call_id, int sz, int buff) {
     int b = sz * NUM_BUFFERS * size_ + buff * size_;
-    int wr_id = RECV_WR << 16 | buff << 8;
     for (int i = 0; i < size_; i++) {
       if (i == rank_) {
         continue;
       }
-      connections_[i].post_recv(buffers_[b + i], wr_id | i);
+      auto& recv_buf = buffers_[b + i];
+      zero_recv_buffer(recv_buf);
+      connections_[i].post_recv(
+          recv_buf, make_wr_id(call_id, RECV_WR, buff, i));
     }
   }
 
   int rank_;
   int size_;
   std::span<Connection> connections_;
+  // Dedicated per-peer ACK connections — separate PD/CQ/QP from data
+  // connections so the ack barrier's pre-posted ACK_RECV doesn't sit
+  // at the head of the data recv FIFO. Empty for top-level groups
+  // (those use the original inline ack on data QP).
+  std::span<Connection> ack_connections_;
   std::span<SharedBuffer> buffers_;
-  std::unique_ptr<char[]> staging_mem_;
+  std::span<SharedBuffer> ack_send_buffers_;
+  std::span<SharedBuffer> ack_recv_buffers_;
+  // Software queue of ACK_RECV completions that arrived early (peer ran
+  // ahead). drain_acks pulls from here first before polling the CQ.
+  // Element = peer index. drain_acks already replenished the recv WR.
+  std::vector<int> cached_ack_recvs_;
 };
 
 } // namespace jaccl
