@@ -4,83 +4,21 @@
 
 #include <infiniband/verbs.h>
 
-#include <cstdlib>
-#include <iostream>
 #include <span>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
-#if defined(__aarch64__) || defined(__arm64__)
-#include <arm_acle.h>
-// Full-system data-synchronization barrier. On ARM (Apple Silicon) the
-// CPU has weak memory ordering and a regular std::copy into a buffer
-// is not guaranteed to be visible to a NIC that reads the same buffer
-// via DMA. Without this barrier, JACCL's send path reads stale bytes
-// (typically leftover bf16 from a prior all_reduce in the same FRAME-
-// sized buffer slot), and the receiver gets float-bit-pattern garbage
-// in what was supposed to be an int message. Same idiom mlx already
-// uses in metal/fence.cpp for CPU<->GPU coherency.
-#define JACCL_DMA_BARRIER() __dsb(0xF)
-#else
-#define JACCL_DMA_BARRIER() ((void)0)
-#endif
-
-#include "mlx/distributed/utils.h"
+#include "jaccl/tcp.h"
 
 constexpr const char* IBV_TAG = "[jaccl]";
 constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
-constexpr int ACK_SEND_WR = 3;
-constexpr int ACK_RECV_WR = 4;
 constexpr int MAX_SEND_WR = 32;
-constexpr int MAX_RECV_WR = 128;
+constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;
 constexpr int NUM_BUFFERS = 2;
 constexpr int FRAME_SIZE = 4096;
-
-// wr_id layout (64 bits):
-//   [63..32]  call_id  — unique per collective invocation on a group
-//   [23..16]  work_type (SEND_WR | RECV_WR)
-//   [15..8]   buff index (0..NUM_BUFFERS-1)
-//   [7..0]    peer rank or wire index (0..255)
-//
-// The call_id is critical for correctness when a prior collective leaks a
-// completion into the CQ (or leaves a posted recv WR that subsequently gets
-// matched by a peer's send): without it, the current collective's polling
-// loop would parse the stale wr_id's buff/rank fields and read from a
-// (sz, buff, peer) buffer slot it never posted to, returning whatever bytes
-// the prior collective left there (typically bf16 from a prior all_reduce
-// landing in what should be an int gather, etc). With it, stale completions
-// are detected by call_id mismatch and skipped without decrementing
-// in_flight or processing the buffer.
-inline uint64_t make_wr_id(
-    uint32_t call_id,
-    int work_type,
-    int buff,
-    int peer_or_wire) {
-  return (static_cast<uint64_t>(call_id) << 32) |
-      (static_cast<uint64_t>(work_type & 0xff) << 16) |
-      (static_cast<uint64_t>(buff & 0xff) << 8) |
-      static_cast<uint64_t>(peer_or_wire & 0xff);
-}
-
-inline uint32_t wr_id_call_id(uint64_t wr_id) {
-  return static_cast<uint32_t>(wr_id >> 32);
-}
-
-inline int wr_id_work_type(uint64_t wr_id) {
-  return static_cast<int>((wr_id >> 16) & 0xff);
-}
-
-inline int wr_id_buff(uint64_t wr_id) {
-  return static_cast<int>((wr_id >> 8) & 0xff);
-}
-
-inline int wr_id_peer(uint64_t wr_id) {
-  return static_cast<int>(wr_id & 0xff);
-}
-
-namespace detail = mlx::core::distributed::detail;
 
 namespace {
 
@@ -106,7 +44,7 @@ inline std::pair<int, int64_t> buffer_size_from_message(int64_t msg) {
 
 } // namespace
 
-namespace mlx::core::distributed::jaccl {
+namespace jaccl {
 
 /**
  * Wrapper for the ibverbs API.
@@ -219,22 +157,8 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
-  // True when this Connection owns the ibv_context and should
-  // close_device on destruction. False when the context is borrowed
-  // from a parent group (subgroups created via MeshGroup::split share
-  // the parent's contexts but allocate their own PD/CQ/QP — this is
-  // the standard RDMA-multi-comm pattern; macOS librdma does not
-  // give back independent contexts from a second ibv_open_device on
-  // the same device, so opening once and sharing is the only way).
-  bool owns_ctx;
 
-  // Owning ctor — takes ownership of ctx (closes on destruction).
   Connection(ibv_context* ctx_);
-  // Borrowing ctor — `ctx_` is borrowed from another Connection;
-  // destruction does not close the device. The caller is responsible
-  // for keeping the owning Connection alive at least as long as this
-  // borrowing one.
-  Connection(ibv_context* ctx_, bool owns_ctx_);
   Connection(Connection&& c);
 
   Connection(const Connection&) = delete;
@@ -251,12 +175,6 @@ struct Connection {
   void queue_pair_rts();
 
   void post_send(const SharedBuffer& buff, uint64_t work_request_id) {
-    // Make sure every prior CPU write to `buff` is visible to the NIC
-    // before we hand the buffer over for DMA. Without this, the NIC may
-    // race the CPU and DMA stale bytes (the bug that produced
-    // 0x3E…/0x3F… float-pattern garbage on c=2 + MTP).
-    JACCL_DMA_BARRIER();
-
     ibv_send_wr work_request, *bad_work_request;
 
     auto entry = buff.to_scatter_gather_entry(protection_domain);
@@ -284,16 +202,6 @@ struct Connection {
     work_request.sg_list = &entry;
     work_request.num_sge = 1;
     work_request.next = nullptr;
-
-    if (std::getenv("JACCL_TRACE_SPLIT")) {
-      std::cerr << "[jaccl] post_recv qp=" << queue_pair
-                << " pd=" << protection_domain
-                << " lkey=" << entry.lkey
-                << " addr=0x" << std::hex << entry.addr << std::dec
-                << " len=" << entry.length
-                << " wr_id=0x" << std::hex << work_request_id << std::dec
-                << std::endl;
-    }
 
     if (int status =
             ibv_post_recv(queue_pair, &work_request, &bad_work_request);
@@ -425,10 +333,16 @@ class SideChannel {
     return result;
   }
 
+  void barrier() {
+    // Twice has proven to be more robust to initialization issues.
+    all_gather<int>(0);
+    all_gather<int>(0);
+  }
+
  private:
   int rank_;
   int size_;
-  std::vector<detail::TCPSocket> sockets_;
+  std::vector<TCPSocket> sockets_;
 };
 
-} // namespace mlx::core::distributed::jaccl
+} // namespace jaccl

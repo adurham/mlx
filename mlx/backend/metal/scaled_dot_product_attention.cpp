@@ -44,19 +44,6 @@ int sdpa_full_chunk_size() {
   return val;
 }
 
-// If set to a positive int, overrides the per-call `blocks` heuristic for
-// the sdpa_vector_2pass dispatch (both bf16 and quantized variants). Used
-// for the blocks sweep during Phase 2.5 / Exp 2. Returns -1 when unset.
-int sdpa_2pass_blocks_override() {
-  if (auto* env = std::getenv("MLX_SDPA_BLOCKS")) {
-    int v = std::atoi(env);
-    if (v > 0) {
-      return v;
-    }
-  }
-  return -1;
-}
-
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -780,8 +767,8 @@ void sdpa_vector_2pass(
       blocks = 32;
     }
   }
-  if (int override = sdpa_2pass_blocks_override(); override > 0) {
-    blocks = override;
+  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
+    blocks = blocks_env;
   }
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
@@ -966,8 +953,8 @@ void sdpa_vector_2pass_quant(
   } else {
     blocks = (n_simds >= 4) ? 64 : 32;
   }
-  if (int override = sdpa_2pass_blocks_override(); override > 0) {
-    blocks = override;
+  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
+    blocks = blocks_env;
   }
 
   // Packed arrays are uint32 (native mx.quantize output) but the kernel

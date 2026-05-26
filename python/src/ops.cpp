@@ -15,6 +15,7 @@
 #include "mlx/einsum.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
+#include "python/src/convert.h"
 #include "python/src/load.h"
 #include "python/src/small_vector.h"
 #include "python/src/utils.h"
@@ -43,6 +44,13 @@ double scalar_to_double(Scalar s) {
   } else {
     return static_cast<double>(std::get<bool>(s));
   }
+}
+
+mx::Shape to_shape(const nb::object& shape) {
+  if (nb::isinstance<nb::int_>(shape)) {
+    return {check_shape_dim(nb::cast<int64_t>(shape))};
+  }
+  return nb::cast<mx::Shape>(shape);
 }
 
 void init_ops(nb::module_& m) {
@@ -829,7 +837,7 @@ void init_ops(nb::module_& m) {
         This is a numerically stable log-add-exp of two arrays with numpy-style
         broadcasting semantics. Either or both input arrays can also be scalars.
 
-        The computation is is a numerically stable version of ``log(exp(a) + exp(b))``.
+        The computation is a numerically stable version of ``log(exp(a) + exp(b))``.
 
         Args:
             a (array): Input array or scalar.
@@ -1702,15 +1710,11 @@ void init_ops(nb::module_& m) {
       )pbdoc");
   m.def(
       "full",
-      [](const std::variant<int, mx::Shape>& shape,
+      [](const nb::object& shape,
          const ScalarOrArray& vals,
          std::optional<mx::Dtype> dtype,
          mx::StreamOrDevice s) {
-        if (auto pv = std::get_if<int>(&shape); pv) {
-          return mx::full({*pv}, to_array(vals, dtype), s);
-        } else {
-          return mx::full(std::get<mx::Shape>(shape), to_array(vals, dtype), s);
-        }
+        return mx::full(to_shape(shape), to_array(vals, dtype), s);
       },
       "shape"_a,
       "vals"_a,
@@ -1736,15 +1740,11 @@ void init_ops(nb::module_& m) {
       )pbdoc");
   m.def(
       "zeros",
-      [](const std::variant<int, mx::Shape>& shape,
+      [](const nb::object& shape,
          std::optional<mx::Dtype> dtype,
          mx::StreamOrDevice s) {
         auto t = dtype.value_or(mx::float32);
-        if (auto pv = std::get_if<int>(&shape); pv) {
-          return mx::zeros({*pv}, t, s);
-        } else {
-          return mx::zeros(std::get<mx::Shape>(shape), t, s);
-        }
+        return mx::zeros(to_shape(shape), t, s);
       },
       "shape"_a,
       "dtype"_a.none() = mx::float32,
@@ -1765,23 +1765,35 @@ void init_ops(nb::module_& m) {
       )pbdoc");
   m.def(
       "asarray",
-      [](const nb::object& a, std::optional<mx::Dtype> dtype) {
+      [](const nb::object& a,
+         std::optional<mx::Dtype> dtype,
+         std::optional<bool> copy) {
+        if (copy.has_value() && !*copy) {
+          throw std::invalid_argument("[asarray] copy=False is not supported.");
+        }
         return create_array(a, dtype);
       },
       nb::arg(),
       "dtype"_a = nb::none(),
+      nb::kw_only(),
+      "copy"_a = nb::none(),
       nb::sig(
-          "def asarray(a: Union[scalar, array, Sequence], dtype: "
-          "Optional[Dtype] = None) -> array"),
+          "def asarray(a: Union[scalar, array, Sequence], dtype: Optional[Dtype] = None, *, copy: Optional[bool] = None) -> array"),
       R"pbdoc(
         Convert the input to an array.
 
         Args:
             a: Input data.
             dtype (Dtype, optional): The desired data-type for the array.
+            copy (bool, optional): Must be ``True`` or unspecified. ``False``
+              is not supported, since MLX has no in-place operations and
+              cannot return a non-copying view.
 
         Returns:
             array: An array interpretation of the input.
+
+        Raises:
+            ValueError: If ``copy`` is ``False``.
       )pbdoc");
   m.def(
       "zeros_like",
@@ -1802,15 +1814,11 @@ void init_ops(nb::module_& m) {
       )pbdoc");
   m.def(
       "ones",
-      [](const std::variant<int, mx::Shape>& shape,
+      [](const nb::object& shape,
          std::optional<mx::Dtype> dtype,
          mx::StreamOrDevice s) {
         auto t = dtype.value_or(mx::float32);
-        if (auto pv = std::get_if<int>(&shape); pv) {
-          return mx::ones({*pv}, t, s);
-        } else {
-          return mx::ones(std::get<mx::Shape>(shape), t, s);
-        }
+        return mx::ones(to_shape(shape), t, s);
       },
       "shape"_a,
       "dtype"_a.none() = mx::float32,

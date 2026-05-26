@@ -4,11 +4,11 @@
 
 #include <span>
 
-#include "mlx/distributed/jaccl/utils.h"
+#include "jaccl/rdma.h"
 
 constexpr int RING_MAX_CONNS = 4;
 
-namespace mlx::core::distributed::jaccl {
+namespace jaccl {
 
 class RingImpl {
  public:
@@ -47,7 +47,6 @@ class RingImpl {
 
   template <int MAX_DIR, typename T, typename ReduceOp>
   void all_reduce(
-      uint32_t call_id,
       const T* in_ptr,
       T* out_ptr,
       int64_t size,
@@ -104,7 +103,7 @@ class RingImpl {
       // Prefill the pipeline
       int buff = 0;
       while (buff < n_steps && buff < PIPELINE) {
-        post_recv_all<MAX_DIR>(call_id, sz, buff, n_wires);
+        post_recv_all<MAX_DIR>(sz, buff, n_wires);
         for (int lr = 0; lr < MAX_DIR; lr++) {
           for (int lw = 0; lw < n_wires; lw++) {
             int64_t offset = lw * N +
@@ -118,7 +117,7 @@ class RingImpl {
             send_count[lr * RING_MAX_CONNS + lw]++;
           }
         }
-        post_send_all<MAX_DIR>(call_id, sz, buff, n_wires);
+        post_send_all<MAX_DIR>(sz, buff, n_wires);
 
         buff++;
         in_flight += 2 * MAX_DIR * n_wires;
@@ -131,12 +130,9 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll(left_, right_, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
-          if (wr_id_call_id(wc[i].wr_id) != call_id) {
-            continue;
-          }
-          int work_type = wr_id_work_type(wc[i].wr_id);
-          int buff = wr_id_buff(wc[i].wr_id);
-          int wire = wr_id_peer(wc[i].wr_id);
+          int work_type = wc[i].wr_id >> 16;
+          int buff = (wc[i].wr_id >> 8) & 0xff;
+          int wire = wc[i].wr_id & 0xff;
           int lr = wire / RING_MAX_CONNS;
           int lw = wire % RING_MAX_CONNS;
 
@@ -150,7 +146,7 @@ class RingImpl {
                 out_ptr + send_offset[lr] +
                     std::max(offset, std::min(offset + N, send_limits[lr])),
                 send_buffer(sz, buff, lr, lw).begin<T>());
-            send_to(call_id, sz, buff, lr, lw);
+            send_to(sz, buff, lr, lw);
             in_flight++;
             send_count[wire]++;
           }
@@ -164,7 +160,7 @@ class RingImpl {
                 std::max<int64_t>(0, std::min(N, recv_limits[lr] - offset)));
             recv_count[wire]++;
             if (recv_count[wire] + (PIPELINE - 1) < n_steps) {
-              recv_from(call_id, sz, buff, lr, lw);
+              recv_from(sz, buff, lr, lw);
               in_flight++;
             }
           }
@@ -206,7 +202,7 @@ class RingImpl {
       // Prefill the pipeline
       int buff = 0;
       while (buff < n_steps && buff < PIPELINE) {
-        post_recv_all<MAX_DIR>(call_id, sz, buff, n_wires);
+        post_recv_all<MAX_DIR>(sz, buff, n_wires);
         for (int lr = 0; lr < MAX_DIR; lr++) {
           for (int lw = 0; lw < n_wires; lw++) {
             int64_t offset = lw * N +
@@ -220,7 +216,7 @@ class RingImpl {
             send_count[lr * RING_MAX_CONNS + lw]++;
           }
         }
-        post_send_all<MAX_DIR>(call_id, sz, buff, n_wires);
+        post_send_all<MAX_DIR>(sz, buff, n_wires);
 
         buff++;
         in_flight += 2 * MAX_DIR * n_wires;
@@ -233,12 +229,9 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll(left_, right_, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
-          if (wr_id_call_id(wc[i].wr_id) != call_id) {
-            continue;
-          }
-          int work_type = wr_id_work_type(wc[i].wr_id);
-          int buff = wr_id_buff(wc[i].wr_id);
-          int wire = wr_id_peer(wc[i].wr_id);
+          int work_type = wc[i].wr_id >> 16;
+          int buff = (wc[i].wr_id >> 8) & 0xff;
+          int wire = wc[i].wr_id & 0xff;
           int lr = wire / RING_MAX_CONNS;
           int lw = wire % RING_MAX_CONNS;
 
@@ -252,7 +245,7 @@ class RingImpl {
                 out_ptr + send_offset[lr] +
                     std::max(offset, std::min(offset + N, send_limits[lr])),
                 send_buffer(sz, buff, lr, lw).begin<T>());
-            send_to(call_id, sz, buff, lr, lw);
+            send_to(sz, buff, lr, lw);
             in_flight++;
             send_count[wire]++;
           }
@@ -267,7 +260,7 @@ class RingImpl {
                 out_ptr + recv_offset[lr] + offset);
             recv_count[wire]++;
             if (recv_count[wire] + (PIPELINE - 1) < n_steps) {
-              recv_from(call_id, sz, buff, lr, lw);
+              recv_from(sz, buff, lr, lw);
               in_flight++;
             }
           }
@@ -303,12 +296,8 @@ class RingImpl {
     }
   }
 
-  void all_gather(
-      uint32_t call_id,
-      const char* in_ptr,
-      char* out_ptr,
-      int64_t n_bytes,
-      int n_wires) {
+  void
+  all_gather(const char* in_ptr, char* out_ptr, int64_t n_bytes, int n_wires) {
     // Copy our data to the appropriate place
     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
 
@@ -338,7 +327,7 @@ class RingImpl {
       // Prefill the pipeline
       int buff = 0;
       while (buff < n_steps && buff < PIPELINE) {
-        post_recv_all(call_id, sz, buff);
+        post_recv_all(sz, buff);
         for (int lr = 0; lr < 2; lr++) {
           for (int lw = 0; lw < n_wires; lw++) {
             int64_t offset = lw * N +
@@ -352,7 +341,7 @@ class RingImpl {
             send_count[lr * RING_MAX_CONNS + lw]++;
           }
         }
-        post_send_all(call_id, sz, buff);
+        post_send_all(sz, buff);
 
         buff++;
         in_flight += 2 * 2 * n_wires;
@@ -365,12 +354,9 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll(left_, right_, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
-          if (wr_id_call_id(wc[i].wr_id) != call_id) {
-            continue;
-          }
-          int work_type = wr_id_work_type(wc[i].wr_id);
-          int buff = wr_id_buff(wc[i].wr_id);
-          int wire = wr_id_peer(wc[i].wr_id);
+          int work_type = wc[i].wr_id >> 16;
+          int buff = (wc[i].wr_id >> 8) & 0xff;
+          int wire = wc[i].wr_id & 0xff;
           int lr = wire / RING_MAX_CONNS;
           int lw = wire % RING_MAX_CONNS;
 
@@ -384,7 +370,7 @@ class RingImpl {
                 out_ptr + send_offset[lr] +
                     std::max(offset, std::min(offset + N, limits[lr])),
                 send_buffer(sz, buff, lr, lw).begin<char>());
-            send_to(call_id, sz, buff, lr, lw);
+            send_to(sz, buff, lr, lw);
             in_flight++;
             send_count[wire]++;
           }
@@ -399,7 +385,7 @@ class RingImpl {
                 out_ptr + recv_offset[lr] + offset);
             recv_count[wire]++;
             if (recv_count[wire] + (PIPELINE - 1) < n_steps) {
-              recv_from(call_id, sz, buff, lr, lw);
+              recv_from(sz, buff, lr, lw);
               in_flight++;
             }
           }
@@ -416,12 +402,7 @@ class RingImpl {
     }
   }
 
-  void send(
-      uint32_t call_id,
-      const char* in_ptr,
-      int64_t n_bytes,
-      int dst,
-      int n_wires) {
+  void send(const char* in_ptr, int64_t n_bytes, int dst, int n_wires) {
     int left = (rank_ + size_ - 1) % size_;
 
     // In the case that size_ == 2 then left == right so we bias send towards
@@ -452,7 +433,7 @@ class RingImpl {
             in_ptr + read_offset[lw],
             in_ptr + std::min(read_offset[lw] + N, limits[lw]),
             send_buffer(sz, buff, dir, lw).begin<char>());
-        send_to(call_id, sz, buff, dir, lw);
+        send_to(sz, buff, dir, lw);
 
         buff++;
         read_offset[lw] += N;
@@ -469,11 +450,8 @@ class RingImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(conns, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        if (wr_id_call_id(wc[i].wr_id) != call_id) {
-          continue;
-        }
-        int buff = wr_id_buff(wc[i].wr_id);
-        int wire = wr_id_peer(wc[i].wr_id);
+        int buff = (wc[i].wr_id >> 8) & 0xff;
+        int wire = wc[i].wr_id & 0xff;
         int lw = wire % RING_MAX_CONNS;
 
         in_flight--;
@@ -483,7 +461,7 @@ class RingImpl {
               in_ptr + read_offset[lw],
               in_ptr + std::min(read_offset[lw] + N, limits[lw]),
               send_buffer(sz, buff, dir, lw).begin<char>());
-          send_to(call_id, sz, buff, dir, lw);
+          send_to(sz, buff, dir, lw);
 
           read_offset[lw] += N;
           in_flight++;
@@ -492,12 +470,7 @@ class RingImpl {
     }
   }
 
-  void recv(
-      uint32_t call_id,
-      char* out_ptr,
-      int64_t n_bytes,
-      int src,
-      int n_wires) {
+  void recv(char* out_ptr, int64_t n_bytes, int src, int n_wires) {
     int right = (rank_ + 1) % size_;
 
     // In the case that size_ == 2 then left == right so we bias send towards
@@ -524,7 +497,7 @@ class RingImpl {
     for (int lw = 0; lw < n_wires; lw++) {
       int buff = 0;
       while (N * buff < limits[lw] && buff < PIPELINE) {
-        recv_from(call_id, sz, buff, dir, lw);
+        recv_from(sz, buff, dir, lw);
 
         buff++;
         in_flight++;
@@ -540,11 +513,8 @@ class RingImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(conns, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        if (wr_id_call_id(wc[i].wr_id) != call_id) {
-          continue;
-        }
-        int buff = wr_id_buff(wc[i].wr_id);
-        int wire = wr_id_peer(wc[i].wr_id);
+        int buff = (wc[i].wr_id >> 8) & 0xff;
+        int wire = wc[i].wr_id & 0xff;
         int lw = wire % RING_MAX_CONNS;
 
         in_flight--;
@@ -558,7 +528,7 @@ class RingImpl {
         write_offset[lw] += N;
 
         if (write_offset[lw] + (PIPELINE - 1) * N < limits[lw]) {
-          recv_from(call_id, sz, buff, dir, lw);
+          recv_from(sz, buff, dir, lw);
 
           in_flight++;
         }
@@ -567,27 +537,25 @@ class RingImpl {
   }
 
  private:
-  void send_to(uint32_t call_id, int sz, int buff, int left_right, int wire) {
+  void send_to(int sz, int buff, int left_right, int wire) {
     if (left_right) {
       left_[wire].post_send(
           send_buffer_left(sz, buff, wire),
-          make_wr_id(call_id, SEND_WR, buff, RING_MAX_CONNS + wire));
+          SEND_WR << 16 | buff << 8 | (RING_MAX_CONNS + wire));
     } else {
       right_[wire].post_send(
-          send_buffer_right(sz, buff, wire),
-          make_wr_id(call_id, SEND_WR, buff, wire));
+          send_buffer_right(sz, buff, wire), SEND_WR << 16 | buff << 8 | wire);
     }
   }
 
-  void recv_from(uint32_t call_id, int sz, int buff, int left_right, int wire) {
+  void recv_from(int sz, int buff, int left_right, int wire) {
     if (left_right) {
       right_[wire].post_recv(
           recv_buffer_right(sz, buff, wire),
-          make_wr_id(call_id, RECV_WR, buff, RING_MAX_CONNS + wire));
+          RECV_WR << 16 | buff << 8 | (RING_MAX_CONNS + wire));
     } else {
       left_[wire].post_recv(
-          recv_buffer_left(sz, buff, wire),
-          make_wr_id(call_id, RECV_WR, buff, wire));
+          recv_buffer_left(sz, buff, wire), RECV_WR << 16 | buff << 8 | wire);
     }
   }
 
@@ -626,29 +594,29 @@ class RingImpl {
   }
 
   template <int MAX_DIR>
-  void post_recv_all(uint32_t call_id, int sz, int buff, int n_wires) {
+  void post_recv_all(int sz, int buff, int n_wires) {
     for (int lr = 0; lr < MAX_DIR; lr++) {
       for (int lw = 0; lw < n_wires; lw++) {
-        recv_from(call_id, sz, buff, lr, lw);
+        recv_from(sz, buff, lr, lw);
       }
     }
   }
 
-  void post_recv_all(uint32_t call_id, int sz, int buff) {
-    post_recv_all<2>(call_id, sz, buff, n_conns_);
+  void post_recv_all(int sz, int buff) {
+    post_recv_all<2>(sz, buff, n_conns_);
   }
 
   template <int MAX_DIR>
-  void post_send_all(uint32_t call_id, int sz, int buff, int n_wires) {
+  void post_send_all(int sz, int buff, int n_wires) {
     for (int lr = 0; lr < MAX_DIR; lr++) {
       for (int lw = 0; lw < n_wires; lw++) {
-        send_to(call_id, sz, buff, lr, lw);
+        send_to(sz, buff, lr, lw);
       }
     }
   }
 
-  void post_send_all(uint32_t call_id, int sz, int buff) {
-    post_send_all<2>(call_id, sz, buff, n_conns_);
+  void post_send_all(int sz, int buff) {
+    post_send_all<2>(sz, buff, n_conns_);
   }
 
   int rank_;
@@ -660,4 +628,4 @@ class RingImpl {
   std::span<SharedBuffer> recv_buffers_;
 };
 
-} // namespace mlx::core::distributed::jaccl
+} // namespace jaccl
