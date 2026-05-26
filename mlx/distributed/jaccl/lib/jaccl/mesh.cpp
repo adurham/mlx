@@ -29,15 +29,18 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
-  // Top-level groups skip the dedicated ACK QP. Data QP traffic is
-  // uniform-size-class (model TP all_sums use FRAME_SIZE buffers), so
-  // the cross-call FIFO mismatch that motivated the ACK QP fix doesn't
-  // manifest here. ack_connections_ left empty → MeshImpl::ack_sync_post
-  // falls back to the original data-QP path.
+  // 2026-05-17 PM: restore dedicated ACK QP for top-level groups too.
+  // The inline-ack-on-data-QP path has an in-call race: ack_sync_post
+  // posts ACK_RECV AFTER the data drain, so peer's ACK_SEND can arrive
+  // in the window → UC silent drop → wedge. Dedicated ACK QP pre-posts
+  // ACK_RECV_POOL=64 recvs, eliminating the race window.
   //
-  // Subgroups created via split() build their own ack_connections_ in
-  // the subgroup ctor — those NEED the dedicated ACK QP because the
-  // coord-vs-master call_id race was the original wedge.
+  // Each ack-connection borrows its peer's data-connection ibv_context
+  // (owns_ctx=false) — the data Connection owns the ctx lifecycle.
+  ack_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
 
   initialize([this](const std::vector<Destination>& info) {
     return side_channel_->all_gather(info);
@@ -63,8 +66,8 @@ MeshGroup::MeshGroup(
       ring_send_buffers_,
       ring_recv_buffers_);
 
-  // No-op when ack_connections_ is empty — top-level group uses the
-  // original inline ack_sync_post and doesn't need pre-posted recvs.
+  // Pre-post ACK_RECVs into the dedicated ACK QPs so peer's ACK_SEND
+  // never arrives at an empty recv FIFO.
   mesh_.post_ack_recvs(0);
 
   open_trace_file_if_enabled();

@@ -144,6 +144,12 @@ class MeshImpl {
     int completed_recv_begin[MESH_MAX_PEERS] = {0};
     int completed_recv_end[MESH_MAX_PEERS] = {0};
 
+    // Start-of-lambda cross-rank barrier on the dedicated ACK QP.
+    // Confirms peer has entered THIS call before we post our first
+    // data send. The pre-posted ACK_RECV pool and sentinel-call_id
+    // replenish path in drain_acks keep the ACK QP recv queue full.
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
@@ -180,8 +186,8 @@ class MeshImpl {
     uint64_t _instr_max_single_poll_ticks = 0;
     uint64_t _instr_iters_with_cqes = 0;
     while (in_flight > 0) {
-      ++_poll_iters;
       if (_prog) {
+        ++_poll_iters;
         if (_poll_iters <= 4 || (_poll_iters % 1000000) == 0) {
           std::fprintf(
               stderr,
@@ -358,6 +364,9 @@ class MeshImpl {
     int completed_send_count[PIPELINE] = {0};
     int write_offset[MESH_MAX_PEERS] = {0};
 
+    // Start-of-lambda cross-rank barrier. See all_reduce for rationale.
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < total && buff < PIPELINE) {
@@ -446,6 +455,9 @@ class MeshImpl {
     int in_flight = 0;
     int64_t read_offset = 0;
 
+    // Start-of-lambda cross-rank barrier. See all_reduce for rationale.
+    ack_sync_pre(call_id);
+
     // Prefill the pipeline
     int buff = 0;
     while (read_offset < n_bytes && buff < PIPELINE) {
@@ -494,6 +506,9 @@ class MeshImpl {
 
     int in_flight = 0;
     int64_t write_offset = 0;
+
+    // Start-of-lambda cross-rank barrier. See all_reduce for rationale.
+    ack_sync_pre(call_id);
 
     // Prefill the pipeline
     int buff = 0;
@@ -582,6 +597,29 @@ class MeshImpl {
   // other recvs in the lambda so the ack is at the head of the QP
   // recv queue and matches peer's ack_send first.
   void ack_sync_pre(uint32_t call_id) {
+    if (ack_pre_fastskip_enabled_ == -1) {
+      const char* env = std::getenv("EXO_JACCL_ACK_PRE_FASTSKIP");
+      ack_pre_fastskip_enabled_ = (env != nullptr && env[0] == '1') ? 1 : 0;
+    }
+    if (ack_pre_fastskip_enabled_ == 1 && post_chain_valid_ &&
+        last_post_call_id_ + 1 == call_id) {
+      fastskip_hit_count_++;
+      if ((fastskip_hit_count_ + fastskip_miss_count_) % 500 == 0) {
+        std::fprintf(
+            stderr,
+            "[ack-fastskip] rank=%d hits=%llu misses=%llu hit_rate=%.3f\n",
+            rank_,
+            (unsigned long long)fastskip_hit_count_,
+            (unsigned long long)fastskip_miss_count_,
+            (double)fastskip_hit_count_ /
+                (double)(fastskip_hit_count_ + fastskip_miss_count_));
+        std::fflush(stderr);
+      }
+      return;
+    }
+    if (ack_pre_fastskip_enabled_ == 1) {
+      fastskip_miss_count_++;
+    }
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers;
     for (int peer = 0; peer < size_; peer++) {
@@ -646,6 +684,8 @@ class MeshImpl {
           call_id);
       std::fflush(stderr);
     }
+    last_post_call_id_ = call_id;
+    post_chain_valid_ = true;
   }
 
   void drain_acks(uint32_t call_id, int in_flight) {
@@ -842,6 +882,15 @@ class MeshImpl {
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> ack_send_buffers_;
   std::span<SharedBuffer> ack_recv_buffers_;
+  // Fast-skip state: if the immediately preceding call's ack_sync_post
+  // already established the invariants (post_chain_valid_ && last+1==current),
+  // ack_sync_pre can return early without a full barrier round-trip.
+  uint32_t last_post_call_id_ = 0;
+  bool post_chain_valid_ = false;
+  signed char ack_pre_fastskip_enabled_ = -1; // -1=uninit, 0=off, 1=on
+  uint64_t fastskip_hit_count_ = 0;
+  uint64_t fastskip_miss_count_ = 0;
+
   // Software queue of ACK_RECV completions that arrived early (peer ran
   // ahead). drain_acks pulls from here first before polling the CQ.
   // Element = peer index. drain_acks already replenished the recv WR.
