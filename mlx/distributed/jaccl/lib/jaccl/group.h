@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 
 namespace jaccl {
 
@@ -31,6 +32,10 @@ class Group {
   virtual void send(const void* input, size_t n_bytes, int dst) = 0;
   virtual void recv(void* output, size_t n_bytes, int src) = 0;
   virtual void barrier() = 0;
+
+  virtual std::shared_ptr<Group> split(int color, int key = -1) {
+    throw std::runtime_error("[jaccl] Group split not supported.");
+  }
 };
 
 /**
