@@ -321,6 +321,15 @@ FetchContent_MakeAvailable(json)
 target_include_directories(
   mlx PRIVATE $<BUILD_INTERFACE:${json_SOURCE_DIR}/single_include/nlohmann>)
 
+# Add standalone JACCL library (RDMA over Thunderbolt distributed backend)
+if(MLX_BUILD_CPU
+   AND ${CMAKE_SYSTEM_NAME} MATCHES "Darwin"
+   AND DEFINED MACOS_SDK_VERSION
+   AND MACOS_SDK_VERSION GREATER_EQUAL 26.2)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/mlx/distributed/jaccl/lib
+                   ${CMAKE_BINARY_DIR}/jaccl)
+endif()
+
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/mlx)
 
 target_include_directories(
