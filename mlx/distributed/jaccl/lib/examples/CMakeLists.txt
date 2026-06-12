@@ -42,3 +42,4 @@ build_example(allreduce_bench.cpp)
 
 # Probes (feasibility experiments)
 build_example(uc_rdma_write_probe.cpp)
+build_example(hopid_budget_probe.cpp)
