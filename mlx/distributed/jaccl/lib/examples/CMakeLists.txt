@@ -39,3 +39,6 @@ build_example(minimal_barrier.cpp)
 
 # Benchmarks
 build_example(allreduce_bench.cpp)
+
+# Probes (feasibility experiments)
+build_example(uc_rdma_write_probe.cpp)
