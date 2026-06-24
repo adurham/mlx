@@ -1482,18 +1482,16 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   //
   // TODO: Tune 16 and 4 here a bit better.
   //
-  // OPT-8 (2026-06-24): extend the sorted gather_qmm_rhs path to M>1
-  // (prefill). The kernel supports M>1 via run-length encoding of sorted
-  // indices — it groups consecutive rows with the same expert and loads
-  // that expert's weight ONCE, amortizing the memory bandwidth. The
-  // original M==1 gate limited this to decode. For prefill (M=128), the
-  // regular gather_qmm does random expert access per threadgroup even
-  // when indices are sorted, wasting memory bandwidth. Routing sorted
-  // prefill through gather_qmm_rhs reuses expert weight reads across
-  // same-expert tokens. Condition: sorted AND B*M >= 64 (enough tokens
-  // for the run-length encoding to benefit) AND B/E >= 1 (at least one
-  // token per expert on average).
-  if (right_sorted_ == true && (M * B) >= 64 && (B * M) / E >= 1) {
+  // NOTE: OPT-8 (extending gather_qmm_rhs to M>1 prefill) was tested and
+  // REVERTED. The gather_qmm_rhs kernel requires a physical broadcast of x
+  // to match indices (broadcast_with_indices), allocating ~25MB per call
+  // (1536 rows × 4096 D × 4B). At 129 calls/chunk = 3.2GB of broadcast
+  // allocations per chunk. This caused bimodal Metal allocator stalls:
+  // fast chunks 0.77s, slow chunks 2.3s (3x), avg unchanged at 142 t/s.
+  // The regular gather_qmm uses lhs_indices (no broadcast) and gets L2
+  // cache locality from sorted indices without the allocation overhead.
+  // Keep the original M==1 gate for decode; prefill uses gather_qmm.
+  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
     gather_qmm_rhs(
         x,
         w,
