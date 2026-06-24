@@ -2435,6 +2435,179 @@ template <
   }
 }
 
+// OPT-9 (2026-06-24): gather_qmm_rhs with lhs_indices — no broadcast.
+// Same run-length encoding as affine_gather_qmm_rhs, but reads x
+// indirectly via lhs_indices instead of requiring a physical broadcast.
+// This avoids the 25MB/call broadcast allocation that caused bimodal
+// Metal allocator stalls at B=2 prefill (3.2GB/chunk).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose>
+[[kernel]] void affine_gather_qmm_rhs_lhs(
+    const device T* x_base [[buffer(0)]],
+    const device uint32_t* w [[buffer(1)]],
+    const device T* scales [[buffer(2)]],
+    const device T* biases [[buffer(3)]],
+    const device uint32_t* rhs_indices [[buffer(4)]],
+    const device uint32_t* lhs_indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& K [[buffer(9)]],
+    const constant int& x_batch_ndims [[buffer(10)]],
+    const constant int* x_shape [[buffer(11)]],
+    const constant int64_t* x_strides [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::BlockMMA<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      transpose,
+      BK_padded,
+      transpose ? BK_padded : BN_padded>;
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      transpose ? BN : BK,
+      transpose ? BK : BN,
+      transpose ? BK_padded : BN_padded,
+      transpose,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int N_w = N * bytes_per_pack / pack_factor;
+  const int N_g = N / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = transpose ? N * K_w : K * N_w;
+  const size_t stride_s = transpose ? N * K_g : K * N_g;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const size_t y_row_long = size_t(y_row);
+  const size_t y_col_long = size_t(y_col);
+
+  const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
+  const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+  const int k_remain = K - K_it * BK;
+  const short2 tile_w =
+      transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+
+  auto wl = (const device uint8_t*)w;
+  y += y_row_long * N + y_col_long;
+  wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
+  scales += transpose ? y_col_long * K_g : y_col / group_size;
+  biases += transpose ? y_col_long * K_g : y_col / group_size;
+
+  uint32_t index;
+  short offset;
+  uint32_t index_next = rhs_indices[y_row];
+  short offset_next = 0;
+  int n = 0;
+  const int tgp_size = WM * WN * SIMD_SIZE;
+
+  while (n < tgp_bm) {
+    n++;
+    offset = offset_next;
+    index = index_next;
+    offset_next = tgp_bm;
+    for (; n < tgp_bm; n++) {
+      if (rhs_indices[y_row + n] != index) {
+        offset_next = n;
+        index_next = rhs_indices[y_row + n];
+        break;
+      }
+    }
+    const int group_rows = offset_next - offset;
+    thread mma_t mma_op(simd_group_id, simd_lane_id);
+
+    for (int kk = 0; kk < K_it; kk++) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Load x indirectly via lhs_indices — no broadcast
+      for (int li = simd_lane_id; li < BM * BK; li += tgp_size) {
+        short row = li / BK;
+        short col = li % BK;
+        if (row < group_rows) {
+          uint32_t x_idx = lhs_indices[y_row + offset + row];
+          size_t x_off = (x_batch_ndims == 1)
+              ? x_idx * x_strides[0]
+              : elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
+          Xs[row * BK_padded + col] = x_base[x_off + kk * BK + col];
+        } else {
+          Xs[row * BK_padded + col] = T(0);
+        }
+      }
+      thread loader_w_t loader_w(
+          wl + index * stride_w,
+          scales + index * stride_s,
+          biases + index * stride_s,
+          transpose ? K : N,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+    }
+    if (!align_K) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int li = simd_lane_id; li < BM * BK; li += tgp_size) {
+        short row = li / BK;
+        short col = li % BK;
+        if (row < group_rows && col < k_remain) {
+          uint32_t x_idx = lhs_indices[y_row + offset + row];
+          size_t x_off = (x_batch_ndims == 1)
+              ? x_idx * x_strides[0]
+              : elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
+          Xs[row * BK_padded + col] = x_base[x_off + K_it * BK + col];
+        } else {
+          Xs[row * BK_padded + col] = T(0);
+        }
+      }
+      thread loader_w_t loader_w(
+          wl + index * stride_w,
+          scales + index * stride_s,
+          biases + index * stride_s,
+          transpose ? K : N,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+      loader_w.load_safe(tile_w);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+    }
+
+    if (offset_next - offset == BM) {
+      mma_op.store_result(y, N);
+    } else {
+      mma_op.store_result_slice(
+          y, N, short2(0, offset), short2(BN, offset_next));
+    }
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 [[kernel]] void affine_quantize(
     const device T* w [[buffer(0)]],

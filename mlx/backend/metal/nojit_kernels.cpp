@@ -319,6 +319,24 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
   return d.get_kernel(kernel_name, hash_name, func_consts);
 }
 
+MTL::ComputePipelineState* get_gather_qmm_rhs_lhs_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array&,
+    int,
+    int,
+    const std::string&,
+    int,
+    int,
+    int,
+    int,
+    int,
+    bool) {
+  return d.get_kernel(kernel_name, hash_name, func_consts);
+}
+
 MTL::ComputePipelineState* get_steel_gemm_fused_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,

@@ -906,6 +906,47 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+MTL::ComputePipelineState* get_gather_qmm_rhs_lhs_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& x,
+    int group_size,
+    int bits,
+    const std::string& mode,
+    int bm,
+    int bn,
+    int bk,
+    int wm,
+    int wn,
+    bool transpose) {
+  const auto& lib_name = kernel_name;
+  auto lib = d.get_library(lib_name, [&]() {
+    std::string kernel_source;
+    concatenate(
+        kernel_source, metal::utils(), metal::quantized_utils(), metal::gemm());
+    bool is_affine = mode == "affine";
+    concatenate(
+        kernel_source,
+        is_affine ? metal::quantized() : metal::fp_quantized(),
+        get_template_definition(
+            lib_name,
+            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs_lhs"),
+            get_type_string(x.dtype()),
+            group_size,
+            bits,
+            bm,
+            bn,
+            bk,
+            wm,
+            wn,
+            transpose));
+    return kernel_source;
+  });
+  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+}
+
 MTL::ComputePipelineState* get_steel_gemm_fused_nax_kernel(
     metal::Device& d,
     const std::string& kernel_name,

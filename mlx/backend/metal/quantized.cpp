@@ -1362,6 +1362,120 @@ void gather_qmm_rhs(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// OPT-9 (2026-06-24): gather_qmm_rhs_lhs — sorted run-length encoding
+// WITH lhs_indices (indirect x read). No broadcast needed.
+void gather_qmm_rhs_lhs(
+    const array& x_,
+    const array& w_,
+    const array& scales_,
+    const std::optional<array>& biases_,
+    const array& lhs_indices_,
+    const array& rhs_indices_,
+    array& out,
+    bool transpose,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string mode) {
+  // Normalize inputs — NO broadcast of x (that's the whole point)
+  array x = ensure_row_contiguous_matrix(x_, d, s);
+  array w = ensure_row_contiguous_matrix(w_, d, s);
+  array scales = ensure_row_contiguous_matrix(scales_, d, s);
+  array lhs_indices = ensure_row_contiguous(lhs_indices_, d, s);
+  array rhs_indices = ensure_row_contiguous(rhs_indices_, d, s);
+
+  int bm = 16, bn = 32, bk = 32;
+  int wm = 1, wn = 2;
+
+  const bool align_M = (M % bm) == 0;
+  const bool align_N = (N % bn) == 0;
+  const bool align_K = (K % bk) == 0;
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  concatenate(
+      kname,
+      mode + (transpose ? "_gather_qmm_rhs_lhs_nt_" : "_gather_qmm_rhs_lhs_nn_"),
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_bm_",
+      bm,
+      "_bn_",
+      bn,
+      "_bk_",
+      bk,
+      "_wm_",
+      wm,
+      "_wn_",
+      wn);
+
+  metal::MTLFCList func_consts = {
+      {&align_M, MTL::DataType::DataTypeBool, 200},
+      {&align_N, MTL::DataType::DataTypeBool, 201},
+      {&align_K, MTL::DataType::DataTypeBool, 202},
+  };
+
+  std::string hash_name;
+  hash_name.reserve(128);
+  concatenate(
+      hash_name,
+      kname,
+      "_align_M_",
+      align_M ? 't' : 'n',
+      "_align_N_",
+      align_N ? 't' : 'n',
+      "_align_K_",
+      align_K ? 't' : 'n');
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = get_gather_qmm_rhs_lhs_kernel(
+      d,
+      kname,
+      hash_name,
+      func_consts,
+      x,
+      group_size,
+      bits,
+      mode,
+      bm,
+      bn,
+      bk,
+      wm,
+      wn,
+      transpose);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  MTL::Size group_dims(32, wn, wm);
+  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
+
+  int c = 0;
+  compute_encoder.set_input_array(x, c++);         // x_base (no broadcast)
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases_) {
+    array biases = ensure_row_contiguous(*biases_, d, s);
+    compute_encoder.set_input_array(biases, c++);
+  }
+  compute_encoder.set_input_array(rhs_indices, c++);
+  compute_encoder.set_input_array(lhs_indices, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(M, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(K, c++);
+  // x batch shape/strides for indirect access
+  c = add_strides_and_shapes(compute_encoder, false, x, w, scales, biases_, c);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void dispatch_qmv(
     const array& x,
     const array& w,
@@ -1503,6 +1617,33 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         group_size_,
         bits_,
         x.size() / K,
+        N,
+        K,
+        d,
+        s,
+        mode);
+    return;
+  }
+
+  // OPT-9 (2026-06-24): sorted prefill via gather_qmm_rhs_lhs — no broadcast.
+  // When indices are sorted AND M>1 (prefill), use the new kernel that reads
+  // x indirectly via lhs_indices (no 25MB broadcast allocation) while keeping
+  // the run-length encoding for expert weights. This avoids the bimodal
+  // allocator stalls that killed OPT-8 (which used gather_qmm_rhs with
+  // broadcast). Gate: sorted AND M >= 16 (enough rows for run-length benefit).
+  if (right_sorted_ == true && M >= 16) {
+    gather_qmm_rhs_lhs(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        transpose_,
+        group_size_,
+        bits_,
+        M,
         N,
         K,
         d,
