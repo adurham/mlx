@@ -1481,7 +1481,19 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  //
+  // OPT-8 (2026-06-24): extend the sorted gather_qmm_rhs path to M>1
+  // (prefill). The kernel supports M>1 via run-length encoding of sorted
+  // indices — it groups consecutive rows with the same expert and loads
+  // that expert's weight ONCE, amortizing the memory bandwidth. The
+  // original M==1 gate limited this to decode. For prefill (M=128), the
+  // regular gather_qmm does random expert access per threadgroup even
+  // when indices are sorted, wasting memory bandwidth. Routing sorted
+  // prefill through gather_qmm_rhs reuses expert weight reads across
+  // same-expert tokens. Condition: sorted AND B*M >= 64 (enough tokens
+  // for the run-length encoding to benefit) AND B/E >= 1 (at least one
+  // token per expert on average).
+  if (right_sorted_ == true && (M * B) >= 64 && (B * M) / E >= 1) {
     gather_qmm_rhs(
         x,
         w,
