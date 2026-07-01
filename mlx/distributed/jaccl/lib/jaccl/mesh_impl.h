@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <span>
 #include <mach/mach_time.h>
 
@@ -229,6 +230,32 @@ class MeshImpl {
         if (n > 0) ++_instr_iters_with_cqes;
       }
       for (int i = 0; i < n; i++) {
+        // exo-jaccl-fix (2026-07-01): fault-injection hook for validating the
+        // scheduler exception-propagation fix. When JACCL_INJECT_WC_ERROR is
+        // set to a positive integer K, the K-th all_reduce completion polled
+        // across the process is forced to look like a non-success RDMA work
+        // completion (wc.status != IBV_WC_SUCCESS). This reproduces the
+        // ``[jaccl] all_reduce wc.status=N`` transport fault ON DEMAND so we can
+        // confirm it now surfaces as a catchable exception + clean instance
+        // restart instead of std::terminate. Default OFF (env unset) → zero
+        // cost beyond a single static getenv() and one counter increment.
+        static const long _inject_at = [] {
+          const char* v = std::getenv("JACCL_INJECT_WC_ERROR");
+          return v ? std::atol(v) : 0L;
+        }();
+        if (_inject_at > 0) {
+          static std::atomic<long> _wc_seen{0};
+          if (_wc_seen.fetch_add(1) + 1 == _inject_at) {
+            std::fprintf(
+                stderr,
+                "[jaccl] INJECTED wc error at completion #%ld (test hook)\n",
+                _inject_at);
+            std::fflush(stderr);
+            throw std::runtime_error(
+                "[jaccl] all_reduce wc.status=4 wr_id=0xINJECTED byte_len=0 "
+                "(injected by JACCL_INJECT_WC_ERROR)");
+          }
+        }
         // Catch any non-success completion or RECV whose byte_len
         // doesn't match the buffer size we posted. UC silent-drop of a
         // foreign-collective send into our recv WR shows up here.

@@ -353,10 +353,15 @@ void eval(std::vector<array> outputs) {
     for (auto& x : outputs) {
       x.wait();
     }
+    // exo-jaccl-fix (2026-07-01): surface any worker-thread fault (e.g. JACCL
+    // RDMA collective error) as a catchable exception on this thread.
+    scheduler::throw_if_stream_exception();
     return;
   }
 
   eval_impl(std::move(outputs), false).wait();
+  // exo-jaccl-fix (2026-07-01): same rethrow after the async eval completes.
+  scheduler::throw_if_stream_exception();
 }
 
 std::pair<std::vector<array>, std::vector<array>> vjp(

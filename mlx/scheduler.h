@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <queue>
 #include <shared_mutex>
@@ -30,6 +31,11 @@ struct StreamThread {
   std::condition_variable cond;
   bool stop;
   std::thread thread;
+  // exo-jaccl-fix (2026-07-01): holds the first exception thrown by a task on
+  // this stream's worker thread. Captured instead of re-thrown (which would
+  // std::terminate the process); rethrown on the calling thread at the next
+  // take_exception() call (invoked from synchronize()). Guarded by mtx.
+  std::exception_ptr stored_exception{nullptr};
 
   StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
 
@@ -86,17 +92,45 @@ struct StreamThread {
       try {
         task();
       } catch (const std::exception& e) {
+        // exo-jaccl-fix (2026-07-01): a task threw on the stream worker
+        // thread. The OLD behavior re-threw here, which unwinds out of
+        // thread_fn / std::thread -> std::terminate() -> SIGABRT, killing the
+        // whole runner process. For a JACCL RDMA collective fault
+        // (``[jaccl] all_reduce wc.status=N``) that meant a single transport
+        // blip took down the entire cluster unrecoverably, with no catchable
+        // error surfacing to Python.
+        //
+        // NEW: capture the exception into a per-stream exception_ptr and keep
+        // the worker thread ALIVE. The next synchronize() on this stream
+        // rethrows it on the CALLING (Python-facing) thread, where the exo
+        // runner's try/except converts it into a clean RunnerTerminationError
+        // and the supervisor restarts just this instance. Draining any queued
+        // tasks below (see stored_exception_) prevents a wedged peer rank.
         std::fprintf(
             stderr,
-            "[mlx scheduler] uncaught %s in task: %s\n",
+            "[mlx scheduler] captured %s in task (surfacing at next "
+            "synchronize): %s\n",
             typeid(e).name(),
             e.what());
         std::fflush(stderr);
-        throw;
+        {
+          std::lock_guard<std::mutex> lk(mtx);
+          if (!stored_exception) {
+            stored_exception = std::current_exception();
+          }
+        }
       } catch (...) {
-        std::fprintf(stderr, "[mlx scheduler] unknown uncaught exception\n");
+        std::fprintf(
+            stderr,
+            "[mlx scheduler] captured unknown exception in task (surfacing "
+            "at next synchronize)\n");
         std::fflush(stderr);
-        throw;
+        {
+          std::lock_guard<std::mutex> lk(mtx);
+          if (!stored_exception) {
+            stored_exception = std::current_exception();
+          }
+        }
       }
     }
   }
@@ -112,6 +146,18 @@ struct StreamThread {
     }
     cond.notify_one();
   }
+
+  // exo-jaccl-fix (2026-07-01): if a prior task on this stream captured an
+  // exception, clear and return it so the caller (synchronize()) can rethrow
+  // it on the Python-facing thread. Returns nullptr when the stream is clean.
+  // One-shot: the stored exception is consumed so a single fault surfaces
+  // exactly once and the stream is usable again after the instance restarts.
+  std::exception_ptr take_exception() {
+    std::lock_guard<std::mutex> lk(mtx);
+    std::exception_ptr e = stored_exception;
+    stored_exception = nullptr;
+    return e;
+  }
 };
 
 class MLX_API Scheduler {
@@ -126,6 +172,11 @@ class MLX_API Scheduler {
   Scheduler& operator=(Scheduler&&) = delete;
 
   void enqueue(Stream s, std::function<void()> task);
+
+  // exo-jaccl-fix (2026-07-01): consume and return the captured exception for
+  // stream ``s`` (nullptr if none). Called by synchronize() to rethrow a
+  // worker-thread fault on the Python-facing thread instead of terminating.
+  std::exception_ptr take_stream_exception(Stream s);
 
   void notify_new_task(const Stream& stream) {
     {
@@ -165,6 +216,21 @@ class MLX_API Scheduler {
   std::shared_mutex threads_mtx_;
   std::condition_variable completion_cv;
   std::mutex mtx;
+
+ public:
+  // exo-jaccl-fix (2026-07-01): sweep ALL stream worker threads and return the
+  // first captured exception (consuming it), nullptr if all clean. Used by the
+  // eval() path, which waits on arrays/events rather than calling
+  // synchronize(Stream) and so can't target a single stream index.
+  std::exception_ptr take_any_stream_exception() {
+    std::shared_lock lock(threads_mtx_);
+    for (auto& [idx, st] : threads_) {
+      if (auto e = st->take_exception()) {
+        return e;
+      }
+    }
+    return nullptr;
+  }
 };
 
 MLX_API Scheduler& scheduler();
@@ -188,6 +254,16 @@ inline void notify_task_completion(const Stream& stream) {
 
 inline void wait_for_one() {
   scheduler().wait_for_one();
+}
+
+// exo-jaccl-fix (2026-07-01): rethrow (on the calling thread) any exception
+// captured by a stream worker thread. No-op when all streams are clean. Called
+// from eval()/synchronize() so a JACCL RDMA collective fault surfaces as a
+// normal catchable exception instead of std::terminate on the worker thread.
+inline void throw_if_stream_exception() {
+  if (auto e = scheduler().take_any_stream_exception()) {
+    std::rethrow_exception(e);
+  }
 }
 
 } // namespace mlx::core::scheduler
