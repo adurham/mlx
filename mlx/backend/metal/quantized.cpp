@@ -1492,7 +1492,8 @@ bool gather_qmv_rhs_enabled() {
   return enabled;
 }
 
-// Instantiated (M_TILE, RPS) pairs: (2,8) (4,4) (4,8) (6,4) (6,8) (8,4).
+// Instantiated (M_TILE, RPS) pairs — fp modes: (2,8) (4,4) (4,8) (6,4)
+// (6,8) (8,4) (8,8); affine: (4,4) (4,8) (6,4) (8,4).
 int gather_qmv_rhs_tile() {
   static int tile = []() {
     const char* v = std::getenv("MLX_GATHER_QMV_RHS_TILE");
@@ -1526,6 +1527,7 @@ void gather_qmv_rhs(
     const array& x_,
     const array& w_,
     const array& scales_,
+    const std::optional<array>& biases_,
     const array& indices_,
     array& out,
     int group_size,
@@ -1541,8 +1543,18 @@ void gather_qmv_rhs(
   array scales = ensure_row_contiguous(scales_, d, s);
   array indices = ensure_row_contiguous(indices_, d, s);
 
+  bool is_affine = mode == "affine";
   int m_tile = gather_qmv_rhs_tile();
   int rps = gather_qmv_rhs_rps(m_tile);
+  if (is_affine) {
+    // affine set has no mt=2 and rps=8 only at mt=4
+    if (m_tile == 2) {
+      m_tile = 4;
+    }
+    if (m_tile != 4) {
+      rps = 4;
+    }
+  }
   int bn = 2 * rps;
   if (N % bn != 0) {
     rps = 4;
@@ -1587,6 +1599,10 @@ void gather_qmv_rhs(
   int c = 0;
   compute_encoder.set_input_array(w, c++);
   compute_encoder.set_input_array(scales, c++);
+  if (is_affine) {
+    array biases = ensure_row_contiguous(*biases_, d, s);
+    compute_encoder.set_input_array(biases, c++);
+  }
   compute_encoder.set_input_array(x, c++);
   compute_encoder.set_input_array(indices, c++);
   compute_encoder.set_output_array(out, c++);
@@ -1726,21 +1742,24 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // The regular gather_qmm uses lhs_indices (no broadcast) and gets L2
   // cache locality from sorted indices without the allocation overhead.
   // Keep the original M==1 gate for decode; prefill uses gather_qmm.
-  // M-batched qmv over sorted expert runs (2026-07-02): for the fp modes
-  // (mxfp4/mxfp8/nvfp4, no biases), stream expert weights once per
-  // same-expert run with the qmv_fast structure instead of the steel tile
-  // pipeline. Requires dense per-pair x rows (no broadcast), fast-kernel
-  // alignment (N % 8, K % block_size), and >=2 rows per expert on average
-  // so decode-sized dispatches keep the old path. MLX_GATHER_QMV_RHS=0
-  // kills it.
+  // M-batched qmv over sorted expert runs (2026-07-02): stream expert
+  // weights once per same-expert run with the qmv_fast structure instead of
+  // the steel tile pipeline. Covers affine (with biases) and the fp modes
+  // (no biases); bits {4,8} only (whole-pack alignment). Requires dense
+  // per-pair x rows (no broadcast), fast-kernel alignment (N % 8,
+  // K % block_size), and >=2 rows per expert on average so decode-sized
+  // dispatches keep the old path. MLX_GATHER_QMV_RHS=0 kills it.
   if (M == 1 && B >= 16 && right_sorted_ == true && transpose_ &&
-      mode != "affine" && !biases && N % 8 == 0 &&
-      K % (2048 / bits_) == 0 && int(x.size()) / K == B && B / E >= 2 &&
-      gather_qmv_rhs_enabled()) {
+      (bits_ == 4 || bits_ == 8) &&
+      (mode == "affine") == biases.has_value() &&
+      (mode != "affine" || group_size_ == 32 || group_size_ == 64) &&
+      N % 8 == 0 && K % (2048 / bits_) == 0 && int(x.size()) / K == B &&
+      B / E >= 2 && gather_qmv_rhs_enabled()) {
     gather_qmv_rhs(
         x,
         w,
         scales,
+        biases,
         rhs_indices,
         out,
         group_size_,

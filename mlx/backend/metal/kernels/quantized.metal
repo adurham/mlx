@@ -155,4 +155,33 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+instantiate_quantized_all()
+
+// M-batched sorted-run gather qmv (2026-07-02). Only bits {4,8} (whole-pack
+// alignment) and the (M_TILE, RPS) pairs the dispatch selects from.
+#define instantiate_gather_qmv_rhs(type, group_size, bits, mtile, rps) \
+  instantiate_kernel( \
+      "affine_gather_qmv_rhs_" #type "_gs_" #group_size "_b_" #bits "_mt_" #mtile "_rps_" #rps, \
+      affine_gather_qmv_rhs, \
+      type, \
+      group_size, \
+      bits, \
+      mtile, \
+      rps)
+
+#define instantiate_gather_qmv_rhs_tiles(type, group_size, bits) \
+  instantiate_gather_qmv_rhs(type, group_size, bits, 4, 4) \
+  instantiate_gather_qmv_rhs(type, group_size, bits, 4, 8) \
+  instantiate_gather_qmv_rhs(type, group_size, bits, 6, 4) \
+  instantiate_gather_qmv_rhs(type, group_size, bits, 8, 4)
+
+#define instantiate_gather_qmv_rhs_types(group_size, bits) \
+  instantiate_gather_qmv_rhs_tiles(float, group_size, bits) \
+  instantiate_gather_qmv_rhs_tiles(float16_t, group_size, bits) \
+  instantiate_gather_qmv_rhs_tiles(bfloat16_t, group_size, bits)
+
+instantiate_gather_qmv_rhs_types(32, 4)
+instantiate_gather_qmv_rhs_types(32, 8)
+instantiate_gather_qmv_rhs_types(64, 4)
+instantiate_gather_qmv_rhs_types(64, 8)
+    // clang-format on
