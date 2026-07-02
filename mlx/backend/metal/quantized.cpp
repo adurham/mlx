@@ -1495,7 +1495,16 @@ bool gather_qmv_rhs_enabled() {
 int gather_qmv_rhs_tile() {
   static int tile = []() {
     const char* v = std::getenv("MLX_GATHER_QMV_RHS_TILE");
-    return (v != nullptr && std::string(v) == "4") ? 4 : 8;
+    if (v != nullptr) {
+      std::string sv(v);
+      if (sv == "4") {
+        return 4;
+      }
+      if (sv == "6") {
+        return 6;
+      }
+    }
+    return 8;
   }();
   return tile;
 }
