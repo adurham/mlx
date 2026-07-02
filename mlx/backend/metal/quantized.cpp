@@ -1495,9 +1495,13 @@ bool gather_qmv_rhs_enabled() {
 // Instantiated (M_TILE, RPS) pairs — fp modes: (2,8) (4,4) (4,8) (6,4)
 // (6,8) (8,4) (8,8); affine: (4,4) (4,8) (6,4) (8,4).
 // Upper bound on B/E (average rows per expert run) for the rhs path.
-// Default 8 (validated). MLX_GATHER_QMV_RHS_MAXBE overrides for benching
-// longer runs, where larger M_TILE cuts the ceil(run/M_TILE) weight
-// restreams that made B/E=16 lose at TILE=4.
+// Default 6: full sweep 2026-07-02 (M4 Max, DSv4 shapes, TILE=4) —
+// B/E=6 wins (1.16x affine8, 1.48x mxfp4), B/E=7 parity, B/E=8 LOSES
+// (0.63x affine8, 0.86x mxfp4), and losses grow with B/E. Larger M_TILE
+// makes long runs WORSE (register pressure beats restream savings:
+// mt=8 at B/E=16 is 0.17x), so there is no rhs bucket beyond the
+// crossover — steel's tile reuse owns long runs. MLX_GATHER_QMV_RHS_MAXBE
+// overrides for experiments.
 int gather_qmv_rhs_max_be() {
   static int max_be = []() {
     const char* v = std::getenv("MLX_GATHER_QMV_RHS_MAXBE");
@@ -1507,7 +1511,7 @@ int gather_qmv_rhs_max_be() {
         return m;
       }
     }
-    return 8;
+    return 6;
   }();
   return max_be;
 }
