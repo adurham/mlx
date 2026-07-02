@@ -1494,6 +1494,24 @@ bool gather_qmv_rhs_enabled() {
 
 // Instantiated (M_TILE, RPS) pairs — fp modes: (2,8) (4,4) (4,8) (6,4)
 // (6,8) (8,4) (8,8); affine: (4,4) (4,8) (6,4) (8,4).
+// Upper bound on B/E (average rows per expert run) for the rhs path.
+// Default 8 (validated). MLX_GATHER_QMV_RHS_MAXBE overrides for benching
+// longer runs, where larger M_TILE cuts the ceil(run/M_TILE) weight
+// restreams that made B/E=16 lose at TILE=4.
+int gather_qmv_rhs_max_be() {
+  static int max_be = []() {
+    const char* v = std::getenv("MLX_GATHER_QMV_RHS_MAXBE");
+    if (v != nullptr) {
+      int m = atoi(v);
+      if (m >= 2 && m <= 256) {
+        return m;
+      }
+    }
+    return 8;
+  }();
+  return max_be;
+}
+
 int gather_qmv_rhs_tile() {
   static int tile = []() {
     const char* v = std::getenv("MLX_GATHER_QMV_RHS_TILE");
@@ -1758,7 +1776,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       (mode == "affine") == biases.has_value() &&
       (mode != "affine" || group_size_ == 32 || group_size_ == 64) &&
       N % 8 == 0 && K % (2048 / bits_) == 0 && int(x.size()) / K == B &&
-      B / E >= 2 && B / E <= 8 && gather_qmv_rhs_enabled()) {
+      B / E >= 2 && B / E <= gather_qmv_rhs_max_be() &&
+      gather_qmv_rhs_enabled()) {
     gather_qmv_rhs(
         x,
         w,
