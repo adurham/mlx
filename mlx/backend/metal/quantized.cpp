@@ -1749,12 +1749,16 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // per-pair x rows (no broadcast), fast-kernel alignment (N % 8,
   // K % block_size), and >=2 rows per expert on average so decode-sized
   // dispatches keep the old path. MLX_GATHER_QMV_RHS=0 kills it.
+  // Upper bound B/E <= 8: longer average runs favor the steel tile kernel
+  // (measured 0.33x at B/E=16 — ceil(run/M_TILE) weight restreams dominate),
+  // while short runs favor qmv streaming (1.48x fp4 / 1.16x affine at
+  // B/E=6, parity at B/E=3).
   if (M == 1 && B >= 16 && right_sorted_ == true && transpose_ &&
       (bits_ == 4 || bits_ == 8) &&
       (mode == "affine") == biases.has_value() &&
       (mode != "affine" || group_size_ == 32 || group_size_ == 64) &&
       N % 8 == 0 && K % (2048 / bits_) == 0 && int(x.size()) / K == B &&
-      B / E >= 2 && gather_qmv_rhs_enabled()) {
+      B / E >= 2 && B / E <= 8 && gather_qmv_rhs_enabled()) {
     gather_qmv_rhs(
         x,
         w,
