@@ -1519,9 +1519,6 @@ int gather_qmv_rhs_rps(int m_tile) {
   if (m_tile == 2) {
     return 8;
   }
-  if (m_tile == 8) {
-    return 4;
-  }
   return rps;
 }
 

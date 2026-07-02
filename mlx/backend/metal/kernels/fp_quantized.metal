@@ -131,7 +131,8 @@
   instantiate_gather_qmv_rhs(mode, type, group_size, bits, 4, 8) \
   instantiate_gather_qmv_rhs(mode, type, group_size, bits, 6, 4) \
   instantiate_gather_qmv_rhs(mode, type, group_size, bits, 6, 8) \
-  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 8, 4)
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 8, 4) \
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 8, 8)
 
 #define instantiate_quantize_dequantize(type, mode, group_size, bits) \
   instantiate_kernel( \

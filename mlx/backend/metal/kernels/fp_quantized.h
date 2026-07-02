@@ -1409,6 +1409,39 @@ template <typename T, int group_size, int bits>
 // computed with the exact qdot/load_vector/simd_sum sequence of
 // fp_qmv_fast_impl, so results are bitwise identical to the M=1 fast
 // kernel. MC and RPS are compile-time so all inner loops fully unroll.
+// qdot with the x values held in T (bf16/fp16) registers, converted to U at
+// use. The T -> U widening is exact and the value grouping and accumulation
+// order match qdot exactly, so the result is bitwise identical to qdot on x
+// values converted at load time. Halves the x register footprint so larger
+// MC chunks fit without spilling.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U qdot_xt(const device uint8_t* w, const thread T* x_thread, U scale) {
+  U accum = 0;
+  if constexpr (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (U(x_thread[4 * i]) * Dequantize<4>{}(ws[i]) +
+           U(x_thread[4 * i + 1]) * Dequantize<4>{}(ws[i] >> 4) +
+           U(x_thread[4 * i + 2]) * Dequantize<4>{}(ws[i] >> 8) +
+           U(x_thread[4 * i + 3]) * Dequantize<4>{}(ws[i] >> 12));
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += U(x_thread[i]) * Dequantize<8>{}(w[i]);
+    }
+  }
+  return scale * accum;
+}
+
+template <typename T, int values_per_thread>
+inline void load_vector_nocvt(const device T* x, thread T* x_thread) {
+#pragma unroll
+  for (int i = 0; i < values_per_thread; i++) {
+    x_thread[i] = x[i];
+  }
+}
+
 template <typename T, int group_size, int bits, int MC, int RPS>
 METAL_FUNC void fp_gather_qmv_rhs_chunk(
     const device uint8_t* ws,
@@ -1425,7 +1458,7 @@ METAL_FUNC void fp_gather_qmv_rhs_chunk(
   constexpr int block_size = values_per_thread * SIMD_SIZE;
 
   typedef float U;
-  thread U x_thread[MC][values_per_thread];
+  thread T x_thread[MC][values_per_thread];
   thread U result[RPS][MC] = {0};
 
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
@@ -1434,7 +1467,7 @@ METAL_FUNC void fp_gather_qmv_rhs_chunk(
   for (int k = 0; k < in_vec_size; k += block_size) {
 #pragma unroll
     for (int m = 0; m < MC; m++) {
-      load_vector<T, U, values_per_thread>(x + m * in_vec_size, x_thread[m]);
+      load_vector_nocvt<T, values_per_thread>(x + m * in_vec_size, x_thread[m]);
     }
 
     for (int row = 0; row < RPS; row++) {
@@ -1444,7 +1477,8 @@ METAL_FUNC void fp_gather_qmv_rhs_chunk(
       U s = dequantize_scale<U, group_size>(sl[0]);
 #pragma unroll
       for (int m = 0; m < MC; m++) {
-        result[row][m] += qdot<U, values_per_thread, bits>(wl, x_thread[m], s);
+        result[row][m] +=
+            qdot_xt<T, U, values_per_thread, bits>(wl, x_thread[m], s);
       }
     }
 
