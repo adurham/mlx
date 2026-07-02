@@ -1492,21 +1492,37 @@ bool gather_qmv_rhs_enabled() {
   return enabled;
 }
 
+// Instantiated (M_TILE, RPS) pairs: (2,8) (4,4) (4,8) (6,4) (6,8) (8,4).
 int gather_qmv_rhs_tile() {
   static int tile = []() {
     const char* v = std::getenv("MLX_GATHER_QMV_RHS_TILE");
     if (v != nullptr) {
-      std::string sv(v);
-      if (sv == "4") {
-        return 4;
-      }
-      if (sv == "6") {
-        return 6;
+      int t = atoi(v);
+      if (t == 2 || t == 4 || t == 6 || t == 8) {
+        return t;
       }
     }
-    return 8;
+    return 4;
   }();
   return tile;
+}
+
+int gather_qmv_rhs_rps(int m_tile) {
+  static int rps = []() {
+    const char* v = std::getenv("MLX_GATHER_QMV_RHS_RPS");
+    if (v != nullptr && std::string(v) == "8") {
+      return 8;
+    }
+    return 4;
+  }();
+  // snap to an instantiated pair
+  if (m_tile == 2) {
+    return 8;
+  }
+  if (m_tile == 8) {
+    return 4;
+  }
+  return rps;
 }
 
 void gather_qmv_rhs(
@@ -1529,7 +1545,15 @@ void gather_qmv_rhs(
   array indices = ensure_row_contiguous(indices_, d, s);
 
   int m_tile = gather_qmv_rhs_tile();
-  int bn = 8;
+  int rps = gather_qmv_rhs_rps(m_tile);
+  int bn = 2 * rps;
+  if (N % bn != 0) {
+    rps = 4;
+    bn = 8;
+    if (m_tile == 2) {
+      m_tile = 4; // (2,4) is not instantiated
+    }
+  }
 
   std::string kname;
   kname.reserve(64);
@@ -1543,7 +1567,9 @@ void gather_qmv_rhs(
       "_b_",
       bits,
       "_mt_",
-      m_tile);
+      m_tile,
+      "_rps_",
+      rps);
   auto kernel = get_quantized_kernel_wrapped(
       d,
       kname,
@@ -1552,7 +1578,8 @@ void gather_qmv_rhs(
       type_string,
       group_size,
       bits,
-      m_tile);
+      m_tile,
+      rps);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);

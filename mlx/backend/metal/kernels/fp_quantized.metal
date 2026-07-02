@@ -115,19 +115,23 @@
   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs, gather_qmm_rhs_nt, type, 16, 32, 32, 1, 2, true, mode, group_size, bits) \
   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs, gather_qmm_rhs_nn, type, 16, 32, 32, 1, 2, false, mode, group_size, bits)
 
-#define instantiate_gather_qmv_rhs(mode, type, group_size, bits, mtile) \
+#define instantiate_gather_qmv_rhs(mode, type, group_size, bits, mtile, rps) \
   instantiate_kernel( \
-      #mode "_gather_qmv_rhs_" #type "_gs_" #group_size "_b_" #bits "_mt_" #mtile, \
+      #mode "_gather_qmv_rhs_" #type "_gs_" #group_size "_b_" #bits "_mt_" #mtile "_rps_" #rps, \
       fp_gather_qmv_rhs, \
       type, \
       group_size, \
       bits, \
-      mtile)
+      mtile, \
+      rps)
 
 #define instantiate_quantized_all_qmv_rhs(type, mode, group_size, bits) \
-  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 4) \
-  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 6) \
-  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 8)
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 2, 8) \
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 4, 4) \
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 4, 8) \
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 6, 4) \
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 6, 8) \
+  instantiate_gather_qmv_rhs(mode, type, group_size, bits, 8, 4)
 
 #define instantiate_quantize_dequantize(type, mode, group_size, bits) \
   instantiate_kernel( \
