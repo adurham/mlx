@@ -1,5 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
@@ -1274,8 +1278,28 @@ void gather_qmm_rhs(
   array scales = ensure_row_contiguous(scales_, d, s);
 
   // TODO: Tune the block sizes
+  // Tile config — see gather_qmm_rhs_lhs for rationale. Same env override
+  // (MLX_GATHER_QMM_RHS_LHS_TILE) applies here: this is the production
+  // DSv4 MoE prefill path (M=1 rows pre-matched to sorted indices, no
+  // physical broadcast), measured ~152 GB/s on M4 Max vs ~450 for GEMV.
+  static const auto rhs_tile_override = []() -> std::array<int, 5> {
+    if (const char* e = std::getenv("MLX_GATHER_QMM_RHS_LHS_TILE")) {
+      std::array<int, 5> t{};
+      if (std::sscanf(e, "%d,%d,%d,%d,%d", &t[0], &t[1], &t[2], &t[3], &t[4]) == 5) {
+        return t;
+      }
+    }
+    return {0, 0, 0, 0, 0};
+  }();
   int bm = 16, bn = 32, bk = 32;
   int wm = 1, wn = 2;
+  if (rhs_tile_override[0] > 0) {
+    bm = rhs_tile_override[0];
+    bn = rhs_tile_override[1];
+    bk = rhs_tile_override[2];
+    wm = rhs_tile_override[3];
+    wn = rhs_tile_override[4];
+  }
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
@@ -1388,8 +1412,30 @@ void gather_qmm_rhs_lhs(
   array lhs_indices = ensure_row_contiguous(lhs_indices_, d, s);
   array rhs_indices = ensure_row_contiguous(rhs_indices_, d, s);
 
+  // Tile config. Defaults bm=16 bn=32 bk=32 wm=1 wn=2 were inherited from
+  // the OPT-9 bring-up, not tuned. On M4 Max the achieved bandwidth of the
+  // MoE prefill regime (M-per-expert ~6-24 rows, N=1024, K=4096, mxfp4)
+  // is ~150-170 GB/s vs the ~450 GB/s the M=1 GEMV path reaches, so the
+  // tile shape is the prime suspect. Env-overridable for A/B sweeps
+  // (MLX_GATHER_QMM_RHS_LHS_TILE="bm,bn,bk,wm,wn"); the env is read once.
+  static const auto tile_override = []() -> std::array<int, 5> {
+    if (const char* e = std::getenv("MLX_GATHER_QMM_RHS_LHS_TILE")) {
+      std::array<int, 5> t{};
+      if (std::sscanf(e, "%d,%d,%d,%d,%d", &t[0], &t[1], &t[2], &t[3], &t[4]) == 5) {
+        return t;
+      }
+    }
+    return {0, 0, 0, 0, 0};
+  }();
   int bm = 16, bn = 32, bk = 32;
   int wm = 1, wn = 2;
+  if (tile_override[0] > 0) {
+    bm = tile_override[0];
+    bn = tile_override[1];
+    bk = tile_override[2];
+    wm = tile_override[3];
+    wn = tile_override[4];
+  }
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
