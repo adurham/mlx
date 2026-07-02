@@ -1428,21 +1428,20 @@ inline void qdequant(const device uint8_t* w, thread U* w_vals) {
 
 // Same value grouping and accumulation order as qdot, with the dequantized
 // weight values supplied from registers instead of decoded inline.
-template <typename T, typename U, int values_per_thread, int bits>
+template <typename U, int values_per_thread, int bits>
 inline U
-qdot_dequantized(const threadgroup T* x, const thread U* w_vals, U scale) {
+qdot_dequantized(const thread U* x, const thread U* w_vals, U scale) {
   U accum = 0;
   if constexpr (bits == 4) {
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
-          (U(x[4 * i]) * w_vals[4 * i] +
-           U(x[4 * i + 1]) * w_vals[4 * i + 1] +
-           U(x[4 * i + 2]) * w_vals[4 * i + 2] +
-           U(x[4 * i + 3]) * w_vals[4 * i + 3]);
+          (x[4 * i] * w_vals[4 * i] + x[4 * i + 1] * w_vals[4 * i + 1] +
+           x[4 * i + 2] * w_vals[4 * i + 2] +
+           x[4 * i + 3] * w_vals[4 * i + 3]);
     }
   } else {
     for (int i = 0; i < values_per_thread; i++) {
-      accum += U(x[i]) * w_vals[i];
+      accum += x[i] * w_vals[i];
     }
   }
   return scale * accum;
@@ -1454,10 +1453,8 @@ METAL_FUNC void fp_gather_qmv_rhs_chunk(
     const device uint8_t* scales,
     const device T* x,
     device T* y,
-    threadgroup T* Xs,
     const constant int& in_vec_size,
     const constant int& out_vec_size,
-    uint simd_gid,
     uint simd_lid) {
   constexpr int packs_per_thread = 2;
   constexpr int results_per_simdgroup = 4;
@@ -1465,26 +1462,20 @@ METAL_FUNC void fp_gather_qmv_rhs_chunk(
   constexpr int bytes_per_pack = get_bytes_per_pack<32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int tg_size = 2 * SIMD_SIZE;
 
   typedef float U;
+  thread U x_thread[MC][values_per_thread];
   thread U w_vals[values_per_thread];
   thread U result[results_per_simdgroup][MC] = {0};
 
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
-  const int tidx = simd_gid * SIMD_SIZE + simd_lid;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-    for (int i = 0; i < MC * block_size / tg_size; i++) {
-      int li = i * tg_size + tidx;
-      int m = li / block_size;
-      int col = li % block_size;
-      Xs[li] = x[m * in_vec_size + k + col];
+    for (int m = 0; m < MC; m++) {
+      load_vector<T, U, values_per_thread>(x + m * in_vec_size, x_thread[m]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = ws + row * in_vec_size_w;
@@ -1492,16 +1483,16 @@ METAL_FUNC void fp_gather_qmv_rhs_chunk(
 
       U s = dequantize_scale<U, group_size>(sl[0]);
       qdequant<U, values_per_thread, bits>(wl, w_vals);
-      const threadgroup T* xt = Xs + simd_lid * values_per_thread;
 #pragma unroll
       for (int m = 0; m < MC; m++) {
-        result[row][m] += qdot_dequantized<T, U, values_per_thread, bits>(
-            xt + m * block_size, w_vals, s);
+        result[row][m] += qdot_dequantized<U, values_per_thread, bits>(
+            x_thread[m], w_vals, s);
       }
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
     scales += block_size / group_size;
+    x += block_size;
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1554,8 +1545,6 @@ template <typename T, int group_size, int bits, int M_TILE>
     run_end++;
   }
 
-  threadgroup T Xs[M_TILE * block_size];
-
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -1570,67 +1559,36 @@ template <typename T, int group_size, int bits, int M_TILE>
 
   for (int m0 = row0; m0 < run_end; m0 += M_TILE) {
     const int mc = min(M_TILE, run_end - m0);
-    const device T* xl = x + size_t(m0) * in_vec_size;
+    const device T* xl =
+        x + size_t(m0) * in_vec_size + simd_lid * values_per_thread;
     device T* yl = y + size_t(m0) * out_vec_size + out_row;
 
     if (mc == M_TILE) {
       fp_gather_qmv_rhs_chunk<T, group_size, bits, M_TILE>(
-          ws, sb, xl, yl, Xs, in_vec_size, out_vec_size, simd_gid, simd_lid);
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
     } else if (mc == 1) {
       fp_gather_qmv_rhs_chunk<T, group_size, bits, 1>(
-          ws, sb, xl, yl, Xs, in_vec_size, out_vec_size, simd_gid, simd_lid);
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
     } else if (mc == 2) {
       fp_gather_qmv_rhs_chunk<T, group_size, bits, 2>(
-          ws, sb, xl, yl, Xs, in_vec_size, out_vec_size, simd_gid, simd_lid);
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
     } else if (mc == 3) {
       fp_gather_qmv_rhs_chunk<T, group_size, bits, 3>(
-          ws, sb, xl, yl, Xs, in_vec_size, out_vec_size, simd_gid, simd_lid);
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
     } else {
       if constexpr (M_TILE > 4) {
         if (mc == 4) {
           fp_gather_qmv_rhs_chunk<T, group_size, bits, 4>(
-              ws,
-              sb,
-              xl,
-              yl,
-              Xs,
-              in_vec_size,
-              out_vec_size,
-              simd_gid,
-              simd_lid);
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
         } else if (mc == 5) {
           fp_gather_qmv_rhs_chunk<T, group_size, bits, 5>(
-              ws,
-              sb,
-              xl,
-              yl,
-              Xs,
-              in_vec_size,
-              out_vec_size,
-              simd_gid,
-              simd_lid);
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
         } else if (mc == 6) {
           fp_gather_qmv_rhs_chunk<T, group_size, bits, 6>(
-              ws,
-              sb,
-              xl,
-              yl,
-              Xs,
-              in_vec_size,
-              out_vec_size,
-              simd_gid,
-              simd_lid);
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
         } else {
           fp_gather_qmv_rhs_chunk<T, group_size, bits, 7>(
-              ws,
-              sb,
-              xl,
-              yl,
-              Xs,
-              in_vec_size,
-              out_vec_size,
-              simd_gid,
-              simd_lid);
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
         }
       }
     }
