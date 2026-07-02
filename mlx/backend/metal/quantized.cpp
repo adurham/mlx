@@ -1,5 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdlib>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
@@ -1476,6 +1478,125 @@ void gather_qmm_rhs_lhs(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// M-batched qmv over sorted expert runs (2026-07-02). Streams each expert's
+// weights with the fp_qmv_fast structure (~448 GB/s on M4 Max) while holding
+// up to M_TILE same-expert activation rows in registers, instead of the
+// steel gather_qmm_rhs tile pipeline (~141 GB/s at the DSv4 prefill shape of
+// 1536 pairs / 256 experts). Bitwise identical to the gather_qmv_fast path.
+// MLX_GATHER_QMV_RHS=0 kills it; MLX_GATHER_QMV_RHS_TILE picks 4 or 8.
+bool gather_qmv_rhs_enabled() {
+  static bool enabled = []() {
+    const char* v = std::getenv("MLX_GATHER_QMV_RHS");
+    return v == nullptr || std::string(v) != "0";
+  }();
+  return enabled;
+}
+
+// Instantiated (M_TILE, RPS) pairs: (2,8) (4,4) (4,8) (6,4) (6,8) (8,4).
+int gather_qmv_rhs_tile() {
+  static int tile = []() {
+    const char* v = std::getenv("MLX_GATHER_QMV_RHS_TILE");
+    if (v != nullptr) {
+      int t = atoi(v);
+      if (t == 2 || t == 4 || t == 6 || t == 8) {
+        return t;
+      }
+    }
+    return 4;
+  }();
+  return tile;
+}
+
+int gather_qmv_rhs_rps(int m_tile) {
+  static int rps = []() {
+    const char* v = std::getenv("MLX_GATHER_QMV_RHS_RPS");
+    if (v != nullptr && std::string(v) == "8") {
+      return 8;
+    }
+    return 4;
+  }();
+  // snap to an instantiated pair
+  if (m_tile == 2) {
+    return 8;
+  }
+  return rps;
+}
+
+void gather_qmv_rhs(
+    const array& x_,
+    const array& w_,
+    const array& scales_,
+    const array& indices_,
+    array& out,
+    int group_size,
+    int bits,
+    int B,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  array x = ensure_row_contiguous(x_, d, s);
+  array w = ensure_row_contiguous(w_, d, s);
+  array scales = ensure_row_contiguous(scales_, d, s);
+  array indices = ensure_row_contiguous(indices_, d, s);
+
+  int m_tile = gather_qmv_rhs_tile();
+  int rps = gather_qmv_rhs_rps(m_tile);
+  int bn = 2 * rps;
+  if (N % bn != 0) {
+    rps = 4;
+    bn = 8;
+    if (m_tile == 2) {
+      m_tile = 4; // (2,4) is not instantiated
+    }
+  }
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  concatenate(
+      kname,
+      mode + "_gather_qmv_rhs_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_mt_",
+      m_tile,
+      "_rps_",
+      rps);
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "gather_qmv_rhs",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      m_tile,
+      rps);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(B, N / bn, 1);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_input_array(indices, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(B, c++);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void dispatch_qmv(
     const array& x,
     const array& w,
@@ -1605,6 +1726,34 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // The regular gather_qmm uses lhs_indices (no broadcast) and gets L2
   // cache locality from sorted indices without the allocation overhead.
   // Keep the original M==1 gate for decode; prefill uses gather_qmm.
+  // M-batched qmv over sorted expert runs (2026-07-02): for the fp modes
+  // (mxfp4/mxfp8/nvfp4, no biases), stream expert weights once per
+  // same-expert run with the qmv_fast structure instead of the steel tile
+  // pipeline. Requires dense per-pair x rows (no broadcast), fast-kernel
+  // alignment (N % 8, K % block_size), and >=2 rows per expert on average
+  // so decode-sized dispatches keep the old path. MLX_GATHER_QMV_RHS=0
+  // kills it.
+  if (M == 1 && B >= 16 && right_sorted_ == true && transpose_ &&
+      mode != "affine" && !biases && N % 8 == 0 &&
+      K % (2048 / bits_) == 0 && int(x.size()) / K == B && B / E >= 2 &&
+      gather_qmv_rhs_enabled()) {
+    gather_qmv_rhs(
+        x,
+        w,
+        scales,
+        rhs_indices,
+        out,
+        group_size_,
+        bits_,
+        B,
+        N,
+        K,
+        d,
+        s,
+        mode);
+    return;
+  }
+
   if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
     gather_qmm_rhs(
         x,

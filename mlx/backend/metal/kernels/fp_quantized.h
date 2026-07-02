@@ -1399,6 +1399,191 @@ template <typename T, int group_size, int bits>
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
 }
 
+// M-batched qmv over sorted expert runs (2026-07-02). One K-pass streams an
+// expert's weight rows once for up to MC same-expert activation rows held in
+// registers, using the fp_qmv_fast_impl weight-streaming structure
+// (packs_per_thread=2, inline qdot — the compiler hoists the pack decode
+// across the m-loop) with RPS output rows per simdgroup. Larger RPS
+// amortizes the per-threadgroup re-read of the run's x rows across more
+// output columns (x traffic scales with N / (2 * RPS)). Every output is
+// computed with the exact qdot/load_vector/simd_sum sequence of
+// fp_qmv_fast_impl, so results are bitwise identical to the M=1 fast
+// kernel. MC and RPS are compile-time so all inner loops fully unroll.
+// qdot with the x values held in T (bf16/fp16) registers, converted to U at
+// use. The T -> U widening is exact and the value grouping and accumulation
+// order match qdot exactly, so the result is bitwise identical to qdot on x
+// values converted at load time. Halves the x register footprint so larger
+// MC chunks fit without spilling.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U qdot_xt(const device uint8_t* w, const thread T* x_thread, U scale) {
+  U accum = 0;
+  if constexpr (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (U(x_thread[4 * i]) * Dequantize<4>{}(ws[i]) +
+           U(x_thread[4 * i + 1]) * Dequantize<4>{}(ws[i] >> 4) +
+           U(x_thread[4 * i + 2]) * Dequantize<4>{}(ws[i] >> 8) +
+           U(x_thread[4 * i + 3]) * Dequantize<4>{}(ws[i] >> 12));
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += U(x_thread[i]) * Dequantize<8>{}(w[i]);
+    }
+  }
+  return scale * accum;
+}
+
+template <typename T, int values_per_thread>
+inline void load_vector_nocvt(const device T* x, thread T* x_thread) {
+#pragma unroll
+  for (int i = 0; i < values_per_thread; i++) {
+    x_thread[i] = x[i];
+  }
+}
+
+template <typename T, int group_size, int bits, int MC, int RPS>
+METAL_FUNC void fp_gather_qmv_rhs_chunk(
+    const device uint8_t* ws,
+    const device uint8_t* scales,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint simd_lid) {
+  constexpr int packs_per_thread = 2;
+  constexpr int pack_factor = get_pack_factor<32, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+
+  typedef float U;
+  thread T x_thread[MC][values_per_thread];
+  thread U result[RPS][MC] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+#pragma unroll
+    for (int m = 0; m < MC; m++) {
+      load_vector_nocvt<T, values_per_thread>(x + m * in_vec_size, x_thread[m]);
+    }
+
+    for (int row = 0; row < RPS; row++) {
+      auto wl = ws + row * in_vec_size_w;
+      const device uint8_t* sl = scales + row * in_vec_size_g;
+
+      U s = dequantize_scale<U, group_size>(sl[0]);
+#pragma unroll
+      for (int m = 0; m < MC; m++) {
+        result[row][m] +=
+            qdot_xt<T, U, values_per_thread, bits>(wl, x_thread[m], s);
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    x += block_size;
+  }
+
+  for (int row = 0; row < RPS; row++) {
+#pragma unroll
+    for (int m = 0; m < MC; m++) {
+      U r = simd_sum(result[row][m]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
+// Entry point for the sorted-rhs gather qmv. Grid: (num_rows, N/(2*RPS), 1).
+// Row layout matches fp_gather_qmm_rhs: x/y have one dense row per
+// (token, expert) pair, indices[row] is the expert id, sorted ascending so
+// same-expert rows are contiguous. Threadgroups whose row is not a run start
+// exit immediately; a run-start threadgroup processes its whole run in
+// chunks of M_TILE rows, so an expert's weights stream ceil(run / M_TILE)
+// times total instead of once per row.
+template <typename T, int group_size, int bits, int M_TILE, int RPS>
+[[kernel]] void fp_gather_qmv_rhs(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& num_rows [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int pack_factor = get_pack_factor<32, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const int row0 = tid.x;
+  const uint32_t expert = indices[row0];
+  if (row0 > 0 && indices[row0 - 1] == expert) {
+    return;
+  }
+  int run_end = row0 + 1;
+  while (run_end < num_rows && indices[run_end] == expert) {
+    run_end++;
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * RPS) + simd_gid * RPS;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      size_t(expert) * out_vec_size * in_vec_size_w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  const device uint8_t* sb = scales +
+      size_t(expert) * out_vec_size * in_vec_size_g +
+      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  for (int m0 = row0; m0 < run_end; m0 += M_TILE) {
+    const int mc = min(M_TILE, run_end - m0);
+    const device T* xl =
+        x + size_t(m0) * in_vec_size + simd_lid * values_per_thread;
+    device T* yl = y + size_t(m0) * out_vec_size + out_row;
+
+    if (mc == M_TILE) {
+      fp_gather_qmv_rhs_chunk<T, group_size, bits, M_TILE, RPS>(
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+    } else if (mc == 1) {
+      fp_gather_qmv_rhs_chunk<T, group_size, bits, 1, RPS>(
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+    } else if (mc == 2) {
+      fp_gather_qmv_rhs_chunk<T, group_size, bits, 2, RPS>(
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+    } else if (mc == 3) {
+      fp_gather_qmv_rhs_chunk<T, group_size, bits, 3, RPS>(
+          ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+    } else {
+      if constexpr (M_TILE > 4) {
+        if (mc == 4) {
+          fp_gather_qmv_rhs_chunk<T, group_size, bits, 4, RPS>(
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+        } else if (mc == 5) {
+          fp_gather_qmv_rhs_chunk<T, group_size, bits, 5, RPS>(
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+        } else if (mc == 6) {
+          fp_gather_qmv_rhs_chunk<T, group_size, bits, 6, RPS>(
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+        } else {
+          fp_gather_qmv_rhs_chunk<T, group_size, bits, 7, RPS>(
+              ws, sb, xl, yl, in_vec_size, out_vec_size, simd_lid);
+        }
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void fp_gather_qvm(
     const device uint32_t* w,
