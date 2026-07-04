@@ -103,6 +103,66 @@ inline uint64_t mach_ticks_to_us(uint64_t ticks) {
   return (ticks * tbi.numer) / (tbi.denom * 1000ULL);
 }
 
+// UC-drop stall recovery timeout (microseconds).
+//
+// Thunderbolt RDMA connections are UC (unreliable, no retransmit). Under
+// c>=2 the two TP ranks can lead each other by hundreds-to-thousands of
+// collectives; when that lead overruns the ACK_RECV pool (or the NIC's
+// completion ring wedges — ring_indicies_err), a posted ACK/data SEND or
+// RECV work completion is silently lost. The owning collective's poll loop
+// then spins on a counter that will never reach zero, hanging the runner
+// until exo's supervisor SIGKILLs it 45-180s later (with IOConnectUnmapMemory
+// GPU-teardown noise) and force-replaces the whole instance.
+//
+// Instead: if a collective poll loop makes ZERO forward progress for this
+// long, throw. mlx's jaccl scheduler exception path (2026-07-01) catches it
+// and turns it into a clean instance re-place in seconds — no SIGKILL, no GPU
+// fault, far below the supervisor watchdog. Normal collectives complete in
+// well under a second, so an 8s default has a >8x safety margin over the
+// slowest healthy collective observed. 0 disables (legacy hang-until-SIGKILL).
+inline uint64_t jaccl_stall_timeout_us() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("MLX_JACCL_STALL_TIMEOUT_US");
+    return e ? std::strtoull(e, nullptr, 10) : 8000000ULL;
+  }();
+  return v;
+}
+
+// Watches a collective poll loop for a permanently-stuck in-flight counter
+// (a lost UC completion). tick() is called once per poll iteration with the
+// loop's current progress metric (in_flight, or need_send+need_recv): any
+// change resets the deadline; no change for jaccl_stall_timeout_us() throws.
+// Overhead is one mach_absolute_time() per iteration, negligible beside the
+// ibv_poll_cq the loop already performs.
+struct StallWatch {
+  uint64_t timeout_us;
+  uint64_t last_progress_ticks;
+  long last_metric;
+  explicit StallWatch(long metric)
+      : timeout_us(jaccl_stall_timeout_us()),
+        last_progress_ticks(mach_absolute_time()),
+        last_metric(metric) {}
+  void tick(long metric, const char* what, int rank, uint32_t call_id) {
+    if (timeout_us == 0) {
+      return;
+    }
+    if (metric != last_metric) {
+      last_metric = metric;
+      last_progress_ticks = mach_absolute_time();
+      return;
+    }
+    if (mach_ticks_to_us(mach_absolute_time() - last_progress_ticks) >
+        timeout_us) {
+      std::ostringstream msg;
+      msg << "[jaccl] " << what << " STALLED rank=" << rank
+          << " call_id=" << call_id << " metric=" << metric
+          << " (no forward progress for >" << (timeout_us / 1000)
+          << "ms; UC completion lost — throwing for clean re-place)";
+      throw std::runtime_error(msg.str());
+    }
+  }
+};
+
 class MeshImpl {
  public:
   MeshImpl(
@@ -206,7 +266,9 @@ class MeshImpl {
     uint64_t _instr_total_in_poll_ticks = 0;
     uint64_t _instr_max_single_poll_ticks = 0;
     uint64_t _instr_iters_with_cqes = 0;
+    StallWatch _stall(in_flight);
     while (in_flight > 0) {
+      _stall.tick(in_flight, "all_reduce", rank_, call_id);
       ++_poll_iters;
       if (_prog) {
         if (_poll_iters <= 4 || (_poll_iters % 1000000) == 0) {
@@ -432,7 +494,9 @@ class MeshImpl {
     }
 
     // Main loop: keep going until we have no data in flight.
+    StallWatch _stall(in_flight);
     while (in_flight > 0) {
+      _stall.tick(in_flight, "all_gather", rank_, call_id);
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
@@ -524,7 +588,9 @@ class MeshImpl {
     }
 
     // Main loop
+    StallWatch _stall(in_flight);
     while (in_flight > 0) {
+      _stall.tick(in_flight, "send", rank_, call_id);
       ibv_wc wc[WC_NUM];
       int n = connections_[dst].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
@@ -572,7 +638,9 @@ class MeshImpl {
     }
 
     // Main loop
+    StallWatch _stall(in_flight);
     while (in_flight > 0) {
+      _stall.tick(in_flight, "recv", rank_, call_id);
       ibv_wc wc[WC_NUM];
       int n = connections_[src].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
@@ -728,7 +796,9 @@ class MeshImpl {
     // Split in_flight into per-side accounting (always 2 * num_peers).
     int need_send = in_flight / 2;
     int need_recv = in_flight / 2;
+    StallWatch _stall(need_send + need_recv);
     while (need_send > 0 || need_recv > 0) {
+      _stall.tick(need_send + need_recv, "drain_acks", rank_, call_id);
       if (_prog) {
         ++_iters;
         if (_iters <= 4 || (_iters % 1000000) == 0) {
