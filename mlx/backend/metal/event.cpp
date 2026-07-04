@@ -69,9 +69,25 @@ void Event::wait() {
   // SIGKILL, no GPU fault, no QP leak). Only fires when a task actually threw
   // (fatal), so the happy path is unchanged. Tunable via MLX_EVENT_WAIT_POLL_MS;
   // 0 restores the legacy infinite wait.
+  // Second escape hatch (2026-07-04): a total-wait timeout. The exception
+  // re-check above only rescues the peer when its OWN stream thread threw. But
+  // the observed residual c>=2 hang is the PEER blocking here on a GPU array
+  // whose TP collective the PRIMARY rank abandoned (StallWatch fired on the
+  // primary, not here): jaccl-poll on this rank is idle, no local exception is
+  // ever captured, so the peer would wait until the exo supervisor's 45s
+  // _check_hang SIGKILLs it. A GPU event that has not signaled for this long is
+  // unambiguously wedged (a healthy eval/collective signals in well under a
+  // second), so throw — surfacing a CLEAN fault that unwinds with RAII RDMA
+  // teardown (-> RunnerTerminationError -> clean instance restart) instead of a
+  // mid-GPU-op SIGKILL. Default 30s (< the 45s watchdog, >> any healthy wait).
+  // 0 disables the total timeout (poll + exception-check still apply).
   static const uint64_t poll_ms = [] {
     const char* v = std::getenv("MLX_EVENT_WAIT_POLL_MS");
     return v ? std::strtoull(v, nullptr, 10) : 2000ULL;
+  }();
+  static const uint64_t timeout_ms = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_TIMEOUT_MS");
+    return v ? std::strtoull(v, nullptr, 10) : 40000ULL;
   }();
   auto* ev = static_cast<MTL::SharedEvent*>(event_.get());
   if (poll_ms == 0) {
@@ -80,9 +96,17 @@ void Event::wait() {
     }
     return;
   }
+  uint64_t waited_ms = 0;
   while (!ev->waitUntilSignaledValue(value(), poll_ms)) {
     // No-op unless a worker thread captured an exception; rethrows it here.
     scheduler::throw_if_stream_exception();
+    waited_ms += poll_ms;
+    if (timeout_ms != 0 && waited_ms >= timeout_ms) {
+      throw std::runtime_error(
+          "[Event::wait] Timed out: GPU event not signaled and no stream "
+          "exception (peer rank stuck on an abandoned c>=2 collective); "
+          "surfacing a clean fault for instance restart.");
+    }
   }
 }
 
