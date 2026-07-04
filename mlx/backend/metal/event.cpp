@@ -95,7 +95,12 @@ void Event::wait() {
     return v ? std::strtoull(v, nullptr, 10) : 2000ULL;
   }();
   uint64_t spins = 0;
-  uint64_t waited_us = 0;
+  // Measure REAL wall-clock elapsed with steady_clock — NOT an accumulated
+  // sleep_us counter. macOS sleep granularity + scheduling make each poll
+  // iteration take far longer than the requested sleep, so summing sleep_us
+  // undercounts elapsed time by multiples and the timeout would not fire until
+  // hundreds of real seconds — long after the 45s _check_hang SIGKILL.
+  const auto start = std::chrono::steady_clock::now();
   while (ev->signaledValue() < target) {
     if (spins < spin_iters) {
       ++spins;
@@ -109,14 +114,19 @@ void Event::wait() {
     // Unlike the kernel wait, this loop actually runs: surface a captured
     // stream-worker exception, then honor the total self-abort timeout.
     scheduler::throw_if_stream_exception();
-    if (timeout_us != 0 && waited_us >= timeout_us) {
-      throw std::runtime_error(
-          "[Event::wait] Timed out: GPU event not signaled and no stream "
-          "exception (peer rank stuck on an abandoned c>=2 collective); "
-          "surfacing a clean fault for in-place reconnect / restart.");
+    if (timeout_us != 0) {
+      auto elapsed_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+      if (elapsed_us >= 0 && static_cast<uint64_t>(elapsed_us) >= timeout_us) {
+        throw std::runtime_error(
+            "[Event::wait] Timed out: GPU event not signaled and no stream "
+            "exception (peer rank stuck on an abandoned c>=2 collective); "
+            "surfacing a clean fault for in-place reconnect / restart.");
+      }
     }
     std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-    waited_us += sleep_us;
   }
 }
 
