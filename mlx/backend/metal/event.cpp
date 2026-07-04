@@ -50,9 +50,39 @@ Event::Event(Stream stream) : stream_(stream) {
 }
 
 void Event::wait() {
-  if (!static_cast<MTL::SharedEvent*>(event_.get())
-           ->waitUntilSignaledValue(value(), -1)) {
-    throw std::runtime_error("[Event::wait] Timed out");
+  // exo-jaccl-fix (2026-07-04): poll with a FINITE timeout and re-check for a
+  // captured stream-worker exception each interval, instead of blocking
+  // forever on waitUntilSignaledValue(value(), -1).
+  //
+  // When a stream worker task throws (StreamThread::thread_fn, e.g. a jaccl
+  // StallWatch throw on a wedged c>=2 collective), the scheduler CAPTURES it
+  // into that stream's stored_exception and the task therefore NEVER signals
+  // this event. The exception only surfaces at the next synchronize()
+  // (scheduler::throw_if_stream_exception). A thread blocked HERE with an
+  // infinite timeout never reaches a synchronize(), so it waits forever — this
+  // is the c>=2 PEER-rank wedge: while the StallWatch-clean primary re-places,
+  // the peer blocks in Event::wait() until the exo supervisor SIGKILLs it
+  // mid-GPU-op, which faults the GPU (IOConnectUnmapMemory), leaks its RDMA
+  // QPs, and lands the re-place in stuck-PREPARING. Re-checking every interval
+  // lets the captured exception rethrow HERE so the peer surfaces the fault and
+  // exits cleanly (-> RunnerTerminationError -> clean instance restart, no
+  // SIGKILL, no GPU fault, no QP leak). Only fires when a task actually threw
+  // (fatal), so the happy path is unchanged. Tunable via MLX_EVENT_WAIT_POLL_MS;
+  // 0 restores the legacy infinite wait.
+  static const uint64_t poll_ms = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_POLL_MS");
+    return v ? std::strtoull(v, nullptr, 10) : 2000ULL;
+  }();
+  auto* ev = static_cast<MTL::SharedEvent*>(event_.get());
+  if (poll_ms == 0) {
+    if (!ev->waitUntilSignaledValue(value(), -1)) {
+      throw std::runtime_error("[Event::wait] Timed out");
+    }
+    return;
+  }
+  while (!ev->waitUntilSignaledValue(value(), poll_ms)) {
+    // No-op unless a worker thread captured an exception; rethrows it here.
+    scheduler::throw_if_stream_exception();
   }
 }
 
