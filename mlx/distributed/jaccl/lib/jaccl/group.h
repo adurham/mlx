@@ -33,6 +33,11 @@ class Group {
   virtual void recv(void* output, size_t n_bytes, int src) = 0;
   virtual void barrier() = 0;
 
+  // In-place recovery of a wedged UC transport: reset + re-establish QPs
+  // without a full re-place. Default no-op (only the top-level mesh supports
+  // it); overridden by MeshGroup.
+  virtual void reconnect() {}
+
   virtual std::shared_ptr<Group> split(int color, int key = -1) {
     throw std::runtime_error("[jaccl] Group split not supported.");
   }

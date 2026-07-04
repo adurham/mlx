@@ -181,6 +181,17 @@ void init_distributed(nb::module_& parent_module) {
           "rank", &mx::distributed::Group::rank, "Get the rank of this process")
       .def("size", &mx::distributed::Group::size, "Get the size of the group")
       .def(
+          "reconnect",
+          &mx::distributed::Group::reconnect,
+          R"pbdoc(
+            In-place recovery of a wedged distributed transport: reset and
+            re-establish the underlying connections without tearing down the
+            process. All ranks must call this together. No-op for backends that
+            do not support it (only jaccl does). Call it after a collective
+            raised a transport fault to resume serving without reloading
+            anything.
+          )pbdoc")
+      .def(
           "split",
           &mx::distributed::Group::split,
           "color"_a,

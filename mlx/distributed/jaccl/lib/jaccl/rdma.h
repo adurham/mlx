@@ -224,6 +224,7 @@ struct Connection {
   void queue_pair_init();
   void queue_pair_rtr(const Destination& dst);
   void queue_pair_rts();
+  void queue_pair_reset();
 
   void post_send(const SharedBuffer& buff, uint64_t work_request_id) {
     // Make sure every prior CPU write to `buff` is visible to the NIC

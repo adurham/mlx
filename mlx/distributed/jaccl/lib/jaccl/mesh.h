@@ -83,6 +83,11 @@ class MeshGroup : public Group {
 
   void barrier() override;
 
+  // In-place recovery: reset + re-establish the QPs (top-level group only)
+  // without destroying PD/CQ/MRs, to clear a UC transport wedge without a
+  // full runner re-place. Both ranks must call it.
+  void reconnect() override;
+
   // split(color, key) — current implementation requires all ranks to
   // call with the same color (single subgroup per call). Cannot be called
   // on a subgroup (subgroup has no SideChannel for the destination exchange).

@@ -384,6 +384,83 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
   }
 }
 
+void MeshGroup::reconnect() {
+  // In-place recovery: reset the wedged QPs and re-establish the connections
+  // WITHOUT destroying PD/CQ/MRs or reloading the model. Both ranks call this
+  // after a collective fault; the surviving TCP side_channel_ (coordinator)
+  // re-exchanges QP info and acts as the cross-rank barrier so neither rank
+  // sends before both are RTS. Recovers a UC transport wedge in ~ms instead of
+  // a full runner re-place (~90s model reload).
+  if (!side_channel_.has_value()) {
+    throw std::runtime_error(
+        "[jaccl] reconnect is only supported on top-level groups");
+  }
+  const bool has_ack = !ack_connections_.empty();
+
+  // 1. Reset every QP (flush wedged/in-flight WRs, drain stale CQEs).
+  for (auto& conn : connections_) {
+    if (conn.ctx != nullptr) {
+      conn.queue_pair_reset();
+    }
+  }
+  if (has_ack) {
+    for (auto& conn : ack_connections_) {
+      if (conn.ctx != nullptr) {
+        conn.queue_pair_reset();
+      }
+    }
+  }
+
+  auto exchange = [this](const std::vector<Destination>& info) {
+    return side_channel_->all_gather(info);
+  };
+
+  // 2. Re-establish: INIT -> exchange -> RTR/RTS (mirrors initialize(), minus
+  //    PD/CQ/QP creation and buffer allocation which are preserved).
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    connections_[peer].queue_pair_init();
+    if (has_ack) {
+      ack_connections_[peer].queue_pair_init();
+    }
+  }
+
+  std::vector<Destination> data_info;
+  for (auto& conn : connections_) {
+    data_info.emplace_back(conn.info());
+  }
+  auto data_all_infos = exchange(data_info);
+
+  std::vector<std::vector<Destination>> ack_all_infos;
+  if (has_ack) {
+    std::vector<Destination> ack_info;
+    for (auto& conn : ack_connections_) {
+      ack_info.emplace_back(conn.info());
+    }
+    ack_all_infos = exchange(ack_info);
+  }
+
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    connections_[peer].queue_pair_rtr(data_all_infos[peer][rank_]);
+    connections_[peer].queue_pair_rts();
+    if (has_ack) {
+      ack_connections_[peer].queue_pair_rtr(ack_all_infos[peer][rank_]);
+      ack_connections_[peer].queue_pair_rts();
+    }
+  }
+
+  // 3. Clear stale ACK bookkeeping and re-post the ACK_RECV pool on the fresh
+  //    QPs, then barrier so both ranks are ready before the next collective.
+  mesh_.reset_ack_state();
+  mesh_.post_ack_recvs(0);
+  side_channel_->all_gather<int>(0);
+}
+
 void MeshGroup::allocate_buffers() {
   buffers_.clear();
   ack_send_buffers_.clear();

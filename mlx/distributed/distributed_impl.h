@@ -21,6 +21,11 @@ class GroupImpl {
   virtual int size() = 0;
   virtual std::shared_ptr<GroupImpl> split(int color, int key = -1) = 0;
 
+  // In-place recovery of a wedged transport (reset + re-establish connections
+  // without a full re-place). Default no-op; overridden by backends that
+  // support it (jaccl). Both ranks must call it.
+  virtual void reconnect() {}
+
   // Actual communication operations
   virtual void all_sum(const array& input, array& output, Stream stream) = 0;
   virtual void all_gather(const array& input, array& output, Stream stream) = 0;

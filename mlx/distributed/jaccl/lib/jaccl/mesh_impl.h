@@ -710,6 +710,12 @@ class MeshImpl {
   // at c=2 when one rank's master is busy and the other's is idle.
   static constexpr int ACK_RECV_POOL = 64;
 
+  // Clear stale ACK bookkeeping across an in-place reconnect. cached_ack_recvs_
+  // belonged to the pre-wedge connection and must not carry into the fresh one.
+  void reset_ack_state() {
+    cached_ack_recvs_.clear();
+  }
+
   void post_ack_recvs(uint32_t call_id) {
     // No-op when ack_connections_ is empty (top-level group: uses the
     // original inline ack_sync_post on data QP, no pre-posting needed).

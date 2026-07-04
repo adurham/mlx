@@ -40,6 +40,15 @@ struct MLX_API Group {
    */
   Group split(int color, int key = -1) const;
 
+  /**
+   * In-place recovery of a wedged distributed transport: reset and
+   * re-establish the underlying connections without tearing the process down.
+   * All ranks must call this together. No-op for backends that don't support
+   * it. Intended to be called after a collective raised a transport fault, to
+   * resume serving without reloading anything.
+   */
+  void reconnect() const;
+
   const std::shared_ptr<detail::GroupImpl>& raw_group() const {
     return group_;
   }
