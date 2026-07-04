@@ -128,6 +128,34 @@ inline uint64_t jaccl_stall_timeout_us() {
   return v;
 }
 
+// Soft-RC (software reliability over UC): how long the ACK barrier waits with
+// zero progress before RETRANSMITTING its outstanding ACK work-requests, and
+// how many times before giving up. UC silently drops a SEND/RECV (or its CQE
+// is lost when the completion ring wedges), so rather than spin forever we
+// re-post the outstanding ACK_SEND/RECV. ACKs are idempotent — a duplicate
+// ACK_RECV is absorbed by cached_ack_recvs_, and need_send-- tolerates the
+// extra completion — so retransmit is safe with no dedup. This turns the
+// silent-drop wedge into a self-healing collective (no throw, no re-place)
+// for the common transient-loss case. After _MAX attempts fail (e.g. a truly
+// wedged completion ring) we fall through to the StallWatch throw so the
+// runner still self-heals. Retransmit interval defaults to 500ms — far above a
+// healthy sub-ms ACK, so it only fires on genuine loss. 0 disables (revert to
+// pure StallWatch-throw behavior).
+inline uint64_t jaccl_ack_retransmit_us() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("MLX_JACCL_ACK_RETRANSMIT_US");
+    return e ? std::strtoull(e, nullptr, 10) : 500000ULL;
+  }();
+  return v;
+}
+inline int jaccl_ack_retransmit_max() {
+  static const int v = [] {
+    const char* e = std::getenv("MLX_JACCL_ACK_RETRANSMIT_MAX");
+    return e ? std::atoi(e) : 40;
+  }();
+  return v;
+}
+
 // Watches a collective poll loop for a permanently-stuck in-flight counter
 // (a lost UC completion). tick() is called once per poll iteration with the
 // loop's current progress metric (in_flight, or need_send+need_recv): any
@@ -797,7 +825,62 @@ class MeshImpl {
     int need_send = in_flight / 2;
     int need_recv = in_flight / 2;
     StallWatch _stall(need_send + need_recv);
+    // soft-RC retransmit state (see jaccl_ack_retransmit_us). StallWatch above
+    // stays as the final backstop: if retransmit hasn't restored progress by
+    // jaccl_stall_timeout_us, it throws for a clean re-place.
+    const bool _rtx_has_ack = !ack_connections_.empty();
+    const uint64_t _rtx_us = jaccl_ack_retransmit_us();
+    const int _rtx_max = jaccl_ack_retransmit_max();
+    uint64_t _rtx_last = mach_absolute_time();
+    int _rtx_metric = need_send + need_recv;
+    int _rtx_count = 0;
     while (need_send > 0 || need_recv > 0) {
+      // soft-RC: on a stall, retransmit the outstanding ACK work-requests.
+      // Idempotent — a duplicate ACK_RECV is absorbed by cached_ack_recvs_ and
+      // the extra local send completion just decrements need_send (which the
+      // while-guard tolerates going <=0). Turns a silent UC drop into a
+      // self-healing collective with no throw / no re-place.
+      if (_rtx_us != 0) {
+        const int _m = need_send + need_recv;
+        if (_m != _rtx_metric) {
+          _rtx_metric = _m;
+          _rtx_last = mach_absolute_time();
+        } else if (
+            (_rtx_max <= 0 || _rtx_count < _rtx_max) &&
+            mach_ticks_to_us(mach_absolute_time() - _rtx_last) > _rtx_us) {
+          ++_rtx_count;
+          for (int peer = 0; peer < size_; peer++) {
+            if (peer == rank_) {
+              continue;
+            }
+            auto& conn =
+                _rtx_has_ack ? ack_connections_[peer] : connections_[peer];
+            if (need_send > 0) {
+              conn.post_send(
+                  ack_send_buffers_[peer],
+                  make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+            }
+            if (need_recv > 0) {
+              auto& rbuf = ack_recv_buffers_[peer];
+              std::memset(rbuf.data<char>(), 0, rbuf.size());
+              JACCL_DMA_BARRIER();
+              conn.post_recv(
+                  rbuf,
+                  make_wr_id(_rtx_has_ack ? 0 : call_id, ACK_RECV_WR, 0, peer));
+            }
+          }
+          std::fprintf(
+              stderr,
+              "[jaccl] soft-RC RETRANSMIT rank=%d call_id=%u need_send=%d need_recv=%d attempt=%d\n",
+              rank_,
+              call_id,
+              need_send,
+              need_recv,
+              _rtx_count);
+          std::fflush(stderr);
+          _rtx_last = mach_absolute_time();
+        }
+      }
       _stall.tick(need_send + need_recv, "drain_acks", rank_, call_id);
       if (_prog) {
         ++_iters;
