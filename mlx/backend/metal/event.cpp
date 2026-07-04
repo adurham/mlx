@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 #include "mlx/event.h"
 #include "mlx/backend/metal/device.h"
@@ -50,63 +51,72 @@ Event::Event(Stream stream) : stream_(stream) {
 }
 
 void Event::wait() {
-  // exo-jaccl-fix (2026-07-04): poll with a FINITE timeout and re-check for a
-  // captured stream-worker exception each interval, instead of blocking
-  // forever on waitUntilSignaledValue(value(), -1).
+  // exo-jaccl-fix (2026-07-05): INTERRUPTIBLE wait. Poll the shared event's
+  // value in USER space (MTL::SharedEvent::signaledValue() — a non-blocking
+  // shared-memory read) instead of Apple's waitUntilSignaledValue, which traps
+  // into an UNINTERRUPTIBLE kernel GPU-wait (iokit_user_client_trap) and, when
+  // the GPU/collective is wedged, ignores its timeout and blocks forever.
   //
-  // When a stream worker task throws (StreamThread::thread_fn, e.g. a jaccl
-  // StallWatch throw on a wedged c>=2 collective), the scheduler CAPTURES it
-  // into that stream's stored_exception and the task therefore NEVER signals
-  // this event. The exception only surfaces at the next synchronize()
-  // (scheduler::throw_if_stream_exception). A thread blocked HERE with an
-  // infinite timeout never reaches a synchronize(), so it waits forever — this
-  // is the c>=2 PEER-rank wedge: while the StallWatch-clean primary re-places,
-  // the peer blocks in Event::wait() until the exo supervisor SIGKILLs it
-  // mid-GPU-op, which faults the GPU (IOConnectUnmapMemory), leaks its RDMA
-  // QPs, and lands the re-place in stuck-PREPARING. Re-checking every interval
-  // lets the captured exception rethrow HERE so the peer surfaces the fault and
-  // exits cleanly (-> RunnerTerminationError -> clean instance restart, no
-  // SIGKILL, no GPU fault, no QP leak). Only fires when a task actually threw
-  // (fatal), so the happy path is unchanged. Tunable via MLX_EVENT_WAIT_POLL_MS;
-  // 0 restores the legacy infinite wait.
-  // Second escape hatch (2026-07-04): a total-wait timeout. The exception
-  // re-check above only rescues the peer when its OWN stream thread threw. But
-  // the observed residual c>=2 hang is the PEER blocking here on a GPU array
-  // whose TP collective the PRIMARY rank abandoned (StallWatch fired on the
-  // primary, not here): jaccl-poll on this rank is idle, no local exception is
-  // ever captured, so the peer would wait until the exo supervisor's 45s
-  // _check_hang SIGKILLs it. A GPU event that has not signaled for this long is
-  // unambiguously wedged (a healthy eval/collective signals in well under a
-  // second), so throw — surfacing a CLEAN fault that unwinds with RAII RDMA
-  // teardown (-> RunnerTerminationError -> clean instance restart) instead of a
-  // mid-GPU-op SIGKILL. Default 30s (< the 45s watchdog, >> any healthy wait).
-  // 0 disables the total timeout (poll + exception-check still apply).
-  static const uint64_t poll_ms = [] {
-    const char* v = std::getenv("MLX_EVENT_WAIT_POLL_MS");
-    return v ? std::strtoull(v, nullptr, 10) : 2000ULL;
-  }();
-  static const uint64_t timeout_ms = [] {
-    const char* v = std::getenv("MLX_EVENT_WAIT_TIMEOUT_MS");
-    return v ? std::strtoull(v, nullptr, 10) : 40000ULL;
-  }();
+  // That kernel block is the c>=2 PEER-rank trap: a wedged TP collective never
+  // signals this event, and the peer's main thread is stuck in the kernel where
+  // it can neither honor a timeout, surface a captured stream exception, nor
+  // call reconnect() — only SIGKILL frees it (faulting the GPU + leaking RDMA
+  // QPs). Polling keeps this thread runnable, so the loop can (a) rethrow a
+  // captured stream-worker exception and (b) honor a total timeout — letting a
+  // wedged peer SELF-ABORT and have the runner reconnect() the transport
+  // in-place instead of dying. Fast path is one signaledValue() read; then a
+  // brief spin (cheap for sub-µs completions), then a low-CPU sleep-poll.
+  // Tunables: MLX_EVENT_WAIT_POLL_US (sleep granularity, default 50),
+  // MLX_EVENT_WAIT_SPIN (spins before sleeping, default 2000),
+  // MLX_EVENT_WAIT_TIMEOUT_MS (self-abort deadline, default 40000; 0 disables).
   auto* ev = static_cast<MTL::SharedEvent*>(event_.get());
-  if (poll_ms == 0) {
-    if (!ev->waitUntilSignaledValue(value(), -1)) {
+  const uint64_t target = value();
+  if (ev->signaledValue() >= target) {
+    return;
+  }
+  static const uint64_t sleep_us = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_POLL_US");
+    return v ? std::strtoull(v, nullptr, 10) : 50ULL;
+  }();
+  // Escape hatch: sleep_us==0 restores the legacy uninterruptible blocking
+  // wait (A/B only — it reintroduces the peer-hang).
+  if (sleep_us == 0) {
+    if (!ev->waitUntilSignaledValue(target, -1)) {
       throw std::runtime_error("[Event::wait] Timed out");
     }
     return;
   }
-  uint64_t waited_ms = 0;
-  while (!ev->waitUntilSignaledValue(value(), poll_ms)) {
-    // No-op unless a worker thread captured an exception; rethrows it here.
+  static const uint64_t timeout_us = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_TIMEOUT_MS");
+    return (v ? std::strtoull(v, nullptr, 10) : 40000ULL) * 1000ULL;
+  }();
+  static const uint64_t spin_iters = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_SPIN");
+    return v ? std::strtoull(v, nullptr, 10) : 2000ULL;
+  }();
+  uint64_t spins = 0;
+  uint64_t waited_us = 0;
+  while (ev->signaledValue() < target) {
+    if (spins < spin_iters) {
+      ++spins;
+#if defined(__aarch64__)
+      __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__)
+      __asm__ __volatile__("pause" ::: "memory");
+#endif
+      continue;
+    }
+    // Unlike the kernel wait, this loop actually runs: surface a captured
+    // stream-worker exception, then honor the total self-abort timeout.
     scheduler::throw_if_stream_exception();
-    waited_ms += poll_ms;
-    if (timeout_ms != 0 && waited_ms >= timeout_ms) {
+    if (timeout_us != 0 && waited_us >= timeout_us) {
       throw std::runtime_error(
           "[Event::wait] Timed out: GPU event not signaled and no stream "
           "exception (peer rank stuck on an abandoned c>=2 collective); "
-          "surfacing a clean fault for instance restart.");
+          "surfacing a clean fault for in-place reconnect / restart.");
     }
+    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+    waited_us += sleep_us;
   }
 }
 
