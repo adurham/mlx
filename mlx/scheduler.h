@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -201,10 +202,53 @@ class MLX_API Scheduler {
   void wait_for_one() {
     std::unique_lock<std::mutex> lk(mtx);
     int n_tasks_old = n_active_tasks();
-    if (n_tasks_old > 1) {
-      completion_cv.wait(lk, [this, n_tasks_old] {
-        return this->n_active_tasks() < n_tasks_old;
-      });
+    if (n_tasks_old <= 1) {
+      return;
+    }
+    auto pred = [this, n_tasks_old] {
+      return this->n_active_tasks() < n_tasks_old;
+    };
+    // exo-jaccl-fix (2026-07-05): INTERRUPTIBLE wait. A bare completion_cv.wait
+    // blocks the MAIN thread forever if a stream task is wedged (a c>=2 peer
+    // whose comm-stream collective the primary abandoned) — and unlike
+    // Event::wait, this path has no timeout, so the peer hangs to the 45s
+    // _check_hang SIGKILL, is killed mid-op, and the in-place reconnect never
+    // gets a partner. Poll with a bounded wait + total timeout so the peer
+    // surfaces a clean fault and self-aborts -> reconnect. Same knob as
+    // Event::wait; 0 restores the legacy infinite wait.
+    static const uint64_t timeout_ms = [] {
+      const char* v = std::getenv("MLX_EVENT_WAIT_TIMEOUT_MS");
+      return v ? std::strtoull(v, nullptr, 10) : 40000ULL;
+    }();
+    if (timeout_ms == 0) {
+      completion_cv.wait(lk, pred);
+      return;
+    }
+    auto start = std::chrono::steady_clock::now();
+    bool logged_slow = false;
+    while (!completion_cv.wait_for(lk, std::chrono::milliseconds(200), pred)) {
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+      // Fires only on a genuinely stuck wait (healthy tasks complete in << 1s),
+      // so no hot-path spam: proves this is where a wedged peer parks.
+      if (!logged_slow && elapsed_ms >= 3000) {
+        logged_slow = true;
+        fprintf(
+            stderr,
+            "[wait_for_one] slow: elapsed=%.1fs n_active=%d (polling; "
+            "self-abort at %llums)\n",
+            elapsed_ms / 1000.0,
+            n_active_tasks(),
+            static_cast<unsigned long long>(timeout_ms));
+        fflush(stderr);
+      }
+      if (elapsed_ms >= 0 && static_cast<uint64_t>(elapsed_ms) >= timeout_ms) {
+        throw std::runtime_error(
+            "[wait_for_one] Timed out: stream task not completing (peer stuck "
+            "on an abandoned c>=2 collective); surfacing a clean fault for "
+            "in-place reconnect / restart.");
+      }
     }
   }
 
