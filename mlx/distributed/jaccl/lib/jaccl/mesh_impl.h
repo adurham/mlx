@@ -192,6 +192,17 @@ inline bool jaccl_reliable_data_enabled() {
   static const bool v = jaccl_env_true("MLX_JACCL_RELIABLE_DATA");
   return v;
 }
+// Cap the reliable-path chunk buffer size class. Large UC sends (>= ~64KB /
+// sz>=4) do not reliably COMPLETE on Apple's librdma (they stick, which is
+// likely the same failure the UC all_reduce wedged on); cap the chunk to a
+// size class that reliably completes. Default 0 (FRAME_SIZE=4096). Tunable.
+inline int jaccl_reliable_max_sz() {
+  static const int v = [] {
+    const char* e = std::getenv("MLX_JACCL_RELIABLE_MAX_SZ");
+    return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
 
 // Watches a collective poll loop for a permanently-stuck in-flight counter
 // (a lost UC completion). tick() is called once per poll iteration with the
@@ -283,6 +294,11 @@ class MeshImpl {
     const int peer = (rank_ == 0) ? 1 : 0;
     const int64_t total_bytes = size * static_cast<int64_t>(sizeof(T));
     auto [sz, buffer_size] = buffer_size_from_message(total_bytes);
+    // Cap chunk size to the size class that reliably completes on librdma.
+    if (sz > jaccl_reliable_max_sz()) {
+      sz = jaccl_reliable_max_sz();
+      buffer_size = static_cast<int64_t>(FRAME_SIZE) * (1 << sz);
+    }
     const int HDR = static_cast<int>(sizeof(uint32_t));
     int64_t chunk_bytes = static_cast<int64_t>(buffer_size) - HDR;
     chunk_bytes -= chunk_bytes % static_cast<int64_t>(sizeof(T));
@@ -346,6 +362,7 @@ class MeshImpl {
       zero_recv_buffer(rb);
       connections_[peer].post_recv(rb, make_wr_id(call_id, RECV_WR, buff, peer));
     };
+    static std::atomic<int> _recv_log{0};
     // Consume a RECV completion: read seq header, assemble if new.
     auto consume_recv = [&](int buff) {
       JACCL_DMA_BARRIER();
@@ -353,6 +370,15 @@ class MeshImpl {
       const char* p = rb.data<char>();
       uint32_t c;
       std::memcpy(&c, p, HDR);
+      if (_recv_log.fetch_add(1) < 40 || jaccl_progress_enabled()) {
+        std::fprintf(
+            stderr,
+            "[jaccl-reliable] RECV rank=%d call_id=%u hdr_seq=%u num_chunks=%d "
+            "accept=%d\n",
+            rank_, call_id, c, num_chunks,
+            (c < static_cast<uint32_t>(num_chunks) && !got[c]) ? 1 : 0);
+        std::fflush(stderr);
+      }
       if (c < static_cast<uint32_t>(num_chunks) && !got[c]) {
         int64_t off = static_cast<int64_t>(c) * chunk_bytes;
         int64_t len = std::min(chunk_bytes, total_bytes - off);
