@@ -359,11 +359,12 @@ class MeshImpl {
     int next_send = 0; // first chunk index to (re)send this round
     std::vector<uint8_t> to_resend(num_chunks, 0); // MY chunks the peer needs
 
-    // Post the recv pool ONCE; consumption re-posts each buffer, so the pool
-    // stays full across rounds (the peer retransmits into it).
-    for (int buff = 0; buff < NUM_BUFFERS; buff++) {
-      post_recv_buff(buff);
-    }
+    // Single posted recv (stop-and-wait), re-posted ONLY while chunks are still
+    // expected. This leaves ZERO posted recv WRs on the data QP when the
+    // collective completes — otherwise leftover recvs grab the NEXT collective's
+    // sends (stale call_id -> skipped -> that collective's data is lost),
+    // causing retransmit churn and hangs. Buffer 0 only.
+    post_recv_buff(0);
 
     // Round-based reliable exchange.
     const uint64_t drain_quiet_us = jaccl_ack_retransmit_us(); // reuse knob
@@ -416,7 +417,11 @@ class MeshImpl {
           if (wt == RECV_WR) {
             consume_recv(wb);
             all_recv = static_cast<int>(std::count(got.begin(), got.end(), 1));
-            post_recv_buff(wb); // replenish
+            // Re-post ONLY while more chunks are still expected -> zero leftover
+            // recvs once we have everything.
+            if (all_recv < num_chunks) {
+              post_recv_buff(wb);
+            }
           } else if (wt == SEND_WR) {
             outstanding_sends--;
             // Advance the send pipeline in this buffer.
