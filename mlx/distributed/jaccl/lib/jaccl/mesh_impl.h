@@ -388,23 +388,29 @@ class MeshImpl {
           outstanding_sends++;
         }
       }
-      // Drain: process send/recv completions until quiescent for drain_quiet_us.
+      // Drain: process completions until either done, or no FORWARD PROGRESS
+      // (all_recv + c, both monotonic this round) for drain_quiet_us. Progress-
+      // based (not completion-based): a flood of duplicate/straggler completions
+      // that don't advance anything still lets us fall through to the barrier,
+      // where retransmit reconciles — instead of spinning forever.
       uint64_t last_progress = mach_absolute_time();
+      int prev_progress = all_recv + c;
       while (true) {
         if (all_recv >= num_chunks && outstanding_sends == 0 &&
             c >= num_chunks) {
           break; // nothing left to do this round
         }
+        int cur_progress = all_recv + c;
+        if (cur_progress != prev_progress) {
+          prev_progress = cur_progress;
+          last_progress = mach_absolute_time();
+        } else if (
+            mach_ticks_to_us(mach_absolute_time() - last_progress) >
+            drain_quiet_us) {
+          break; // stalled this round -> barrier + retransmit
+        }
         ibv_wc wc[16];
         int n = poll(connections_, 16, wc);
-        if (n == 0) {
-          if (mach_ticks_to_us(mach_absolute_time() - last_progress) >
-              drain_quiet_us) {
-            break; // quiescent -> go to barrier
-          }
-          continue;
-        }
-        last_progress = mach_absolute_time();
         for (int i = 0; i < n; i++) {
           if (wr_id_call_id(wc[i].wr_id) != call_id) {
             continue; // stale
@@ -437,6 +443,14 @@ class MeshImpl {
         }
       }
       // Reliable barrier: exchange "chunks received from peer" bitmasks.
+      if (round > 0 || jaccl_progress_enabled()) {
+        std::fprintf(
+            stderr,
+            "[jaccl-reliable] BARRIER rank=%d call_id=%u round=%d all_recv=%d "
+            "num_chunks=%d\n",
+            rank_, call_id, round, all_recv, num_chunks);
+        std::fflush(stderr);
+      }
       auto gathered = coordinator_->all_gather(got);
       const std::vector<uint8_t>& peer_got = gathered[peer];
       bool i_have_all = std::count(got.begin(), got.end(), 1) == num_chunks;

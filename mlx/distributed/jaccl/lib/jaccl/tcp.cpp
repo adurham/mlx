@@ -152,7 +152,10 @@ void TCPSocket::set_recv_timeout_secs(int secs) {
   timeval tv{};
   tv.tv_sec = secs;
   tv.tv_usec = 0;
+  // Bound both recv and send so a stuck/backpressured coordinator op fails
+  // cleanly (throws) instead of hanging forever.
   setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 void TCPSocket::recv(const char* tag, void* data, size_t len) {
