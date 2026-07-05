@@ -282,28 +282,54 @@ class MeshImpl {
     int completed_recv_begin[MESH_MAX_PEERS] = {0};
     int completed_recv_end[MESH_MAX_PEERS] = {0};
 
-    // Start-of-lambda cross-rank barrier on the dedicated ACK QP.
-    // Confirms peer has entered THIS call before we post our first
-    // data send. The pre-posted ACK_RECV pool (post_ack_recvs) and
-    // sentinel-call_id replenish path in drain_acks keep the ACK QP
-    // recv queue full across lambdas.
-    if (jaccl_ack_sync_pre_enabled()) {
-      ack_sync_pre(call_id);
-    }
-
-    // Prefill the pipeline
     int buff = 0;
-    while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(call_id, sz, buff);
-      std::copy(
-          data + read_offset,
-          data + std::min(read_offset + N, total),
-          send_buffer(sz, buff).begin<T>());
-      post_send_all(call_id, sz, buff);
+    if (coordinator_ != nullptr && jaccl_confirmed_barrier_pre()) {
+      // Reliable + ORDERED start barrier (replaces the UC ack_sync_pre for this
+      // call). The UC ack barrier wedges on a lost completion; a plain TCP
+      // barrier is reliable but corrupts because a data SEND can arrive before
+      // the peer posts its matching data RECV (UC drop -> wrong data). Fix:
+      // post ALL prefill recvs and fill the send buffers, THEN rendezvous over
+      // the reliable TCP coordinator (so BOTH ranks provably have their recvs
+      // posted), THEN post the sends. No send can land early -> no data-phase
+      // UC drop, no wedge, correct data.
+      int first = buff;
+      while (read_offset < total && buff < PIPELINE) {
+        post_recv_all(call_id, sz, buff);
+        std::copy(
+            data + read_offset,
+            data + std::min(read_offset + N, total),
+            send_buffer(sz, buff).begin<T>());
+        buff++;
+        in_flight += 2 * num_peers;
+        read_offset += N;
+      }
+      coordinator_->all_gather<int>(0);
+      for (int b = first; b < buff; b++) {
+        post_send_all(call_id, sz, b);
+      }
+    } else {
+      // Start-of-lambda cross-rank barrier on the dedicated ACK QP.
+      // Confirms peer has entered THIS call before we post our first
+      // data send. The pre-posted ACK_RECV pool (post_ack_recvs) and
+      // sentinel-call_id replenish path in drain_acks keep the ACK QP
+      // recv queue full across lambdas.
+      if (jaccl_ack_sync_pre_enabled()) {
+        ack_sync_pre(call_id);
+      }
 
-      buff++;
-      in_flight += 2 * num_peers;
-      read_offset += N;
+      // Prefill the pipeline
+      while (read_offset < total && buff < PIPELINE) {
+        post_recv_all(call_id, sz, buff);
+        std::copy(
+            data + read_offset,
+            data + std::min(read_offset + N, total),
+            send_buffer(sz, buff).begin<T>());
+        post_send_all(call_id, sz, buff);
+
+        buff++;
+        in_flight += 2 * num_peers;
+        read_offset += N;
+      }
     }
 
     if (_prog) {
@@ -784,16 +810,13 @@ class MeshImpl {
   // other recvs in the lambda so the ack is at the head of the QP
   // recv queue and matches peer's ack_send first.
   void ack_sync_pre(uint32_t call_id) {
-    // Confirmed barrier: rendezvous both ranks over the reliable TCP coordinator
-    // (stream-ordered, no UC drops) instead of the UC ack exchange, which can
-    // wedge on a single lost completion. Deterministically prevents the
-    // recv-side race regardless of timing. Gated by MLX_JACCL_CONFIRMED_BARRIER
-    // (perf: one coordinator round-trip per barrier). Top-level group only
-    // (coordinator_ is null on subgroups → they keep the UC path).
-    if (coordinator_ != nullptr && jaccl_confirmed_barrier_pre()) {
-      coordinator_->all_gather<int>(0);
-      return;
-    }
+    // NOTE: the confirmed-pre barrier is NOT done here — a plain TCP rendezvous
+    // in place of the UC ack corrupts, because a data SEND can arrive before
+    // the peer posts its data RECV. Collectives that want the reliable+ordered
+    // pre barrier instead inline "post recvs -> coordinator barrier -> post
+    // sends" in their prefill (see all_reduce). This UC path stays for the
+    // collectives that haven't adopted that ordering (and when confirmed-pre is
+    // off).
     // Defensive guard: skip if no dedicated ACK QP exists. Both
     // top-level and subgroup groups populate ack_connections_ when
     // ackqp-net is in effect; this guards against future regressions.
