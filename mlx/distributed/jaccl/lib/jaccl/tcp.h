@@ -45,6 +45,10 @@ class TCPSocket {
   void send(const char* tag, const void* data, size_t len);
   void recv(const char* tag, void* data, size_t len);
 
+  // Bound blocking recv() with SO_RCVTIMEO so a stuck peer fails cleanly
+  // (recv throws) instead of hanging forever. 0 = no timeout (default).
+  void set_recv_timeout_secs(int secs);
+
   int detach();
 
   operator int() const {

@@ -148,6 +148,13 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
   }
 }
 
+void TCPSocket::set_recv_timeout_secs(int secs) {
+  timeval tv{};
+  tv.tv_sec = secs;
+  tv.tv_usec = 0;
+  setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 void TCPSocket::recv(const char* tag, void* data, size_t len) {
   while (len > 0) {
     auto n = ::recv(sock_, data, len, 0);

@@ -365,6 +365,21 @@ SideChannel::SideChannel(int rank, int size, const char* addr)
             }));
     sockets_[0].send(IBV_TAG, reinterpret_cast<char*>(&rank_), sizeof(int));
   }
+
+  // Bound coordinator recv()s so a stuck confirmed-barrier (a desynced peer
+  // that never sends) fails cleanly instead of hanging until the exo _check_hang
+  // SIGKILL. Generous enough (default 35s) that init/reconnect coordinator
+  // handshakes — which are fast and cross-rank synchronized — never trip it,
+  // but under the 45s hang watchdog. 0 disables.
+  int _recv_timeout = [] {
+    const char* e = std::getenv("MLX_JACCL_COORD_RECV_TIMEOUT_SECS");
+    return e ? std::atoi(e) : 35;
+  }();
+  if (_recv_timeout > 0) {
+    for (auto& s : sockets_) {
+      s.set_recv_timeout_secs(_recv_timeout);
+    }
+  }
 }
 
 SideChannel::SideChannel(SideChannel&& sc)

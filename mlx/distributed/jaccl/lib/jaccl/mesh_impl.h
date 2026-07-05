@@ -303,7 +303,7 @@ class MeshImpl {
         in_flight += 2 * num_peers;
         read_offset += N;
       }
-      coordinator_->all_gather<int>(0);
+      confirmed_coord_barrier(call_id, "pre");
       for (int b = first; b < buff; b++) {
         post_send_all(call_id, sz, b);
       }
@@ -806,6 +806,33 @@ class MeshImpl {
   //     our next-lambda send could arrive at peer's still-posted
   //     prior-lambda recv WR (different sz → IBV_WC_LOC_LEN_ERR).
   //
+  // Reliable confirmed barrier over the TCP coordinator, SELF-VERIFYING: every
+  // rank contributes its call_id and all must agree. If they don't, the ranks
+  // have desynced (one is at a different collective/barrier) — detect + throw
+  // immediately WITH a log, instead of silently corrupting the stream or
+  // hanging in recv forever. The coordinator sockets carry an SO_RCVTIMEO so a
+  // stuck barrier fails cleanly (throws) well before the 45s _check_hang.
+  void confirmed_coord_barrier(uint32_t call_id, const char* which) {
+    auto vals = coordinator_->all_gather<uint32_t>(call_id);
+    for (int i = 0; i < static_cast<int>(vals.size()); i++) {
+      if (vals[i] != call_id) {
+        std::fprintf(
+            stderr,
+            "[jaccl] CONFIRMED BARRIER DESYNC rank=%d %s: my call_id=%u but "
+            "rank %d reported call_id=%u\n",
+            rank_,
+            which,
+            call_id,
+            i,
+            vals[i]);
+        std::fflush(stderr);
+        throw std::runtime_error(
+            "[jaccl] confirmed barrier desync detected (ranks at different "
+            "collectives) — throwing for clean re-place");
+      }
+    }
+  }
+
   // CRITICAL: callers MUST post the per-peer ack_recv BEFORE any
   // other recvs in the lambda so the ack is at the head of the QP
   // recv queue and matches peer's ack_send first.
@@ -841,7 +868,7 @@ class MeshImpl {
     // in place of the UC ack exchange that wedges on a lost completion. This is
     // the barrier where the observed recv-side wedge occurs.
     if (coordinator_ != nullptr && jaccl_confirmed_barrier_post()) {
-      coordinator_->all_gather<int>(0);
+      confirmed_coord_barrier(call_id, "post");
       return;
     }
     bool _prog = jaccl_progress_enabled();
