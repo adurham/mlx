@@ -494,8 +494,8 @@ class MeshImpl {
             rank_, call_id, round, all_recv, num_chunks);
         std::fflush(stderr);
       }
-      auto gathered = coordinator_->all_gather(got);
-      const std::vector<uint8_t>& peer_got = gathered[peer];
+      auto peer_got = coordinator_->reliable_barrier(
+          call_id, static_cast<uint32_t>(round), got);
       bool i_have_all = std::count(got.begin(), got.end(), 1) == num_chunks;
       bool peer_has_all =
           std::count(peer_got.begin(), peer_got.end(), 1) == num_chunks;
