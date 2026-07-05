@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <span>
+#include <vector>
 #include <mach/mach_time.h>
 
 #include "jaccl/rdma.h"
@@ -181,6 +183,15 @@ inline bool jaccl_confirmed_barrier_post() {
       jaccl_env_true("MLX_JACCL_CONFIRMED_BARRIER_POST");
   return v;
 }
+// Reliable data-phase all_reduce (ARQ over UC): sequence-tagged chunks +
+// full-message assembly + coordinator-barrier bitmask retransmit, so a dropped
+// reduction chunk is detected and re-sent instead of wedging (all_reduce
+// STALLED). Requires a coordinator (top-level group). Default OFF (perf cost +
+// core-path change). Implies the confirmed barrier machinery.
+inline bool jaccl_reliable_data_enabled() {
+  static const bool v = jaccl_env_true("MLX_JACCL_RELIABLE_DATA");
+  return v;
+}
 
 // Watches a collective poll loop for a permanently-stuck in-flight counter
 // (a lost UC completion). tick() is called once per poll iteration with the
@@ -243,6 +254,182 @@ class MeshImpl {
     coordinator_ = coordinator;
   }
 
+  // Reliable data-phase all_reduce over UC (see jaccl_reliable_data_enabled).
+  // Chunks carry a 4-byte sequence header; the receiver assembles each peer's
+  // FULL message keyed by sequence (duplicates overwrite -> idempotent) and the
+  // reduction is deferred to the end and applied ONCE. A dropped chunk can't
+  // wedge: after a bounded drain, ranks exchange received-bitmasks over the
+  // reliable coordinator and retransmit exactly the missing chunks, looping
+  // until every chunk is in. Written for the 2-rank TP case (num_peers==1);
+  // larger meshes fall back to the UC path.
+  template <typename T, typename ReduceOp>
+  void reliable_all_reduce(
+      uint32_t call_id,
+      const T* in_ptr,
+      T* out_ptr,
+      int64_t size,
+      ReduceOp reduce_op) {
+    if (in_ptr != out_ptr) {
+      std::memcpy(out_ptr, in_ptr, size * sizeof(T));
+    }
+    if (size_ <= 1 || size == 0) {
+      return;
+    }
+    // Dispatch guarantees size_ == 2 (2-rank TP). Defensive guard otherwise.
+    if (size_ != 2) {
+      throw std::runtime_error(
+          "[jaccl] reliable_all_reduce only supports 2 ranks");
+    }
+    const int peer = (rank_ == 0) ? 1 : 0;
+    const int64_t total_bytes = size * static_cast<int64_t>(sizeof(T));
+    auto [sz, buffer_size] = buffer_size_from_message(total_bytes);
+    const int HDR = static_cast<int>(sizeof(uint32_t));
+    int64_t chunk_bytes = static_cast<int64_t>(buffer_size) - HDR;
+    chunk_bytes -= chunk_bytes % static_cast<int64_t>(sizeof(T));
+    const int num_chunks =
+        static_cast<int>((total_bytes + chunk_bytes - 1) / chunk_bytes);
+
+    std::vector<char> asm_buf(total_bytes, 0); // peer's full message, by seq
+    std::vector<uint8_t> got(num_chunks, 0); // chunks received from peer
+
+    // Fill send_buffer(buff) with chunk c of out_ptr (header + data) and post.
+    auto post_chunk = [&](int c, int buff) {
+      auto& sb = send_buffer(sz, buff);
+      char* p = sb.data<char>();
+      uint32_t hdr = static_cast<uint32_t>(c);
+      std::memcpy(p, &hdr, HDR);
+      int64_t off = static_cast<int64_t>(c) * chunk_bytes;
+      int64_t len = std::min(chunk_bytes, total_bytes - off);
+      std::memcpy(
+          p + HDR, reinterpret_cast<const char*>(out_ptr) + off,
+          static_cast<size_t>(len));
+      if (len < chunk_bytes) {
+        std::memset(
+            p + HDR + len, 0, static_cast<size_t>(chunk_bytes - len));
+      }
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_send(sb, make_wr_id(call_id, SEND_WR, buff, peer));
+    };
+    auto post_recv_buff = [&](int buff) {
+      auto& rb = recv_buffer(sz, buff, peer);
+      zero_recv_buffer(rb);
+      connections_[peer].post_recv(rb, make_wr_id(call_id, RECV_WR, buff, peer));
+    };
+    // Consume a RECV completion: read seq header, assemble if new.
+    auto consume_recv = [&](int buff) {
+      JACCL_DMA_BARRIER();
+      auto& rb = recv_buffer(sz, buff, peer);
+      const char* p = rb.data<char>();
+      uint32_t c;
+      std::memcpy(&c, p, HDR);
+      if (c < static_cast<uint32_t>(num_chunks) && !got[c]) {
+        int64_t off = static_cast<int64_t>(c) * chunk_bytes;
+        int64_t len = std::min(chunk_bytes, total_bytes - off);
+        std::memcpy(asm_buf.data() + off, p + HDR, static_cast<size_t>(len));
+        got[c] = 1;
+      }
+    };
+
+    int all_recv = static_cast<int>(std::count(got.begin(), got.end(), 1));
+    int next_send = 0; // first chunk index to (re)send this round
+    std::vector<uint8_t> to_resend(num_chunks, 0); // MY chunks the peer needs
+
+    // Post the recv pool ONCE; consumption re-posts each buffer, so the pool
+    // stays full across rounds (the peer retransmits into it).
+    for (int buff = 0; buff < NUM_BUFFERS; buff++) {
+      post_recv_buff(buff);
+    }
+
+    // Round-based reliable exchange.
+    const uint64_t drain_quiet_us = jaccl_ack_retransmit_us(); // reuse knob
+    const int max_rounds = std::max(8, jaccl_ack_retransmit_max()); // safety net
+    for (int round = 0;; round++) {
+      if (round > max_rounds) {
+        throw std::runtime_error(
+            "[jaccl] reliable_all_reduce exceeded max retransmit rounds "
+            "(link persistently dropping) — throwing for clean re-place");
+      }
+      const int send_from = (round == 0) ? 0 : next_send;
+      int outstanding_sends = 0;
+      int c = send_from;
+      // Prime up to NUM_BUFFERS sends (round 0 = all chunks; later = to_resend).
+      for (int buff = 0; c < num_chunks && buff < NUM_BUFFERS; c++) {
+        if (round == 0 || to_resend[c]) {
+          post_chunk(c, buff);
+          buff++;
+          outstanding_sends++;
+        }
+      }
+      // Drain: process send/recv completions until quiescent for drain_quiet_us.
+      uint64_t last_progress = mach_absolute_time();
+      while (true) {
+        if (all_recv >= num_chunks && outstanding_sends == 0 &&
+            c >= num_chunks) {
+          break; // nothing left to do this round
+        }
+        ibv_wc wc[16];
+        int n = poll(connections_, 16, wc);
+        if (n == 0) {
+          if (mach_ticks_to_us(mach_absolute_time() - last_progress) >
+              drain_quiet_us) {
+            break; // quiescent -> go to barrier
+          }
+          continue;
+        }
+        last_progress = mach_absolute_time();
+        for (int i = 0; i < n; i++) {
+          if (wr_id_call_id(wc[i].wr_id) != call_id) {
+            continue; // stale
+          }
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            continue; // dropped/erred completion — barrier+retransmit recovers
+          }
+          int wt = wr_id_work_type(wc[i].wr_id);
+          int wb = wr_id_buff(wc[i].wr_id);
+          if (wt == RECV_WR) {
+            consume_recv(wb);
+            all_recv = static_cast<int>(std::count(got.begin(), got.end(), 1));
+            post_recv_buff(wb); // replenish
+          } else if (wt == SEND_WR) {
+            outstanding_sends--;
+            // Advance the send pipeline in this buffer.
+            while (c < num_chunks && !(round == 0 || to_resend[c])) {
+              c++;
+            }
+            if (c < num_chunks) {
+              post_chunk(c, wb);
+              c++;
+              outstanding_sends++;
+            }
+          }
+        }
+      }
+      // Reliable barrier: exchange "chunks received from peer" bitmasks.
+      auto gathered = coordinator_->all_gather(got);
+      const std::vector<uint8_t>& peer_got = gathered[peer];
+      bool i_have_all = std::count(got.begin(), got.end(), 1) == num_chunks;
+      bool peer_has_all =
+          std::count(peer_got.begin(), peer_got.end(), 1) == num_chunks;
+      if (i_have_all && peer_has_all) {
+        break;
+      }
+      // Prepare retransmit set: MY chunks the peer is missing.
+      to_resend.assign(num_chunks, 0);
+      next_send = num_chunks;
+      for (int k = 0; k < num_chunks; k++) {
+        if (!peer_got[k]) {
+          to_resend[k] = 1;
+          if (k < next_send) {
+            next_send = k;
+          }
+        }
+      }
+    }
+
+    // All chunks present on both ranks: reduce peer's message into out ONCE.
+    reduce_op(reinterpret_cast<T*>(asm_buf.data()), out_ptr, size);
+  }
+
   template <typename T, typename ReduceOp>
   void all_reduce(
       uint32_t call_id,
@@ -250,6 +437,11 @@ class MeshImpl {
       T* out_ptr,
       int64_t size,
       ReduceOp reduce_op) {
+    // Reliable ARQ data path (gated). Top-level 2-rank group only.
+    if (coordinator_ != nullptr && size_ == 2 && jaccl_reliable_data_enabled()) {
+      reliable_all_reduce<T>(call_id, in_ptr, out_ptr, size, reduce_op);
+      return;
+    }
     bool _prog = jaccl_progress_enabled();
     if (_prog) {
       std::fprintf(
