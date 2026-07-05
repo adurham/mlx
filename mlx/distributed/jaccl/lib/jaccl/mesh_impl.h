@@ -294,6 +294,12 @@ class MeshImpl {
     std::vector<char> asm_buf(total_bytes, 0); // peer's full message, by seq
     std::vector<uint8_t> got(num_chunks, 0); // chunks received from peer
 
+    // Total-time deadline: converts any silent hang inside this collective into
+    // a clean, LOGGED throw (< the 20s Event::wait / 45s _check_hang) so we see
+    // exactly which phase/state is stuck.
+    const uint64_t _t0 = mach_absolute_time();
+    const uint64_t _deadline_us = 15000000;
+
     static std::atomic<int> _rd_calls{0};
     int _rd_n = _rd_calls.fetch_add(1);
     if (_rd_n < 8 || jaccl_progress_enabled()) {
@@ -396,6 +402,17 @@ class MeshImpl {
       uint64_t last_progress = mach_absolute_time();
       int prev_progress = all_recv + c;
       while (true) {
+        if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
+          std::fprintf(
+              stderr,
+              "[jaccl-reliable] DEADLINE rank=%d call_id=%u round=%d all_recv=%d "
+              "c=%d num_chunks=%d outstanding_sends=%d got_sum=%d phase=drain\n",
+              rank_, call_id, round, all_recv, c, num_chunks, outstanding_sends,
+              static_cast<int>(std::count(got.begin(), got.end(), 1)));
+          std::fflush(stderr);
+          throw std::runtime_error(
+              "[jaccl] reliable_all_reduce deadline in drain — clean re-place");
+        }
         if (all_recv >= num_chunks && outstanding_sends == 0 &&
             c >= num_chunks) {
           break; // nothing left to do this round
