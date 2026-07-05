@@ -101,6 +101,7 @@ void Event::wait() {
   // undercounts elapsed time by multiples and the timeout would not fire until
   // hundreds of real seconds — long after the 45s _check_hang SIGKILL.
   const auto start = std::chrono::steady_clock::now();
+  bool logged_slow = false;
   while (ev->signaledValue() < target) {
     if (spins < spin_iters) {
       ++spins;
@@ -114,17 +115,31 @@ void Event::wait() {
     // Unlike the kernel wait, this loop actually runs: surface a captured
     // stream-worker exception, then honor the total self-abort timeout.
     scheduler::throw_if_stream_exception();
-    if (timeout_us != 0) {
-      auto elapsed_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - start)
-              .count();
-      if (elapsed_us >= 0 && static_cast<uint64_t>(elapsed_us) >= timeout_us) {
-        throw std::runtime_error(
-            "[Event::wait] Timed out: GPU event not signaled and no stream "
-            "exception (peer rank stuck on an abandoned c>=2 collective); "
-            "surfacing a clean fault for in-place reconnect / restart.");
-      }
+    auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    // Diagnostic (only fires on a genuinely stuck wait — healthy waits finish
+    // in << 1s — so no hot-path spam): proves this poll is actually running on
+    // a wedged peer and accumulating wall-clock toward the self-abort.
+    if (!logged_slow && elapsed_us >= 3'000'000) {
+      logged_slow = true;
+      fprintf(
+          stderr,
+          "[Event::wait] slow wait: elapsed=%.1fs signaled=%llu target=%llu "
+          "(polling; self-abort at %llums)\n",
+          elapsed_us / 1e6,
+          static_cast<unsigned long long>(ev->signaledValue()),
+          static_cast<unsigned long long>(target),
+          static_cast<unsigned long long>(timeout_us / 1000));
+      fflush(stderr);
+    }
+    if (timeout_us != 0 && elapsed_us >= 0 &&
+        static_cast<uint64_t>(elapsed_us) >= timeout_us) {
+      throw std::runtime_error(
+          "[Event::wait] Timed out: GPU event not signaled and no stream "
+          "exception (peer rank stuck on an abandoned c>=2 collective); "
+          "surfacing a clean fault for in-place reconnect / restart.");
     }
     std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
   }

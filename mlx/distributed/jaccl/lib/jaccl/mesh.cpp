@@ -396,6 +396,13 @@ void MeshGroup::reconnect() {
         "[jaccl] reconnect is only supported on top-level groups");
   }
   const bool has_ack = !ack_connections_.empty();
+  fprintf(
+      stderr,
+      "[jaccl] reconnect rank=%d ENTER (size=%d has_ack=%d)\n",
+      rank_,
+      size_,
+      has_ack ? 1 : 0);
+  fflush(stderr);
 
   // 1. Reset every QP (flush wedged/in-flight WRs, drain stale CQEs).
   for (auto& conn : connections_) {
@@ -427,11 +434,15 @@ void MeshGroup::reconnect() {
     }
   }
 
+  fprintf(stderr, "[jaccl] reconnect rank=%d QPs reset+init; exchanging data QP info (blocks for peer)...\n", rank_);
+  fflush(stderr);
   std::vector<Destination> data_info;
   for (auto& conn : connections_) {
     data_info.emplace_back(conn.info());
   }
   auto data_all_infos = exchange(data_info);
+  fprintf(stderr, "[jaccl] reconnect rank=%d data QP info exchanged; exchanging ack QP info...\n", rank_);
+  fflush(stderr);
 
   std::vector<std::vector<Destination>> ack_all_infos;
   if (has_ack) {
@@ -441,6 +452,8 @@ void MeshGroup::reconnect() {
     }
     ack_all_infos = exchange(ack_info);
   }
+  fprintf(stderr, "[jaccl] reconnect rank=%d ack QP info exchanged; RTR/RTS...\n", rank_);
+  fflush(stderr);
 
   for (int peer = 0; peer < size_; peer++) {
     if (peer == rank_) {
@@ -458,7 +471,11 @@ void MeshGroup::reconnect() {
   //    QPs, then barrier so both ranks are ready before the next collective.
   mesh_.reset_ack_state();
   mesh_.post_ack_recvs(0);
+  fprintf(stderr, "[jaccl] reconnect rank=%d RTS done; final barrier...\n", rank_);
+  fflush(stderr);
   side_channel_->all_gather<int>(0);
+  fprintf(stderr, "[jaccl] reconnect rank=%d COMPLETE\n", rank_);
+  fflush(stderr);
 }
 
 void MeshGroup::allocate_buffers() {
