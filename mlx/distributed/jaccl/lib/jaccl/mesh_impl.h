@@ -7,7 +7,9 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <span>
+#include <thread>
 #include <vector>
 #include <mach/mach_time.h>
 
@@ -200,6 +202,15 @@ inline int jaccl_reliable_max_sz() {
   static const int v = [] {
     const char* e = std::getenv("MLX_JACCL_RELIABLE_MAX_SZ");
     return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
+// Microseconds to sleep per idle drain poll (0 completions). Prevents the
+// reliable-path drain from 100%-spinning and starving Metal/GPU threads.
+inline int jaccl_reliable_idle_us() {
+  static const int v = [] {
+    const char* e = std::getenv("MLX_JACCL_RELIABLE_IDLE_US");
+    return e ? std::atoi(e) : 15;
   }();
   return v;
 }
@@ -483,6 +494,14 @@ class MeshImpl {
               outstanding_sends++;
             }
           }
+        }
+        if (n == 0) {
+          // Idle poll: yield the core so two concurrent comm-worker drains don't
+          // 100%-spin and starve the Metal/GPU submission threads under
+          // sustained c>=2 load (which parks the peer's main thread in an
+          // uninterruptible GPU wait -> _check_hang). Tunable.
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(jaccl_reliable_idle_us()));
         }
       }
       // Reliable barrier: exchange "chunks received from peer" bitmasks.
