@@ -214,6 +214,17 @@ inline int jaccl_reliable_idle_us() {
   }();
   return v;
 }
+// Pipeline depth: how many chunks to keep in flight (sends AND recvs) at sz=0.
+// Small (4KB) UC sends are clean and can overlap, so pipelining hides the RTT
+// that made the stop-and-wait path too slow for c>=2 prefill. Capped at
+// NUM_BUFFERS at the call site. Default 2 (the current buffer allotment).
+inline int jaccl_reliable_inflight() {
+  static const int v = [] {
+    const char* e = std::getenv("MLX_JACCL_RELIABLE_INFLIGHT");
+    return e ? std::atoi(e) : 2;
+  }();
+  return v;
+}
 
 // Watches a collective poll loop for a permanently-stuck in-flight counter
 // (a lost UC completion). tick() is called once per poll iteration with the
@@ -315,8 +326,13 @@ class MeshImpl {
     chunk_bytes -= chunk_bytes % static_cast<int64_t>(sizeof(T));
     const int num_chunks =
         static_cast<int>((total_bytes + chunk_bytes - 1) / chunk_bytes);
-    // librdma rejects a 2nd concurrent large send on a UC QP; keep 1 in flight.
-    const int SEND_INFLIGHT = 1;
+    // Pipeline depth (sends + recvs kept in flight). Large UC sends can't
+    // overlap (ENOMEM), but at sz=0 (4KB, the only clean size) they can, so
+    // pipeline up to NUM_BUFFERS to hide RTT. Falls back to 1 for any capped-
+    // but-still-large size class, out of caution.
+    const int SEND_INFLIGHT =
+        (sz == 0) ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
+                  : 1;
 
     std::vector<char> asm_buf(total_bytes, 0); // peer's full message, by seq
     std::vector<uint8_t> got(num_chunks, 0); // chunks received from peer
@@ -402,12 +418,18 @@ class MeshImpl {
     int next_send = 0; // first chunk index to (re)send this round
     std::vector<uint8_t> to_resend(num_chunks, 0); // MY chunks the peer needs
 
-    // Single posted recv (stop-and-wait), re-posted ONLY while chunks are still
-    // expected. This leaves ZERO posted recv WRs on the data QP when the
-    // collective completes — otherwise leftover recvs grab the NEXT collective's
-    // sends (stale call_id -> skipped -> that collective's data is lost),
-    // causing retransmit churn and hangs. Buffer 0 only.
-    post_recv_buff(0);
+    // Sliding-window recv: keep up to min(RECV_INFLIGHT, num_chunks - all_recv)
+    // recvs posted. Capping by remaining chunks keeps the invariant
+    // posted_recvs <= num_chunks - all_recv, so ZERO recv WRs remain posted at
+    // completion (leftover recvs would grab the NEXT collective's sends -> stale
+    // call_id -> data lost -> churn/hang), while still pipelining depth
+    // RECV_INFLIGHT to hide RTT. Buffers 0..RECV_INFLIGHT-1.
+    const int RECV_INFLIGHT = SEND_INFLIGHT;
+    int posted_recvs = 0;
+    for (int b = 0; b < std::min(RECV_INFLIGHT, num_chunks); b++) {
+      post_recv_buff(b);
+      posted_recvs++;
+    }
 
     // Round-based reliable exchange.
     const uint64_t drain_quiet_us = jaccl_ack_retransmit_us(); // reuse knob
@@ -477,10 +499,13 @@ class MeshImpl {
           if (wt == RECV_WR) {
             consume_recv(wb);
             all_recv = static_cast<int>(std::count(got.begin(), got.end(), 1));
-            // Re-post ONLY while more chunks are still expected -> zero leftover
-            // recvs once we have everything.
-            if (all_recv < num_chunks) {
+            posted_recvs--;
+            // Sliding window: re-post only while posted stays <= remaining
+            // chunks -> zero leftover recvs once everything is received.
+            if (posted_recvs <
+                std::min(RECV_INFLIGHT, num_chunks - all_recv)) {
               post_recv_buff(wb);
+              posted_recvs++;
             }
           } else if (wt == SEND_WR) {
             outstanding_sends--;
