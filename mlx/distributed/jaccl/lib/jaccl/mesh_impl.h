@@ -292,6 +292,17 @@ class MeshImpl {
     std::vector<char> asm_buf(total_bytes, 0); // peer's full message, by seq
     std::vector<uint8_t> got(num_chunks, 0); // chunks received from peer
 
+    static std::atomic<int> _rd_calls{0};
+    int _rd_n = _rd_calls.fetch_add(1);
+    if (_rd_n < 8 || jaccl_progress_enabled()) {
+      std::fprintf(
+          stderr,
+          "[jaccl-reliable] ENTER rank=%d call_id=%u size=%lld total_bytes=%lld "
+          "sz=%d buffer_size=%lld chunk_bytes=%lld num_chunks=%d\n",
+          rank_, call_id, (long long)size, (long long)total_bytes, sz,
+          (long long)buffer_size, (long long)chunk_bytes, num_chunks);
+      std::fflush(stderr);
+    }
     // Fill send_buffer(buff) with chunk c of out_ptr (header + data) and post.
     auto post_chunk = [&](int c, int buff) {
       auto& sb = send_buffer(sz, buff);
@@ -308,7 +319,19 @@ class MeshImpl {
             p + HDR + len, 0, static_cast<size_t>(chunk_bytes - len));
       }
       JACCL_DMA_BARRIER();
-      connections_[peer].post_send(sb, make_wr_id(call_id, SEND_WR, buff, peer));
+      try {
+        connections_[peer].post_send(
+            sb, make_wr_id(call_id, SEND_WR, buff, peer));
+      } catch (const std::exception& e) {
+        std::fprintf(
+            stderr,
+            "[jaccl-reliable] post_send FAILED rank=%d call_id=%u c=%d buff=%d "
+            "num_chunks=%d buffer_size=%lld: %s\n",
+            rank_, call_id, c, buff, num_chunks, (long long)buffer_size,
+            e.what());
+        std::fflush(stderr);
+        throw;
+      }
     };
     auto post_recv_buff = [&](int buff) {
       auto& rb = recv_buffer(sz, buff, peer);
