@@ -288,6 +288,8 @@ class MeshImpl {
     chunk_bytes -= chunk_bytes % static_cast<int64_t>(sizeof(T));
     const int num_chunks =
         static_cast<int>((total_bytes + chunk_bytes - 1) / chunk_bytes);
+    // librdma rejects a 2nd concurrent large send on a UC QP; keep 1 in flight.
+    const int SEND_INFLIGHT = 1;
 
     std::vector<char> asm_buf(total_bytes, 0); // peer's full message, by seq
     std::vector<uint8_t> got(num_chunks, 0); // chunks received from peer
@@ -375,8 +377,10 @@ class MeshImpl {
       const int send_from = (round == 0) ? 0 : next_send;
       int outstanding_sends = 0;
       int c = send_from;
-      // Prime up to NUM_BUFFERS sends (round 0 = all chunks; later = to_resend).
-      for (int buff = 0; c < num_chunks && buff < NUM_BUFFERS; c++) {
+      // Prime SEND_INFLIGHT sends. Apple librdma rejects a 2nd concurrent large
+      // send on a UC QP with ENOMEM(-12) regardless of max_send_wr, so keep only
+      // one send outstanding (2 recvs + 1 send is confirmed OK). Perf later.
+      for (int buff = 0; c < num_chunks && buff < SEND_INFLIGHT; c++) {
         if (round == 0 || to_resend[c]) {
           post_chunk(c, buff);
           buff++;
