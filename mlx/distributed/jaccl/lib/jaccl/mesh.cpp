@@ -61,6 +61,9 @@ MeshGroup::MeshGroup(
       buffers_,
       ack_send_buffers_,
       ack_recv_buffers_);
+  // Give the top-level mesh the reliable TCP coordinator for the confirmed
+  // (ack-of-ack) barrier. side_channel_ is in-place and outlives mesh_.
+  mesh_.set_coordinator(&*side_channel_);
   ring_ = RingImpl(
       rank_,
       size_,

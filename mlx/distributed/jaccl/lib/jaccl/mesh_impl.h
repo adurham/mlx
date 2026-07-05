@@ -155,6 +155,18 @@ inline int jaccl_ack_retransmit_max() {
   }();
   return v;
 }
+// Confirmed (ack-of-ack) barrier. Default OFF (adds a round-trip per collective).
+// When ON, the ACK barrier is a reliable two-round handshake: a rank does not
+// proceed until it has confirmation the peer RECEIVED its ack — deterministically
+// closing the recv-side UC-drop race where one rank's ack is lost, it proceeds,
+// and the peer wedges. Enable for c>=2 correctness (perf penalty).
+inline bool jaccl_confirmed_barrier_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("MLX_JACCL_CONFIRMED_BARRIER");
+    return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+  }();
+  return v;
+}
 
 // Watches a collective poll loop for a permanently-stuck in-flight counter
 // (a lost UC completion). tick() is called once per poll iteration with the
@@ -210,6 +222,12 @@ class MeshImpl {
         ack_recv_buffers_(ack_recv_buffers) {}
 
   MeshImpl() : rank_(0), size_(1) {}
+
+  // Wire up the reliable TCP coordinator (top-level group only) for the
+  // confirmed (ack-of-ack) barrier. Non-owning; the SideChannel outlives this.
+  void set_coordinator(SideChannel* coordinator) {
+    coordinator_ = coordinator;
+  }
 
   template <typename T, typename ReduceOp>
   void all_reduce(
@@ -752,6 +770,16 @@ class MeshImpl {
   // other recvs in the lambda so the ack is at the head of the QP
   // recv queue and matches peer's ack_send first.
   void ack_sync_pre(uint32_t call_id) {
+    // Confirmed barrier: rendezvous both ranks over the reliable TCP coordinator
+    // (stream-ordered, no UC drops) instead of the UC ack exchange, which can
+    // wedge on a single lost completion. Deterministically prevents the
+    // recv-side race regardless of timing. Gated by MLX_JACCL_CONFIRMED_BARRIER
+    // (perf: one coordinator round-trip per barrier). Top-level group only
+    // (coordinator_ is null on subgroups → they keep the UC path).
+    if (coordinator_ != nullptr && jaccl_confirmed_barrier_enabled()) {
+      coordinator_->all_gather<int>(0);
+      return;
+    }
     // Defensive guard: skip if no dedicated ACK QP exists. Both
     // top-level and subgroup groups populate ack_connections_ when
     // ackqp-net is in effect; this guards against future regressions.
@@ -772,6 +800,13 @@ class MeshImpl {
   }
 
   void ack_sync_post(uint32_t call_id) {
+    // Confirmed barrier (see ack_sync_pre): reliable TCP-coordinator rendezvous
+    // in place of the UC ack exchange that wedges on a lost completion. This is
+    // the barrier where the observed recv-side wedge occurs.
+    if (coordinator_ != nullptr && jaccl_confirmed_barrier_enabled()) {
+      coordinator_->all_gather<int>(0);
+      return;
+    }
     bool _prog = jaccl_progress_enabled();
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers;
@@ -1079,6 +1114,10 @@ class MeshImpl {
   // ahead). drain_acks pulls from here first before polling the CQ.
   // Element = peer index. drain_acks already replenished the recv WR.
   std::vector<int> cached_ack_recvs_;
+  // Non-owning pointer to the top-level group's reliable TCP coordinator, used
+  // by the confirmed (ack-of-ack) barrier. nullptr on subgroups (no coordinator)
+  // and when the confirmed barrier is disabled. Set via set_coordinator().
+  SideChannel* coordinator_ = nullptr;
 };
 
 } // namespace jaccl
