@@ -160,11 +160,25 @@ inline int jaccl_ack_retransmit_max() {
 // proceed until it has confirmation the peer RECEIVED its ack — deterministically
 // closing the recv-side UC-drop race where one rank's ack is lost, it proceeds,
 // and the peer wedges. Enable for c>=2 correctness (perf penalty).
+inline bool jaccl_env_true(const char* name) {
+  const char* e = std::getenv(name);
+  return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+}
 inline bool jaccl_confirmed_barrier_enabled() {
-  static const bool v = [] {
-    const char* e = std::getenv("MLX_JACCL_CONFIRMED_BARRIER");
-    return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
-  }();
+  static const bool v = jaccl_env_true("MLX_JACCL_CONFIRMED_BARRIER");
+  return v;
+}
+// Split gates so pre vs post can be isolated (the pre barrier is entangled with
+// RDMA data-recv ordering; post runs after the data has drained). Either the
+// combined flag or the specific one enables each side.
+inline bool jaccl_confirmed_barrier_pre() {
+  static const bool v = jaccl_confirmed_barrier_enabled() ||
+      jaccl_env_true("MLX_JACCL_CONFIRMED_BARRIER_PRE");
+  return v;
+}
+inline bool jaccl_confirmed_barrier_post() {
+  static const bool v = jaccl_confirmed_barrier_enabled() ||
+      jaccl_env_true("MLX_JACCL_CONFIRMED_BARRIER_POST");
   return v;
 }
 
@@ -776,7 +790,7 @@ class MeshImpl {
     // recv-side race regardless of timing. Gated by MLX_JACCL_CONFIRMED_BARRIER
     // (perf: one coordinator round-trip per barrier). Top-level group only
     // (coordinator_ is null on subgroups → they keep the UC path).
-    if (coordinator_ != nullptr && jaccl_confirmed_barrier_enabled()) {
+    if (coordinator_ != nullptr && jaccl_confirmed_barrier_pre()) {
       coordinator_->all_gather<int>(0);
       return;
     }
@@ -803,7 +817,7 @@ class MeshImpl {
     // Confirmed barrier (see ack_sync_pre): reliable TCP-coordinator rendezvous
     // in place of the UC ack exchange that wedges on a lost completion. This is
     // the barrier where the observed recv-side wedge occurs.
-    if (coordinator_ != nullptr && jaccl_confirmed_barrier_enabled()) {
+    if (coordinator_ != nullptr && jaccl_confirmed_barrier_post()) {
       coordinator_->all_gather<int>(0);
       return;
     }
