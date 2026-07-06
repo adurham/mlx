@@ -36,7 +36,10 @@ constexpr int ACK_RECV_WR = 4;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;
-constexpr int NUM_BUFFERS = 2;
+// 8 buffers per size class so the reliable ARQ path can pipeline up to 8
+// sends+recvs in flight (MLX_JACCL_RELIABLE_INFLIGHT). Memory cost is a few
+// MB per peer; QP caps (MAX_SEND_WR/MAX_RECV_WR=32, CQ=64) accommodate it.
+constexpr int NUM_BUFFERS = 8;
 constexpr int FRAME_SIZE = 4096;
 
 // wr_id layout (64 bits):

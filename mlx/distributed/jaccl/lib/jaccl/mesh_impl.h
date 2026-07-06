@@ -327,12 +327,16 @@ class MeshImpl {
     const int num_chunks =
         static_cast<int>((total_bytes + chunk_bytes - 1) / chunk_bytes);
     // Pipeline depth (sends + recvs kept in flight). Large UC sends can't
-    // overlap (ENOMEM), but at sz=0 (4KB, the only clean size) they can, so
-    // pipeline up to NUM_BUFFERS to hide RTT. Falls back to 1 for any capped-
-    // but-still-large size class, out of caution.
-    const int SEND_INFLIGHT =
-        (sz == 0) ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
-                  : 1;
+    // overlap (a 2nd concurrent >=64KB send returns ENOMEM), but small sends
+    // (<=16KB, sz<=2) overlap cleanly — measured 2026-07-05 during the chunk-
+    // size bisection. Stop-and-wait at sz=2 capped the reliable path at
+    // ~105MB/s on an 80Gbps TB5 link (completion latency per 16KB chunk),
+    // which bounded long-context prefill at ~150 tok/s with the GPU 25% idle.
+    // Pipeline up to NUM_BUFFERS for every clean size class; depth 1 only for
+    // capped-but-still-large classes (sz>=3), out of caution.
+    const int SEND_INFLIGHT = (sz <= 2)
+        ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
+        : 1;
 
     std::vector<char> asm_buf(total_bytes, 0); // peer's full message, by seq
     std::vector<uint8_t> got(num_chunks, 0); // chunks received from peer
