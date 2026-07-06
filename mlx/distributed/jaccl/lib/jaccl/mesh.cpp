@@ -197,6 +197,10 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
   }
   (void)key; // reserved for sub-rank reassignment
 
+  // From this point our contexts may be borrowed by a subgroup —
+  // reconnect_fresh() (which closes them) is no longer safe.
+  has_split_ = true;
+
   // Build context list for the subgroup. JACCL_SPLIT_FRESH_CTX=1
   // opens fresh ibv_contexts per subgroup; default (unset) shares the
   // parent's context.
@@ -398,6 +402,27 @@ void MeshGroup::reconnect() {
     throw std::runtime_error(
         "[jaccl] reconnect is only supported on top-level groups");
   }
+
+  // Fresh (hard) mode: rebuild the device contexts and everything on top of
+  // them. Opt-in via MLX_JACCL_RECONNECT_FRESH=1; silently degrades to the
+  // QP-only reset once subgroups exist (they borrow our contexts).
+  // IMPORTANT: both ranks must take the SAME branch — has_split_ flips at
+  // split(), which is itself a collective executed in matching order on all
+  // ranks, and the env var must be set identically cluster-wide.
+  const char* fresh_env = std::getenv("MLX_JACCL_RECONNECT_FRESH");
+  if (fresh_env != nullptr && std::string_view(fresh_env) == "1") {
+    if (!has_split_) {
+      reconnect_fresh();
+      return;
+    }
+    fprintf(
+        stderr,
+        "[jaccl] reconnect rank=%d FRESH requested but subgroups borrow our "
+        "contexts — falling back to QP-only reset\n",
+        rank_);
+    fflush(stderr);
+  }
+
   const bool has_ack = !ack_connections_.empty();
   fprintf(
       stderr,
@@ -478,6 +503,82 @@ void MeshGroup::reconnect() {
   fflush(stderr);
   side_channel_->all_gather<int>(0);
   fprintf(stderr, "[jaccl] reconnect rank=%d COMPLETE\n", rank_);
+  fflush(stderr);
+}
+
+void MeshGroup::reconnect_fresh() {
+  fprintf(
+      stderr,
+      "[jaccl] reconnect_fresh rank=%d ENTER (size=%d) — closing device "
+      "contexts and rebuilding\n",
+      rank_,
+      size_);
+  fflush(stderr);
+
+  // 1. Tear down device-side state in reverse dependency order. Clearing the
+  //    buffer vectors runs SharedBuffer dtors, which deregister every MR —
+  //    this MUST happen before the owning PDs are dealloc'd. Clearing the
+  //    connection vectors then runs Connection dtors: destroy_qp,
+  //    destroy_cq, dealloc_pd, and (data connections own their ctx)
+  //    close_device. Ack connections borrow the data ctxs (owns_ctx=false),
+  //    so they are dropped FIRST while their ctx is still open.
+  buffers_.clear();
+  ack_send_buffers_.clear();
+  ack_recv_buffers_.clear();
+  ring_send_buffers_.clear();
+  ring_recv_buffers_.clear();
+  ack_connections_.clear();
+  connections_.clear();
+
+  // 2. Reopen the devices — fresh ibv contexts. This is the whole point:
+  //    the dead-path wedge lives somewhere in the preserved ctx/PD/CQ/MR
+  //    layer and only a fresh ibv_open_device clears it.
+  connections_ = create_connections(device_names_);
+  ack_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
+
+  // 3. Full bring-up, identical to the ctor: PD/CQ/QP creation, buffer
+  //    allocation + MR registration (BEFORE the INIT transition — macOS
+  //    librdma locks the QP's MR table there), INIT → exchange → RTR/RTS
+  //    over the surviving TCP side channel, then a barrier so no rank
+  //    proceeds before every rank finished QP setup.
+  initialize([this](const std::vector<Destination>& info) {
+    return side_channel_->all_gather(info);
+  });
+  side_channel_->all_gather<int>(0);
+
+  // 4. Rebuild the impl views — MeshImpl/RingImpl hold spans over the
+  //    vectors we just rebuilt, so the old instances dangle. A fresh
+  //    MeshImpl also starts with clean ACK bookkeeping (the equivalent of
+  //    reset_ack_state() on the soft path).
+  mesh_ = MeshImpl(
+      rank_,
+      size_,
+      connections_,
+      ack_connections_,
+      buffers_,
+      ack_send_buffers_,
+      ack_recv_buffers_);
+  mesh_.set_coordinator(&*side_channel_);
+  ring_ = RingImpl(
+      rank_,
+      size_,
+      &connections_[(rank_ + size_ - 1) % size_],
+      &connections_[(rank_ + 1) % size_],
+      1,
+      ring_send_buffers_,
+      ring_recv_buffers_);
+
+  mesh_.post_ack_recvs(0);
+
+  // Bootstrap barrier — same rationale as the ctor: neither rank may fire
+  // its first ack_sync_pre before BOTH have posted their ACK recv pool
+  // (UC silently drops sends into an empty recv queue).
+  side_channel_->all_gather<int>(0);
+
+  fprintf(stderr, "[jaccl] reconnect_fresh rank=%d COMPLETE\n", rank_);
   fflush(stderr);
 }
 
