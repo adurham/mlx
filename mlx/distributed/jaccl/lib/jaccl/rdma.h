@@ -33,6 +33,10 @@ constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
 constexpr int ACK_SEND_WR = 3;
 constexpr int ACK_RECV_WR = 4;
+// Standing-pool recv WR for the optimistic reliable path (reliable_all_reduce
+// v2). Pool recvs outlive individual collectives, so their wr_id call_id is a
+// sentinel (0) and message routing is by the in-band V2 wire header instead.
+constexpr int POOL_RECV_WR = 5;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;

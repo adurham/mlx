@@ -226,6 +226,35 @@ inline int jaccl_reliable_inflight() {
   return v;
 }
 
+// Optimistic reliable path (v2): eliminates the per-collective TCP coordinator
+// barrier for SMALL collectives (num_chunks <= jaccl_reliable_small_chunks).
+// Decode all_sums (8-24KB) become a single UC message each way with NO
+// rendezvous: a rank exits as soon as it has the peer's data and its own send
+// CQEs. Reliability is preserved by (a) a standing pre-posted recv pool that
+// can never be "not ready", (b) send buffers partitioned by call parity and
+// retained one collective so a stuck peer's quiet-timeout STATUS message
+// (carrying its got-bitmask) can be answered with retransmits from the NEXT
+// collective's poll loop, and (c) the unchanged 15s deadline as backstop.
+// Cross-collective skew is provably <= 1 (a rank cannot enter call K+1
+// without the peer's K data, which the peer only sends from inside K).
+// LARGE collectives (prefill) keep the TCP-barrier rendezvous exit (the
+// barrier is amortized there) but share the same standing recv pool and the
+// 12-byte {call_id, seq, len} wire header. Default OFF.
+inline bool jaccl_reliable_optimistic_enabled() {
+  static const bool v = jaccl_env_true("MLX_JACCL_RELIABLE_OPTIMISTIC");
+  return v;
+}
+// Max chunks for the optimistic (no-rendezvous) exit. Must stay <=
+// NUM_BUFFERS/2 - 1 (parity partition reserves one slot for STATUS).
+inline int jaccl_reliable_small_chunks() {
+  static const int v = [] {
+    const char* e = std::getenv("MLX_JACCL_RELIABLE_SMALL_CHUNKS");
+    int n = e ? std::atoi(e) : 3;
+    return std::min(n, NUM_BUFFERS / 2 - 1);
+  }();
+  return v;
+}
+
 // Watches a collective poll loop for a permanently-stuck in-flight counter
 // (a lost UC completion). tick() is called once per poll iteration with the
 // loop's current progress metric (in_flight, or need_send+need_recv): any
@@ -285,6 +314,456 @@ class MeshImpl {
   // confirmed (ack-of-ack) barrier. Non-owning; the SideChannel outlives this.
   void set_coordinator(SideChannel* coordinator) {
     coordinator_ = coordinator;
+  }
+
+  // ── reliable_all_reduce v2: optimistic, no per-collective TCP barrier ──
+  // See jaccl_reliable_optimistic_enabled() for the protocol summary. Wire
+  // format: every message is [V2Hdr{call_id, seq, len}][payload]. seq ==
+  // V2_STATUS_SEQ marks a STATUS message whose payload is the sender's
+  // got[] byte-mask for that call (sent only on quiet-timeout while stuck).
+
+  struct V2Hdr {
+    uint32_t call_id;
+    uint32_t seq;
+    uint32_t len;
+  };
+  static constexpr uint32_t V2_STATUS_SEQ = 0xFFFFFFFFu;
+  static constexpr int V2_HDR = static_cast<int>(sizeof(V2Hdr));
+
+  // Smallest size class (<= reliable cap) whose chunk capacity fits `msg` in
+  // ONE chunk; otherwise the cap class (chunked). Rounds UP unlike the legacy
+  // path so a decode 8KB all_sum is a single 16KB-class chunk, not two.
+  static int v2_size_class(int64_t msg) {
+    const int cap = std::min(jaccl_reliable_max_sz(), BUFFER_SIZES - 1);
+    for (int k = 0; k <= cap; k++) {
+      if (static_cast<int64_t>(FRAME_SIZE) * (1 << k) - V2_HDR >= msg) {
+        return k;
+      }
+    }
+    return cap;
+  }
+
+  void v2_ensure_pool(int peer) {
+    if (v2_pool_posted_) {
+      return;
+    }
+    v2_pool_sz_ = std::min(jaccl_reliable_max_sz(), BUFFER_SIZES - 1);
+    for (int b = 0; b < NUM_BUFFERS; b++) {
+      auto& rb = recv_buffer(v2_pool_sz_, b, peer);
+      zero_recv_buffer(rb);
+      connections_[peer].post_recv(rb, make_wr_id(0, POOL_RECV_WR, b, peer));
+    }
+    v2_pool_posted_ = true;
+    std::fprintf(
+        stderr,
+        "[jaccl-v2] rank=%d standing pool armed (%d recvs, sz=%d)\n",
+        rank_, NUM_BUFFERS, v2_pool_sz_);
+    std::fflush(stderr);
+  }
+
+  template <typename T, typename ReduceOp>
+  void reliable_all_reduce_v2(
+      uint32_t call_id,
+      const T* in_ptr,
+      T* out_ptr,
+      int64_t size,
+      ReduceOp reduce_op) {
+    if (in_ptr != out_ptr) {
+      std::memcpy(out_ptr, in_ptr, size * sizeof(T));
+    }
+    if (size_ <= 1 || size == 0) {
+      return;
+    }
+    if (size_ != 2) {
+      throw std::runtime_error(
+          "[jaccl] reliable_all_reduce_v2 only supports 2 ranks");
+    }
+    const int peer = (rank_ == 0) ? 1 : 0;
+    v2_ensure_pool(peer);
+
+    const int64_t total_bytes = size * static_cast<int64_t>(sizeof(T));
+    const int sz = v2_size_class(total_bytes);
+    const int64_t chunk_bytes =
+        static_cast<int64_t>(FRAME_SIZE) * (1 << sz) - V2_HDR;
+    const int num_chunks =
+        static_cast<int>((total_bytes + chunk_bytes - 1) / chunk_bytes);
+    const bool small = num_chunks <= jaccl_reliable_small_chunks();
+    const int half = NUM_BUFFERS / 2;
+    const int base = (call_id & 1) ? half : 0;
+    const int status_slot = base + half - 1;
+    // Data slots: small -> base+c (c < half-1, status slot reserved).
+    // Large -> rotate over all `half` parity slots.
+    const int data_slots = small ? (half - 1) : half;
+
+    std::vector<char> asm_buf(total_bytes, 0);
+    std::vector<uint8_t> got(num_chunks, 0);
+    int all_recv = 0;
+    std::vector<uint8_t> peer_want; // peer's missing-chunk mask (this call)
+    bool have_peer_status = false;
+    bool peer_in_call = false; // any message of THIS call seen from peer
+    int chunks_posted = 0; // first-pass sends issued
+
+    const uint64_t _t0 = mach_absolute_time();
+    const uint64_t _deadline_us = 15000000;
+    const uint64_t quiet_us = jaccl_ack_retransmit_us();
+
+    static std::atomic<int> _v2_calls{0};
+    const bool _log = _v2_calls.fetch_add(1) < 8 || jaccl_progress_enabled();
+    if (_log) {
+      std::fprintf(
+          stderr,
+          "[jaccl-v2] ENTER rank=%d call_id=%u total_bytes=%lld sz=%d "
+          "num_chunks=%d small=%d\n",
+          rank_, call_id, (long long)total_bytes, sz, num_chunks, small ? 1 : 0);
+      std::fflush(stderr);
+    }
+
+    // Apply lookahead stash from the previous call's loop.
+    if (v2_stash_.call_id == call_id) {
+      for (auto& [seq, bytes] : v2_stash_.chunks) {
+        if (seq < static_cast<uint32_t>(num_chunks) && !got[seq]) {
+          int64_t off = static_cast<int64_t>(seq) * chunk_bytes;
+          int64_t len = std::min(
+              static_cast<int64_t>(bytes.size()), total_bytes - off);
+          if (len > 0) {
+            std::memcpy(asm_buf.data() + off, bytes.data(), len);
+            got[seq] = 1;
+            all_recv++;
+          }
+        }
+      }
+      if (small && v2_stash_.has_status &&
+          v2_stash_.peer_got.size() ==
+              static_cast<size_t>(num_chunks)) {
+        peer_want.assign(num_chunks, 0);
+        for (int k = 0; k < num_chunks; k++) {
+          peer_want[k] = v2_stash_.peer_got[k] ? 0 : 1;
+        }
+        have_peer_status = true;
+      }
+      peer_in_call = true;
+      v2_stash_ = V2Stash{};
+    } else if (v2_stash_.call_id != 0 && v2_stash_.call_id < call_id) {
+      v2_stash_ = V2Stash{}; // stale
+    }
+
+    // Write chunk c of out_ptr (with header) into `slot` and post it.
+    auto post_chunk = [&](uint32_t c, int slot) {
+      auto& sb = send_buffer(sz, slot);
+      char* p = sb.data<char>();
+      int64_t off = static_cast<int64_t>(c) * chunk_bytes;
+      int64_t len = std::min(chunk_bytes, total_bytes - off);
+      V2Hdr hdr{call_id, c, static_cast<uint32_t>(len)};
+      std::memcpy(p, &hdr, V2_HDR);
+      std::memcpy(
+          p + V2_HDR, reinterpret_cast<const char*>(out_ptr) + off,
+          static_cast<size_t>(len));
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_send(
+          sb, make_wr_id(call_id, SEND_WR, slot, peer));
+      v2_send_outstanding_[slot]++;
+    };
+
+    auto post_status = [&]() {
+      auto& sb = send_buffer(v2_pool_sz_, status_slot);
+      char* p = sb.data<char>();
+      V2Hdr hdr{call_id, V2_STATUS_SEQ, static_cast<uint32_t>(num_chunks)};
+      std::memcpy(p, &hdr, V2_HDR);
+      std::memcpy(p + V2_HDR, got.data(), num_chunks);
+      JACCL_DMA_BARRIER();
+      connections_[peer].post_send(
+          sb, make_wr_id(call_id, SEND_WR, status_slot, peer));
+      v2_send_outstanding_[status_slot]++;
+    };
+
+    // Retransmit-service for the PREVIOUS small call: re-post the retained
+    // parity buffers verbatim (they still hold [hdr][payload]) when free.
+    auto service_prev = [&]() {
+      if (v2_prev_want_.empty() || !v2_prev_small_) {
+        return;
+      }
+      const int prev_base = (v2_prev_call_ & 1) ? half : 0;
+      for (int k = 0; k < v2_prev_num_chunks_; k++) {
+        int slot = prev_base + k;
+        if (v2_prev_want_[k] && v2_send_outstanding_[slot] == 0) {
+          auto& sb = send_buffer(v2_prev_sz_, slot);
+          connections_[peer].post_send(
+              sb, make_wr_id(v2_prev_call_, SEND_WR, slot, peer));
+          v2_send_outstanding_[slot]++;
+          v2_prev_want_[k] = 0;
+        }
+      }
+      bool any = false;
+      for (auto w : v2_prev_want_) {
+        any = any || (w != 0);
+      }
+      if (!any) {
+        v2_prev_want_.clear();
+      }
+    };
+
+    // Consume one standing-pool recv completion (buffer index `buff`).
+    // Returns true if it made forward progress for THIS call.
+    auto consume_pool = [&](int buff) -> bool {
+      JACCL_DMA_BARRIER();
+      auto& rb = recv_buffer(v2_pool_sz_, buff, peer);
+      const char* p = rb.data<char>();
+      V2Hdr hdr;
+      std::memcpy(&hdr, p, V2_HDR);
+      bool progress = false;
+      if (hdr.call_id == 0) {
+        // Spurious/empty completion (pre-zeroed buffer). Log and drop.
+        std::fprintf(
+            stderr, "[jaccl-v2] rank=%d empty pool recv (call=%u)\n",
+            rank_, call_id);
+      } else if (hdr.call_id == call_id) {
+        peer_in_call = true;
+        if (hdr.seq == V2_STATUS_SEQ) {
+          if (hdr.len == static_cast<uint32_t>(num_chunks)) {
+            peer_want.assign(num_chunks, 0);
+            for (int k = 0; k < num_chunks; k++) {
+              peer_want[k] =
+                  static_cast<uint8_t>(p[V2_HDR + k]) ? 0 : 1;
+            }
+            have_peer_status = true;
+            progress = true;
+          }
+        } else if (hdr.seq < static_cast<uint32_t>(num_chunks)) {
+          int64_t off = static_cast<int64_t>(hdr.seq) * chunk_bytes;
+          int64_t len = std::min(
+              static_cast<int64_t>(hdr.len), total_bytes - off);
+          if (!got[hdr.seq] && len > 0 &&
+              hdr.len <= static_cast<uint32_t>(chunk_bytes)) {
+            std::memcpy(asm_buf.data() + off, p + V2_HDR, len);
+            got[hdr.seq] = 1;
+            all_recv++;
+            progress = true;
+          }
+        }
+      } else if (hdr.call_id == call_id + 1) {
+        // Peer ran ahead (optimistic exit). Stash for the next call.
+        if (v2_stash_.call_id != call_id + 1) {
+          v2_stash_ = V2Stash{};
+          v2_stash_.call_id = call_id + 1;
+        }
+        if (hdr.seq == V2_STATUS_SEQ) {
+          v2_stash_.has_status = true;
+          v2_stash_.peer_got.assign(
+              p + V2_HDR, p + V2_HDR + std::min<uint32_t>(hdr.len, 16384));
+        } else if (v2_stash_.chunks.size() < 512) {
+          uint32_t len = std::min<uint32_t>(
+              hdr.len, static_cast<uint32_t>(rb.size() - V2_HDR));
+          v2_stash_.chunks.emplace_back(
+              hdr.seq, std::vector<char>(p + V2_HDR, p + V2_HDR + len));
+        }
+      } else if (hdr.call_id < call_id) {
+        if (hdr.seq == V2_STATUS_SEQ && hdr.call_id == v2_prev_call_ &&
+            v2_prev_small_ &&
+            hdr.len == static_cast<uint32_t>(v2_prev_num_chunks_)) {
+          // Peer is stuck in the previous call: queue retransmits.
+          v2_prev_want_.assign(v2_prev_num_chunks_, 0);
+          for (int k = 0; k < v2_prev_num_chunks_; k++) {
+            v2_prev_want_[k] =
+                static_cast<uint8_t>(p[V2_HDR + k]) ? 0 : 1;
+          }
+          std::fprintf(
+              stderr,
+              "[jaccl-v2] rank=%d call=%u serving retransmit for prev "
+              "call=%u\n",
+              rank_, call_id, hdr.call_id);
+          std::fflush(stderr);
+        }
+        // else: stale duplicate data — drop silently.
+      } else {
+        std::fprintf(
+            stderr,
+            "[jaccl-v2] PROTOCOL rank=%d call=%u got header call=%u seq=%u "
+            "(skew > 1)\n",
+            rank_, call_id, hdr.call_id, hdr.seq);
+        std::fflush(stderr);
+        throw std::runtime_error(
+            "[jaccl] reliable v2 protocol violation (skew > 1) — clean "
+            "re-place");
+      }
+      // Re-arm the pool slot (zero first so a dead DMA reads as empty).
+      zero_recv_buffer(rb);
+      connections_[peer].post_recv(
+          rb, make_wr_id(0, POOL_RECV_WR, buff, peer));
+      return progress;
+    };
+
+    auto my_slots_clear = [&]() {
+      for (int s = base; s < base + half; s++) {
+        if (v2_send_outstanding_[s] != 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    // Top-up first-pass sends into free parity slots. Runs every loop pass
+    // (NOT only on same-call CQEs) so busy slots from a previous call's
+    // retransmit sends cannot starve this call's pipeline.
+    auto top_up_sends = [&]() {
+      while (chunks_posted < num_chunks) {
+        int slot = base + (chunks_posted % data_slots);
+        if (v2_send_outstanding_[slot] != 0) {
+          break;
+        }
+        post_chunk(chunks_posted, slot);
+        chunks_posted++;
+      }
+    };
+    top_up_sends();
+
+    int round = 0; // TCP-barrier rounds (large path only)
+    uint64_t last_progress = mach_absolute_time();
+    while (true) {
+      if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
+        std::fprintf(
+            stderr,
+            "[jaccl-v2] DEADLINE rank=%d call_id=%u all_recv=%d/%d "
+            "chunks_posted=%d small=%d peer_in_call=%d\n",
+            rank_, call_id, all_recv, num_chunks, chunks_posted,
+            small ? 1 : 0, peer_in_call ? 1 : 0);
+        std::fflush(stderr);
+        throw std::runtime_error(
+            "[jaccl] reliable_all_reduce_v2 deadline — clean re-place");
+      }
+
+      top_up_sends();
+      // Retransmits owed to THIS call's peer (status-driven, both paths).
+      if (have_peer_status) {
+        bool all_served = true;
+        for (int k = 0; k < num_chunks; k++) {
+          if (!peer_want[k]) {
+            continue;
+          }
+          int slot = base + (k % data_slots);
+          if (v2_send_outstanding_[slot] == 0) {
+            post_chunk(static_cast<uint32_t>(k), slot);
+            peer_want[k] = 0;
+          } else {
+            all_served = false;
+          }
+        }
+        if (all_served) {
+          have_peer_status = false;
+        }
+      }
+      service_prev();
+
+      // Exit checks.
+      bool data_done = (all_recv >= num_chunks) &&
+          (chunks_posted >= num_chunks);
+      if (data_done && my_slots_clear()) {
+        if (small) {
+          break; // optimistic exit — no rendezvous
+        }
+        // Large: TCP rendezvous (barrier is amortized over many chunks and
+        // is the only sound reconciliation without retained buffers).
+        auto peer_got = coordinator_->reliable_barrier(
+            call_id, static_cast<uint32_t>(round), got);
+        round++;
+        bool peer_has_all = std::count(
+            peer_got.begin(), peer_got.end(), 1) == num_chunks;
+        if (peer_has_all) {
+          break;
+        }
+        for (int k = 0; k < num_chunks; k++) {
+          if (!peer_got[k]) {
+            int slot = base + (k % half);
+            // Serve immediately when free; else next loop pass (peer_want).
+            if (v2_send_outstanding_[slot] == 0) {
+              post_chunk(static_cast<uint32_t>(k), slot);
+            } else {
+              if (peer_want.empty()) {
+                peer_want.assign(num_chunks, 0);
+              }
+              peer_want[k] = 1;
+              have_peer_status = true;
+            }
+          }
+        }
+        last_progress = mach_absolute_time();
+        continue;
+      }
+
+      ibv_wc wc[16];
+      int n = poll(connections_, 16, wc);
+      bool progressed = false;
+      for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          continue;
+        }
+        int wt = wr_id_work_type(wc[i].wr_id);
+        int wb = wr_id_buff(wc[i].wr_id);
+        if (wt == POOL_RECV_WR) {
+          progressed |= consume_pool(wb);
+        } else if (wt == SEND_WR) {
+          if (wb >= 0 && wb < NUM_BUFFERS && v2_send_outstanding_[wb] > 0) {
+            v2_send_outstanding_[wb]--;
+          }
+          progressed = true;
+        }
+        // Other completion types (legacy RECV_WR/ACK from a mode switch)
+        // are ignored; v2 is all-or-nothing per process.
+      }
+      if (progressed) {
+        last_progress = mach_absolute_time();
+        continue;
+      }
+      if (n == 0) {
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(jaccl_reliable_idle_us()));
+      }
+      if (quiet_us != 0 &&
+          mach_ticks_to_us(mach_absolute_time() - last_progress) >
+              quiet_us) {
+        last_progress = mach_absolute_time();
+        if (small) {
+          // Stuck: tell the peer what I have (idempotent; resent each
+          // quiet period until the data flows).
+          if (v2_send_outstanding_[status_slot] == 0) {
+            post_status();
+          }
+        } else if (all_recv < num_chunks && peer_in_call) {
+          // Large path quiet with peer provably in this call: barrier to
+          // exchange bitmasks and trigger retransmits (legacy semantics).
+          auto peer_got = coordinator_->reliable_barrier(
+              call_id, static_cast<uint32_t>(round), got);
+          round++;
+          for (int k = 0; k < num_chunks; k++) {
+            if (!peer_got[k]) {
+              if (peer_want.empty()) {
+                peer_want.assign(num_chunks, 0);
+              }
+              peer_want[k] = 1;
+              have_peer_status = true;
+            }
+          }
+        }
+        if (round > std::max(8, jaccl_ack_retransmit_max())) {
+          throw std::runtime_error(
+              "[jaccl] reliable v2 exceeded max retransmit rounds — clean "
+              "re-place");
+        }
+      }
+    }
+
+    // Retain retransmit-service info for the next call's loop.
+    v2_prev_call_ = call_id;
+    v2_prev_num_chunks_ = num_chunks;
+    v2_prev_sz_ = sz;
+    v2_prev_small_ = small;
+
+    reduce_op(reinterpret_cast<T*>(asm_buf.data()), out_ptr, size);
+    if (_log) {
+      std::fprintf(
+          stderr, "[jaccl-v2] EXIT rank=%d call_id=%u rounds=%d\n",
+          rank_, call_id, round);
+      std::fflush(stderr);
+    }
   }
 
   // Reliable data-phase all_reduce over UC (see jaccl_reliable_data_enabled).
@@ -576,7 +1055,11 @@ class MeshImpl {
       ReduceOp reduce_op) {
     // Reliable ARQ data path (gated). Top-level 2-rank group only.
     if (coordinator_ != nullptr && size_ == 2 && jaccl_reliable_data_enabled()) {
-      reliable_all_reduce<T>(call_id, in_ptr, out_ptr, size, reduce_op);
+      if (jaccl_reliable_optimistic_enabled()) {
+        reliable_all_reduce_v2<T>(call_id, in_ptr, out_ptr, size, reduce_op);
+      } else {
+        reliable_all_reduce<T>(call_id, in_ptr, out_ptr, size, reduce_op);
+      }
       return;
     }
     bool _prog = jaccl_progress_enabled();
@@ -1101,6 +1584,16 @@ class MeshImpl {
   // belonged to the pre-wedge connection and must not carry into the fresh one.
   void reset_ack_state() {
     cached_ack_recvs_.clear();
+    // v2 optimistic-path state belonged to the pre-reconnect QPs.
+    v2_pool_posted_ = false;
+    v2_stash_ = V2Stash{};
+    v2_prev_call_ = 0;
+    v2_prev_num_chunks_ = 0;
+    v2_prev_sz_ = 0;
+    v2_prev_small_ = false;
+    v2_prev_want_.clear();
+    std::fill(
+        std::begin(v2_send_outstanding_), std::end(v2_send_outstanding_), 0);
   }
 
   void post_ack_recvs(uint32_t call_id) {
@@ -1507,6 +2000,33 @@ class MeshImpl {
   // ahead). drain_acks pulls from here first before polling the CQ.
   // Element = peer index. drain_acks already replenished the recv WR.
   std::vector<int> cached_ack_recvs_;
+
+  // ── reliable_all_reduce v2 (optimistic) state ──
+  // One-collective lookahead: messages whose header call_id == current+1
+  // (peer exited optimistically and ran ahead). Applied on entry to that call.
+  struct V2Stash {
+    uint32_t call_id = 0;
+    bool has_status = false;
+    std::vector<uint8_t> peer_got;
+    std::vector<std::pair<uint32_t, std::vector<char>>> chunks; // (seq, bytes)
+  };
+  V2Stash v2_stash_;
+  bool v2_pool_posted_ = false;
+  int v2_pool_sz_ = 0; // size class of the standing pool recv buffers
+  // Previous call's retransmit-service info. Valid only when the previous
+  // call was small (optimistic exit): its parity send buffers still hold the
+  // exact wire bytes and can be re-posted verbatim to serve a stuck peer.
+  uint32_t v2_prev_call_ = 0;
+  int v2_prev_num_chunks_ = 0;
+  int v2_prev_sz_ = 0;
+  bool v2_prev_small_ = false;
+  // Chunks of the previous call the peer still needs (status-driven), served
+  // opportunistically from any later call's poll loop as slots free up.
+  std::vector<uint8_t> v2_prev_want_;
+  // Outstanding send WRs per send-buffer slot. A slot may only be rewritten
+  // once its previous WR has completed (the NIC reads the buffer at transmit
+  // time). CQEs from any call decrement by wr_id buff index.
+  int v2_send_outstanding_[NUM_BUFFERS] = {0};
   // Non-owning pointer to the top-level group's reliable TCP coordinator, used
   // by the confirmed (ack-of-ack) barrier. nullptr on subgroups (no coordinator)
   // and when the confirmed barrier is disabled. Set via set_coordinator().
