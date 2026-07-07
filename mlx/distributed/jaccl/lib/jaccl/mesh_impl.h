@@ -330,17 +330,16 @@ class MeshImpl {
   static constexpr uint32_t V2_STATUS_SEQ = 0xFFFFFFFFu;
   static constexpr int V2_HDR = static_cast<int>(sizeof(V2Hdr));
 
-  // Smallest size class (<= reliable cap) whose chunk capacity fits `msg` in
-  // ONE chunk; otherwise the cap class (chunked). Rounds UP unlike the legacy
-  // path so a decode 8KB all_sum is a single 16KB-class chunk, not two.
+  // v2 uses ONE uniform size class (the reliable cap) for every message.
+  // Apple librdma errors when a send's size class doesn't match the posted
+  // recv's (IBV_WC_LOC_LEN_ERR — the same FIFO-mismatch that motivated the
+  // subgroup ACK QP), and the standing pool recvs are posted long before the
+  // message sizes are known. Uniform framing sidesteps the whole class:
+  // decode all_sums (8-24KB) are 1-2 chunks; a 2-byte barrier wastes a frame
+  // (1.6us wire time at 80Gbps — irrelevant).
   static int v2_size_class(int64_t msg) {
-    const int cap = std::min(jaccl_reliable_max_sz(), BUFFER_SIZES - 1);
-    for (int k = 0; k <= cap; k++) {
-      if (static_cast<int64_t>(FRAME_SIZE) * (1 << k) - V2_HDR >= msg) {
-        return k;
-      }
-    }
-    return cap;
+    (void)msg;
+    return std::min(jaccl_reliable_max_sz(), BUFFER_SIZES - 1);
   }
 
   void v2_ensure_pool(int peer) {
@@ -693,11 +692,27 @@ class MeshImpl {
       int n = poll(connections_, 16, wc);
       bool progressed = false;
       for (int i = 0; i < n; i++) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          continue;
-        }
         int wt = wr_id_work_type(wc[i].wr_id);
         int wb = wr_id_buff(wc[i].wr_id);
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          // A dropped/erred completion must not leak its WR slot: log it,
+          // and re-arm pool recvs / free send slots so retransmit recovers.
+          std::fprintf(
+              stderr,
+              "[jaccl-v2] WC_ERR rank=%d call=%u status=%d wt=%d buff=%d\n",
+              rank_, call_id, static_cast<int>(wc[i].status), wt, wb);
+          std::fflush(stderr);
+          if (wt == POOL_RECV_WR && wb >= 0 && wb < NUM_BUFFERS) {
+            auto& rb = recv_buffer(v2_pool_sz_, wb, peer);
+            zero_recv_buffer(rb);
+            connections_[peer].post_recv(
+                rb, make_wr_id(0, POOL_RECV_WR, wb, peer));
+          } else if (wt == SEND_WR && wb >= 0 && wb < NUM_BUFFERS &&
+                     v2_send_outstanding_[wb] > 0) {
+            v2_send_outstanding_[wb]--;
+          }
+          continue;
+        }
         if (wt == POOL_RECV_WR) {
           progressed |= consume_pool(wb);
         } else if (wt == SEND_WR) {
