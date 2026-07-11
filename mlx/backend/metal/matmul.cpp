@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <numeric>
 #include <sstream>
 
@@ -1298,6 +1299,58 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         /* Shape batch_shape = */ std::move(batch_shape),
         /* Strides A_batch_stride = */ std::move(A_batch_stride),
         /* Strides B_batch_stride = */ std::move(B_batch_stride));
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Batch-invariant small-M route (MLX_GEMV_BATCH_INVARIANT=1, default off)
+  //
+  // MLX's gemv (M == 1) and steel gemm (M >= 2) kernels round differently
+  // (measured ~6e-5 per bf16 matmul at K=N=4096), so the same activation
+  // row produces different bytes depending on the batch M it rides in.
+  // Autoregressive serving that mixes M=1 decode with small-M batched
+  // forwards over the SAME token stream (speculative verify, batched
+  // insert) accumulates that drift until a near-tied argmax flips.
+  //
+  // This route dispatches M in [2, 8] as a BATCH of M gemvs: the rows are
+  // folded into the kernel's batch dims (the vector advances by the row
+  // stride, the shared weight matrix has batch stride 0), so every row
+  // runs the exact kernel + config the M == 1 path uses — bitwise
+  // identical per row by construction. Cost: the weight matrix is re-read
+  // once per row, negligible for the small unquantized matmuls this
+  // targets (router gates, hyper-connection mixes); large-M work stays on
+  // steel.
+  static const bool gemv_batch_invariant = []() {
+    const char* v = std::getenv("MLX_GEMV_BATCH_INVARIANT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  if (gemv_batch_invariant && !a_transposed && M >= 2 && M <= 8 &&
+      a_cols == K) {
+    Shape bi_shape = std::move(batch_shape);
+    Strides bi_a = std::move(A_batch_stride);
+    Strides bi_b = std::move(B_batch_stride);
+    bi_shape.push_back(M);
+    bi_a.push_back(K); // contiguous rows (a_cols == K checked above)
+    bi_b.push_back(0); // weights shared across the M rows
+    // bi_shape.size() >= 2 keeps gemv on its general-strides (nc) path,
+    // which honors the per-input batch strides above.
+    return gemv(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& a = */ a,
+        /* const array& b = */ b,
+        /* array& out = */ out,
+        /* int M = */ 1,
+        /* int N = */ N,
+        /* int K = */ K,
+        /* int batch_size_out = */ batch_size_out * M,
+        /* int lda = */ a_cols,
+        /* int ldb = */ b_cols,
+        /* bool transpose_a = */ a_transposed,
+        /* bool transpose_b = */ b_transposed,
+        /* std::vector<array>& copies = */ copies,
+        /* Shape batch_shape = */ std::move(bi_shape),
+        /* Strides A_batch_stride = */ std::move(bi_a),
+        /* Strides B_batch_stride = */ std::move(bi_b));
   }
 
   /////////////////////////////////////////////////////////////////////////////
