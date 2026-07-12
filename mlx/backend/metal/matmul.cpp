@@ -82,6 +82,21 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
 
 } // namespace
 
+// MLX_GEMV_BATCH_INVARIANT=1 (default off): batch-size-invariant dispatch.
+// A row's bytes must not depend on how many other rows share the batch, so
+// every dispatch heuristic keyed on batch size is pinned to its batch==1
+// decision under this flag: the small-M gemv fold and generalized collapse
+// in Matmul::eval_gpu, the gemv kernel-variant pin in gemv_axbpy, the
+// GEMM_TPARAM_MACRO tile product, and the split-K route gates in
+// steel_matmul_axpby.
+static bool gemv_batch_invariant_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_GEMV_BATCH_INVARIANT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return enabled;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Steel matmul fallback
 ///////////////////////////////////////////////////////////////////////////////
@@ -108,7 +123,12 @@ ensure_batch_contiguous(const array& x, metal::Device& d, const Stream& s) {
       wn = 2;                                                             \
     }                                                                     \
   } else if (devc == 'd') { /* Large device */                            \
-    if ((size_t)batch_size_out * M * N >= 1ul << 20) { /* large matmul */ \
+    /* batch-invariance: the tile choice must not depend on how many     */\
+    /* batch elements ride along, or the same (M,N,K) problem reduces    */\
+    /* in a different order at different batch sizes                     */\
+    if ((gemv_batch_invariant_enabled()                                   \
+             ? (size_t)M * N                                              \
+             : (size_t)batch_size_out * M * N) >= 1ul << 20) {            \
       if (out.dtype() != float32) { /* half and bfloat */                 \
         if (2 * std::max(M, N) > K) { /* Reasonable K */                  \
           bm = 64;                                                        \
@@ -921,8 +941,12 @@ void steel_matmul_axpby(
 
   // Case 1: Small M×N with large K, use SIMD split-K
   // Max and Ultra dispatch larger sizes to splitk
-  if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
-      _tk >= 8 && K >= std::max(M, N)) {
+  // batch-invariance: split-K is a different reduction order and only
+  // exists for batch==1, so a row would round differently solo vs inside
+  // a batch (observed on the sdpa-fallback output matmul M=64, K=kv_len).
+  // Under MLX_GEMV_BATCH_INVARIANT take the regular kernel everywhere.
+  if (!gemv_batch_invariant_enabled() && !use_nax && batch_size_out == 1 &&
+      (_tm * _tn) <= min_tmn_threshold && _tk >= 8 && K >= std::max(M, N)) {
     return steel_gemm_splitk_axpby<CHECK_AB>(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,
@@ -944,7 +968,8 @@ void steel_matmul_axpby(
   }
 
   // Case 2: Large K with sufficient M, N, and NAX is available, use NAX split-K
-  if (use_nax && batch_size_out == 1 &&
+  // (same batch-invariance pin as Case 1)
+  if (!gemv_batch_invariant_enabled() && use_nax && batch_size_out == 1 &&
       (K >= 3 * std::max(M, N) ||
        (std::max(M, N) <= 1024 && K > 2 * std::max(M, N)))) {
     return steel_gemm_splitk_axpby_nax<CHECK_AB>(
@@ -1079,6 +1104,11 @@ void gemv_axbpy(
 
   // Determine if inputs have simple batching / broadcasting
   bool contiguous_kernel = (batch_shape.size() == 1);
+  // (Batch-invariance note: the contiguous and general-strides gemv
+  // variants were checked for divergence during the 2026-07-11 sdpa drift
+  // hunt and are bitexact on the serving shapes — the drift was the
+  // steel-vs-gemv route split and split-K, both pinned elsewhere. A
+  // blanket nc pin here costs 5-40% per gemv call, so none is applied.)
 
   int batch_ndim = batch_shape.size();
 
@@ -1275,6 +1305,30 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     B_batch_stride = {0};
     batch_shape = {1};
   }
+  // Batch-invariance for the collapse itself (MLX_GEMV_BATCH_INVARIANT=1):
+  // the rank-1 collapse above folds broadcast batch dims (e.g. the repeated
+  // heads of an MQA attention fallback) into M and rides steel gemm, but a
+  // leading real batch dim (rank >= 2, e.g. two decode streams) skipped the
+  // collapse entirely and fell to batched gemv — a different kernel class
+  // with a different accumulation order (~2 ulp bf16 on the sdpa-fallback
+  // shapes, 2026-07-11), so a stream's attention rounds differently solo vs
+  // batched. Generalize: collapse the LAST batch dim into M whenever it has
+  // the contiguous-A / broadcast-B structure, keeping the leading dims as
+  // the kernel batch. Every stream then takes the same steel kernel at the
+  // same M regardless of how many streams share the batch — and the shared
+  // B is read once per tile instead of once per folded row.
+  else if (
+      gemv_batch_invariant_enabled() && batch_size_out > 1 && !a_transposed &&
+      batch_shape.size() >= 2 && a.strides()[a.ndim() - 2] == K &&
+      A_batch_stride.back() == static_cast<int64_t>(M) * K &&
+      B_batch_stride.back() == 0) {
+    int folded = batch_shape.back();
+    M *= folded;
+    batch_size_out /= folded;
+    batch_shape.pop_back();
+    A_batch_stride.pop_back();
+    B_batch_stride.pop_back();
+  }
 
   /////////////////////////////////////////////////////////////////////////////
   // Gemv specialization
@@ -1319,11 +1373,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // once per row, negligible for the small unquantized matmuls this
   // targets (router gates, hyper-connection mixes); large-M work stays on
   // steel.
-  static const bool gemv_batch_invariant = []() {
-    const char* v = std::getenv("MLX_GEMV_BATCH_INVARIANT");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
-  }();
-  if (gemv_batch_invariant && !a_transposed && M >= 2 && M <= 8 &&
+  if (gemv_batch_invariant_enabled() && !a_transposed && M >= 2 && M <= 8 &&
       a_cols == K) {
     Shape bi_shape = std::move(batch_shape);
     Strides bi_a = std::move(A_batch_stride);
