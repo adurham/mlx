@@ -97,6 +97,20 @@ static bool gemv_batch_invariant_enabled() {
   return enabled;
 }
 
+// MLX_STEEL_BATCH_INVARIANT=1 (default off): extends batch invariance to
+// the steel dispatch heuristics (generalized collapse-into-M, tile
+// selection by M*N, split-K pinned off). Needed for cross-batch-size
+// bitexactness (c=1 rows == c>=2 rows); costs ~5% single-stream decode on
+// DSv4 (split-K retirement on the attention output matmul), so it is a
+// separate opt-in from MLX_GEMV_BATCH_INVARIANT.
+static bool steel_batch_invariant_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_STEEL_BATCH_INVARIANT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return enabled;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Steel matmul fallback
 ///////////////////////////////////////////////////////////////////////////////
@@ -126,7 +140,7 @@ static bool gemv_batch_invariant_enabled() {
     /* batch-invariance: the tile choice must not depend on how many     */\
     /* batch elements ride along, or the same (M,N,K) problem reduces    */\
     /* in a different order at different batch sizes                     */\
-    if ((gemv_batch_invariant_enabled()                                   \
+    if ((steel_batch_invariant_enabled()                                  \
              ? (size_t)M * N                                              \
              : (size_t)batch_size_out * M * N) >= 1ul << 20) {            \
       if (out.dtype() != float32) { /* half and bfloat */                 \
@@ -945,7 +959,7 @@ void steel_matmul_axpby(
   // exists for batch==1, so a row would round differently solo vs inside
   // a batch (observed on the sdpa-fallback output matmul M=64, K=kv_len).
   // Under MLX_GEMV_BATCH_INVARIANT take the regular kernel everywhere.
-  if (!gemv_batch_invariant_enabled() && !use_nax && batch_size_out == 1 &&
+  if (!steel_batch_invariant_enabled() && !use_nax && batch_size_out == 1 &&
       (_tm * _tn) <= min_tmn_threshold && _tk >= 8 && K >= std::max(M, N)) {
     return steel_gemm_splitk_axpby<CHECK_AB>(
         /* const Stream& s = */ s,
@@ -969,7 +983,7 @@ void steel_matmul_axpby(
 
   // Case 2: Large K with sufficient M, N, and NAX is available, use NAX split-K
   // (same batch-invariance pin as Case 1)
-  if (!gemv_batch_invariant_enabled() && use_nax && batch_size_out == 1 &&
+  if (!steel_batch_invariant_enabled() && use_nax && batch_size_out == 1 &&
       (K >= 3 * std::max(M, N) ||
        (std::max(M, N) <= 1024 && K > 2 * std::max(M, N)))) {
     return steel_gemm_splitk_axpby_nax<CHECK_AB>(
@@ -1318,7 +1332,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // same M regardless of how many streams share the batch — and the shared
   // B is read once per tile instead of once per folded row.
   else if (
-      gemv_batch_invariant_enabled() && batch_size_out > 1 && !a_transposed &&
+      steel_batch_invariant_enabled() && batch_size_out > 1 && !a_transposed &&
       batch_shape.size() >= 2 && a.strides()[a.ndim() - 2] == K &&
       A_batch_stride.back() == static_cast<int64_t>(M) * K &&
       B_batch_stride.back() == 0) {
