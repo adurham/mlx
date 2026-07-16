@@ -1129,7 +1129,8 @@ bool ScaledDotProductAttention::use_fallback(
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
        sdpa_full_large_hd_ok ||
-       query_head_dim == 512);
+       (query_head_dim == 512 &&
+        std::getenv("MLX_SDPA_D512_FUSED") != nullptr));
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);
