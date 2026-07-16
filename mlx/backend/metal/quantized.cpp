@@ -1390,8 +1390,16 @@ void gather_qmm_rhs_lhs(
   array lhs_indices = ensure_row_contiguous(lhs_indices_, d, s);
   array rhs_indices = ensure_row_contiguous(rhs_indices_, d, s);
 
-  int bm = 16, bn = 32, bk = 32;
-  int wm = 1, wn = 2;
+  // Tile config — env-overridable for sweep (MLX_GQMM_RHS_LHS_BM etc.)
+  auto tile_env = [](const char* name, int def) -> int {
+    const char* v = std::getenv(name);
+    return v ? std::atoi(v) : def;
+  };
+  int bm = tile_env("MLX_GQMM_RHS_LHS_BM", 16);
+  int bn = tile_env("MLX_GQMM_RHS_LHS_BN", 32);
+  int bk = tile_env("MLX_GQMM_RHS_LHS_BK", 32);
+  int wm = tile_env("MLX_GQMM_RHS_LHS_WM", 1);
+  int wn = tile_env("MLX_GQMM_RHS_LHS_WN", 2);
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
