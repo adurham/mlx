@@ -415,10 +415,12 @@ class RingImpl {
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS;
 
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
-    // PP p2p send fix: force small buffer class (sz=0, N=FRAME_SIZE) to avoid
-    // large UC sends that silently drop. See commit a8c5b9e90 for the same fix
-    // applied to the reliable collective path.
-    auto [sz, N] = std::pair<int, int64_t>{0, FRAME_SIZE};
+    // PP p2p send fix: cap to 64KB chunks (sz=4). The original code used
+    // buffer_size_from_message which picks up to 512KB for large sends.
+    // Large UC sends silently drop (receiver RQ overrun). 4KB (sz=0) works
+    // but is too slow (4096 chunks for 16MB). 64KB is 256 chunks — 16x fewer.
+    // May still drop on UC; if so, fall back to 4KB.
+    auto [sz, N] = std::pair<int, int64_t>{4, FRAME_SIZE * (1 << 4)};
 
     int in_flight = 0;
     int64_t read_offset[RING_MAX_CONNS];
@@ -486,8 +488,8 @@ class RingImpl {
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS;
 
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
-    // PP p2p recv fix: match the send-side small buffer class cap.
-    auto [sz, N] = std::pair<int, int64_t>{0, FRAME_SIZE};
+    // PP p2p recv fix: match the send-side 64KB cap.
+    auto [sz, N] = std::pair<int, int64_t>{4, FRAME_SIZE * (1 << 4)};
 
     int in_flight = 0;
     int64_t write_offset[RING_MAX_CONNS];
