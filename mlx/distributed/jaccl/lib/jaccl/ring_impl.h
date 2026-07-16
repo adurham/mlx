@@ -415,7 +415,10 @@ class RingImpl {
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS;
 
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
-    auto [sz, N] = buffer_size_from_message(bytes_per_wire);
+    // PP p2p send fix: force small buffer class (sz=0, N=FRAME_SIZE) to avoid
+    // large UC sends that silently drop. See commit a8c5b9e90 for the same fix
+    // applied to the reliable collective path.
+    auto [sz, N] = std::pair<int, int64_t>{0, FRAME_SIZE};
 
     int in_flight = 0;
     int64_t read_offset[RING_MAX_CONNS];
@@ -483,7 +486,8 @@ class RingImpl {
     constexpr int WC_NUM = PIPELINE * RING_MAX_CONNS;
 
     int64_t bytes_per_wire = (n_bytes + n_wires - 1) / n_wires;
-    auto [sz, N] = buffer_size_from_message(bytes_per_wire);
+    // PP p2p recv fix: match the send-side small buffer class cap.
+    auto [sz, N] = std::pair<int, int64_t>{0, FRAME_SIZE};
 
     int in_flight = 0;
     int64_t write_offset[RING_MAX_CONNS];
