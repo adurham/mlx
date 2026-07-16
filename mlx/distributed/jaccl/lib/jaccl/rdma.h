@@ -4,6 +4,8 @@
 
 #include <infiniband/verbs.h>
 
+#include <cstdint>
+#include <cstring>
 #include <span>
 #include <sstream>
 #include <unordered_map>
@@ -31,10 +33,17 @@ constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
 constexpr int ACK_SEND_WR = 3;
 constexpr int ACK_RECV_WR = 4;
+// Standing-pool recv WR for the optimistic reliable path (reliable_all_reduce
+// v2). Pool recvs outlive individual collectives, so their wr_id call_id is a
+// sentinel (0) and message routing is by the in-band V2 wire header instead.
+constexpr int POOL_RECV_WR = 5;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;
-constexpr int NUM_BUFFERS = 2;
+// 8 buffers per size class so the reliable ARQ path can pipeline up to 8
+// sends+recvs in flight (MLX_JACCL_RELIABLE_INFLIGHT). Memory cost is a few
+// MB per peer; QP caps (MAX_SEND_WR/MAX_RECV_WR=32, CQ=64) accommodate it.
+constexpr int NUM_BUFFERS = 8;
 constexpr int FRAME_SIZE = 4096;
 
 // wr_id layout (64 bits):
@@ -224,6 +233,7 @@ struct Connection {
   void queue_pair_init();
   void queue_pair_rtr(const Destination& dst);
   void queue_pair_rts();
+  void queue_pair_reset();
 
   void post_send(const SharedBuffer& buff, uint64_t work_request_id) {
     // Make sure every prior CPU write to `buff` is visible to the NIC
@@ -393,6 +403,48 @@ class SideChannel {
     // Twice has proven to be more robust to initialization issues.
     all_gather<int>(0);
     all_gather<int>(0);
+  }
+
+  // Framed, self-validating 2-rank barrier for the reliable data path.
+  //
+  // all_gather() is raw TCP with NO framing: if the two ranks ever exchange a
+  // mismatched byte count (a half-completed op, a size skew, concurrent use),
+  // the stream misaligns and every subsequent exchange reads the wrong bytes —
+  // a silent, permanent hang (recv keeps getting partial data, so even
+  // SO_RCVTIMEO never fires). This method prefixes a fixed 16-byte header
+  // {MAGIC, call_id, round, count} so a desynced stream is DETECTED and throws
+  // (=> clean re-place) instead of hanging, and correct framing prevents the
+  // misalignment to begin with. Returns the peer's `got` bitmap. size_==2 only.
+  std::vector<uint8_t> reliable_barrier(
+      uint32_t call_id,
+      uint32_t round,
+      const std::vector<uint8_t>& got) {
+    const uint32_t MAGIC = 0x4a524252u; // "JRBR"
+    const uint32_t n = static_cast<uint32_t>(got.size());
+    std::vector<char> out(16 + n);
+    const uint32_t hdr[4] = {MAGIC, call_id, round, n};
+    std::memcpy(out.data(), hdr, 16);
+    if (n) {
+      std::memcpy(out.data() + 16, got.data(), n);
+    }
+    // Peer is sockets_[0] on both ranks (2-rank). Small message -> the kernel
+    // buffers the send, so send-then-recv on both ranks does not deadlock.
+    sockets_[0].send(IBV_TAG, out.data(), out.size());
+    uint32_t rhdr[4];
+    sockets_[0].recv(IBV_TAG, rhdr, 16);
+    if (rhdr[0] != MAGIC || rhdr[1] != call_id || rhdr[2] != round) {
+      std::ostringstream m;
+      m << "[jaccl] reliable_barrier DESYNC expected call_id=" << call_id
+        << " round=" << round << " but peer magic=0x" << std::hex << rhdr[0]
+        << std::dec << " call_id=" << rhdr[1] << " round=" << rhdr[2]
+        << " n=" << rhdr[3];
+      throw std::runtime_error(m.str());
+    }
+    std::vector<uint8_t> peer_got(rhdr[3]);
+    if (rhdr[3]) {
+      sockets_[0].recv(IBV_TAG, peer_got.data(), rhdr[3]);
+    }
+    return peer_got;
   }
 
  private:

@@ -485,6 +485,15 @@ void sdpa_full_self_attention_metal(
   int bq = 32;
   int bk = bd < 128 ? 32 : 16;
 
+  // D=512 min-tile spike (2026-07-15): bd=512 doesn't fit the generic
+  // bq/bk formula in 32KB threadgroup memory. Use bq=8, bk=8, wm=1.
+  // (8+8+8)*512*2 = 24KB — fits with room for padding.
+  if (bd == 512) {
+    bq = 8;
+    bk = 8;
+    wm = 1;
+  }
+
   int B = q.shape(0);
   int H = q.shape(1);
   int D = q.shape(3);
@@ -1119,7 +1128,8 @@ bool ScaledDotProductAttention::use_fallback(
       key_sequence_length > sdpa_fused_threshold;
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
-       sdpa_full_large_hd_ok);
+       sdpa_full_large_hd_ok ||
+       query_head_dim == 512);
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);

@@ -183,6 +183,10 @@ class JACCLGroup : public GroupImpl {
     return std::make_shared<JACCLGroup>(std::move(sub_group));
   }
 
+  void reconnect() override {
+    group_->reconnect();
+  }
+
  private:
   std::shared_ptr<::jaccl::Group> group_;
   Stream communication_stream_;

@@ -83,6 +83,11 @@ class MeshGroup : public Group {
 
   void barrier() override;
 
+  // In-place recovery: reset + re-establish the QPs (top-level group only)
+  // without destroying PD/CQ/MRs, to clear a UC transport wedge without a
+  // full runner re-place. Both ranks must call it.
+  void reconnect() override;
+
   // split(color, key) — current implementation requires all ranks to
   // call with the same color (single subgroup per call). Cannot be called
   // on a subgroup (subgroup has no SideChannel for the destination exchange).
@@ -98,6 +103,19 @@ class MeshGroup : public Group {
       ReduceOp reduce_op);
 
   void initialize(const ExchangeFn& exchange);
+
+  // Hard recovery: close and reopen the ibv device contexts and rebuild
+  // EVERYTHING device-side (PD/CQ/QP, buffer MR registrations, MeshImpl/
+  // RingImpl views) — the in-process equivalent of a runner respawn. The
+  // dead-UC-data-path wedge observed on Apple librdma (2026-07-06: stuck
+  // send CQE, all_recv=0, one or both directions) survives
+  // queue_pair_reset() — which preserves PD/CQ/MRs/ctx — but clears with
+  // a fresh ibv_open_device, so this is the recovery that actually works.
+  // Top-level, PRE-SPLIT groups only: subgroups borrow our contexts, so
+  // closing them under an existing subgroup would leave it dangling
+  // (reconnect() falls back to the QP-only reset in that case). Gated by
+  // MLX_JACCL_RECONNECT_FRESH=1 inside reconnect().
+  void reconnect_fresh();
 
   void allocate_buffers();
 
@@ -130,6 +148,9 @@ class MeshGroup : public Group {
 
   FILE* trace_file_ = nullptr;
   bool hash_enabled_ = false;
+  // Set by split(): subgroups borrow our ibv contexts, which makes
+  // reconnect_fresh() (device close + reopen) unsafe from then on.
+  bool has_split_ = false;
 };
 
 } // namespace jaccl

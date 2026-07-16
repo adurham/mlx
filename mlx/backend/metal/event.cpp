@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 #include "mlx/event.h"
 #include "mlx/backend/metal/device.h"
@@ -50,9 +51,97 @@ Event::Event(Stream stream) : stream_(stream) {
 }
 
 void Event::wait() {
-  if (!static_cast<MTL::SharedEvent*>(event_.get())
-           ->waitUntilSignaledValue(value(), -1)) {
-    throw std::runtime_error("[Event::wait] Timed out");
+  // exo-jaccl-fix (2026-07-05): INTERRUPTIBLE wait. Poll the shared event's
+  // value in USER space (MTL::SharedEvent::signaledValue() — a non-blocking
+  // shared-memory read) instead of Apple's waitUntilSignaledValue, which traps
+  // into an UNINTERRUPTIBLE kernel GPU-wait (iokit_user_client_trap) and, when
+  // the GPU/collective is wedged, ignores its timeout and blocks forever.
+  //
+  // That kernel block is the c>=2 PEER-rank trap: a wedged TP collective never
+  // signals this event, and the peer's main thread is stuck in the kernel where
+  // it can neither honor a timeout, surface a captured stream exception, nor
+  // call reconnect() — only SIGKILL frees it (faulting the GPU + leaking RDMA
+  // QPs). Polling keeps this thread runnable, so the loop can (a) rethrow a
+  // captured stream-worker exception and (b) honor a total timeout — letting a
+  // wedged peer SELF-ABORT and have the runner reconnect() the transport
+  // in-place instead of dying. Fast path is one signaledValue() read; then a
+  // brief spin (cheap for sub-µs completions), then a low-CPU sleep-poll.
+  // Tunables: MLX_EVENT_WAIT_POLL_US (sleep granularity, default 50),
+  // MLX_EVENT_WAIT_SPIN (spins before sleeping, default 2000),
+  // MLX_EVENT_WAIT_TIMEOUT_MS (self-abort deadline, default 40000; 0 disables).
+  auto* ev = static_cast<MTL::SharedEvent*>(event_.get());
+  const uint64_t target = value();
+  if (ev->signaledValue() >= target) {
+    return;
+  }
+  static const uint64_t sleep_us = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_POLL_US");
+    return v ? std::strtoull(v, nullptr, 10) : 50ULL;
+  }();
+  // Escape hatch: sleep_us==0 restores the legacy uninterruptible blocking
+  // wait (A/B only — it reintroduces the peer-hang).
+  if (sleep_us == 0) {
+    if (!ev->waitUntilSignaledValue(target, -1)) {
+      throw std::runtime_error("[Event::wait] Timed out");
+    }
+    return;
+  }
+  static const uint64_t timeout_us = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_TIMEOUT_MS");
+    return (v ? std::strtoull(v, nullptr, 10) : 40000ULL) * 1000ULL;
+  }();
+  static const uint64_t spin_iters = [] {
+    const char* v = std::getenv("MLX_EVENT_WAIT_SPIN");
+    return v ? std::strtoull(v, nullptr, 10) : 2000ULL;
+  }();
+  uint64_t spins = 0;
+  // Measure REAL wall-clock elapsed with steady_clock — NOT an accumulated
+  // sleep_us counter. macOS sleep granularity + scheduling make each poll
+  // iteration take far longer than the requested sleep, so summing sleep_us
+  // undercounts elapsed time by multiples and the timeout would not fire until
+  // hundreds of real seconds — long after the 45s _check_hang SIGKILL.
+  const auto start = std::chrono::steady_clock::now();
+  bool logged_slow = false;
+  while (ev->signaledValue() < target) {
+    if (spins < spin_iters) {
+      ++spins;
+#if defined(__aarch64__)
+      __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__)
+      __asm__ __volatile__("pause" ::: "memory");
+#endif
+      continue;
+    }
+    // Unlike the kernel wait, this loop actually runs: surface a captured
+    // stream-worker exception, then honor the total self-abort timeout.
+    scheduler::throw_if_stream_exception();
+    auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    // Diagnostic (only fires on a genuinely stuck wait — healthy waits finish
+    // in << 1s — so no hot-path spam): proves this poll is actually running on
+    // a wedged peer and accumulating wall-clock toward the self-abort.
+    if (!logged_slow && elapsed_us >= 3'000'000) {
+      logged_slow = true;
+      fprintf(
+          stderr,
+          "[Event::wait] slow wait: elapsed=%.1fs signaled=%llu target=%llu "
+          "(polling; self-abort at %llums)\n",
+          elapsed_us / 1e6,
+          static_cast<unsigned long long>(ev->signaledValue()),
+          static_cast<unsigned long long>(target),
+          static_cast<unsigned long long>(timeout_us / 1000));
+      fflush(stderr);
+    }
+    if (timeout_us != 0 && elapsed_us >= 0 &&
+        static_cast<uint64_t>(elapsed_us) >= timeout_us) {
+      throw std::runtime_error(
+          "[Event::wait] Timed out: GPU event not signaled and no stream "
+          "exception (peer rank stuck on an abandoned c>=2 collective); "
+          "surfacing a clean fault for in-place reconnect / restart.");
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
   }
 }
 

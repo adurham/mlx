@@ -274,6 +274,33 @@ void Connection::queue_pair_rts() {
   }
 }
 
+// In-place recovery primitive: transition the QP back to RESET (flushing every
+// posted/in-flight WR) and drain any stale CQEs, so the same QP (and its PD/CQ/
+// MRs, which are untouched) can be re-driven INIT->RTR->RTS by reconnect().
+// This clears a UC transport wedge (lost completion / ring_indicies_err)
+// without destroying the QP or reloading anything. Best-effort: if the driver
+// rejects the RESET transition we surface it so the caller can fall back to a
+// full re-place.
+void Connection::queue_pair_reset() {
+  if (queue_pair != nullptr) {
+    ibv_qp_attr attr = {};
+    attr.qp_state = IBV_QPS_RESET;
+    if (int status = ibv().modify_qp(queue_pair, &attr, IBV_QP_STATE);
+        status != 0) {
+      std::ostringstream msg;
+      msg << "[jaccl] Changing queue pair to RESET failed with errno " << status;
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  // Drain stale completions left in the CQ so the re-established QP starts
+  // clean (a wedge can leave partial/lost CQEs behind).
+  if (completion_queue != nullptr) {
+    ibv_wc wc;
+    while (ibv_poll_cq(completion_queue, 1, &wc) > 0) {
+    }
+  }
+}
+
 std::vector<Connection> create_connections(
     const std::vector<std::string>& device_names) {
   std::vector<Connection> connections;
@@ -337,6 +364,21 @@ SideChannel::SideChannel(int rank, int size, const char* addr)
                         << " waiting " << wait << " ms" << std::endl;
             }));
     sockets_[0].send(IBV_TAG, reinterpret_cast<char*>(&rank_), sizeof(int));
+  }
+
+  // Bound coordinator recv()s so a stuck confirmed-barrier (a desynced peer
+  // that never sends) fails cleanly instead of hanging until the exo _check_hang
+  // SIGKILL. Generous enough (default 35s) that init/reconnect coordinator
+  // handshakes — which are fast and cross-rank synchronized — never trip it,
+  // but under the 45s hang watchdog. 0 disables.
+  int _recv_timeout = [] {
+    const char* e = std::getenv("MLX_JACCL_COORD_RECV_TIMEOUT_SECS");
+    return e ? std::atoi(e) : 35;
+  }();
+  if (_recv_timeout > 0) {
+    for (auto& s : sockets_) {
+      s.set_recv_timeout_secs(_recv_timeout);
+    }
   }
 }
 

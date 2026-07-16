@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+#include <fcntl.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <cstring>
@@ -147,12 +148,31 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
   }
 }
 
+void TCPSocket::set_recv_timeout_secs(int secs) {
+  timeval tv{};
+  tv.tv_sec = secs;
+  tv.tv_usec = 0;
+  // Bound both recv and send so a stuck/backpressured coordinator op fails
+  // cleanly (throws) instead of hanging forever.
+  setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 void TCPSocket::recv(const char* tag, void* data, size_t len) {
   while (len > 0) {
     auto n = ::recv(sock_, data, len, 0);
     if (n <= 0) {
+      // Diagnostic detail: n==0 means the PEER closed the connection (EOF);
+      // n<0 with errno=EAGAIN(35) means a non-blocking socket had no data.
+      // flags/nonblock disambiguate a closed coordinator from a socket that
+      // was never blocking. Retained deliberately — recv failures here are
+      // rare (reconnect / init only).
+      int fl = ::fcntl(sock_, F_GETFL);
       std::ostringstream msg;
-      msg << tag << " Recv failed with errno=" << errno;
+      msg << tag << " Recv failed with errno=" << errno << " n=" << n
+          << " fd=" << sock_ << " remaining=" << len << " flags=0x" << std::hex
+          << fl << std::dec << " nonblock="
+          << ((fl >= 0 && (fl & O_NONBLOCK)) ? 1 : 0);
       throw std::runtime_error(msg.str());
     }
     len -= n;

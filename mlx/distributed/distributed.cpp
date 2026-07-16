@@ -138,6 +138,10 @@ Group Group::split(int color, int key /* = -1 */) const {
   return Group(group_->split(color, key));
 }
 
+void Group::reconnect() const {
+  group_->reconnect();
+}
+
 Group init(bool strict /* = false */, const std::string& bk /* = "any" */) {
   static std::unordered_map<std::string, std::shared_ptr<detail::GroupImpl>>
       backends;
