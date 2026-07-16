@@ -489,8 +489,15 @@ void sdpa_full_self_attention_metal(
   // bq/bk formula in 32KB threadgroup memory. Use bq=8, bk=8, wm=1.
   // (8+8+8)*512*2 = 24KB — fits with room for padding.
   if (bd == 512) {
-    bq = 8;
-    bk = 8;
+    // bq=16 spike: (16+8+8)*512*2 = 32KB (at the threadgroup memory limit)
+    // Env var MLX_SDPA_D512_BQ selects bq=16 (default bq=8)
+    if (std::getenv("MLX_SDPA_D512_BQ16") != nullptr) {
+      bq = 16;
+      bk = 8;
+    } else {
+      bq = 8;
+      bk = 8;
+    }
     wm = 1;
   }
 

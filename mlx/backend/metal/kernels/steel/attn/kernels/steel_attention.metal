@@ -16,7 +16,8 @@
     instantiate_attn(iname, itype, 32, 16, 128, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  80, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  64, 4, 1, mname, mtype) \
-    instantiate_attn(iname, itype,  8,  8, 512, 1, 1, mname, mtype)
+    instantiate_attn(iname, itype,  8,  8, 512, 1, 1, mname, mtype) \
+    instantiate_attn(iname, itype, 16,  8, 512, 1, 1, mname, mtype)
 
 #define instantiate_attn_mask_helper(iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, iname, itype) \
