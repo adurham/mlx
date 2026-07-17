@@ -1481,8 +1481,39 @@ class MeshImpl {
     int in_flight = 0;
     int64_t read_offset = 0;
 
-    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
-    if (jaccl_ack_sync_pre_enabled()) {
+    // ROOT-CAUSE FIX (2026-07-17): raw point-to-point send()/recv() (used
+    // ONLY by exo's Pipeline-Parallel mode's PipelineFirstLayer/
+    // PipelineLastLayer p2p handoff — collectives never call these) used
+    // to rendezvous via ack_sync_pre(), a barrier built on the SAME
+    // unreliable UC transport it's meant to protect. UC has no flow
+    // control and no retry: a SEND arriving at a QP with no posted recv
+    // WR is silently dropped (no NAK, no error CQE either side) — so if
+    // the ACK exchange itself races (peer's ACK_SEND arrives before our
+    // ACK_RECV is posted), THAT drops too, just moving the wedge instead
+    // of fixing it. (Confirmed empirically: reordering ack_sync_pre inside
+    // recv() alone moved the failure from "recv STALLED" to "drain_acks
+    // STALLED" — same disease, different symptom.)
+    //
+    // The one rendezvous immune to this is the RELIABLE TCP coordinator
+    // side-channel (`coordinator_`, a plain socket — TCP retransmits and
+    // orders for us, no drop possible). All_reduce() already established
+    // this pattern for its own pre-barrier (see the
+    // jaccl_confirmed_barrier_pre() branch above it): post ALL prefill
+    // recvs on the receiver, THEN barrier over reliable TCP (so the
+    // sender provably knows the receiver's buffers are armed), THEN post
+    // sends. Apply the same pattern here for raw send()/recv(): the
+    // sender waits on the TCP barrier before posting ANY send_to(); the
+    // receiver posts ALL its prefill recv_from()s before hitting that
+    // same barrier. Whichever side reaches the barrier first blocks in
+    // the kernel's TCP recv (not a spin, not vulnerable to UC drop) until
+    // the other arrives — by construction, by the time BOTH sides leave
+    // the barrier, the receiver's buffers exist on the wire.
+    if (coordinator_ != nullptr) {
+      coordinator_->barrier();
+    } else if (jaccl_ack_sync_pre_enabled()) {
+      // No reliable side-channel (should not happen for PP's top-level
+      // group, but keep the old UC-based rendezvous as a fallback for any
+      // other caller of raw send/recv on a subgroup).
       ack_sync_pre(call_id);
     }
 
@@ -1526,7 +1557,9 @@ class MeshImpl {
         }
       }
     }
-    ack_sync_post(call_id);
+    if (coordinator_ == nullptr) {
+      ack_sync_post(call_id);
+    }
   }
 
   void recv(uint32_t call_id, char* out_ptr, int64_t n_bytes, int src) {
@@ -1537,35 +1570,10 @@ class MeshImpl {
     int in_flight = 0;
     int64_t write_offset = 0;
 
-    // Prefill the pipeline FIRST, then signal readiness (ack_sync_pre).
-    //
-    // ROOT-CAUSE FIX (2026-07-17): this used to call ack_sync_pre() BEFORE
-    // posting the prefill recv_from() work requests. ack_sync_pre is a
-    // cross-rank barrier/handshake — its whole purpose is "signal the peer
-    // I'm ready, then let them send." But signaling readiness before the
-    // recv buffers are actually posted to the NIC means the peer's send_to()
-    // can land on the wire while our QP's receive queue is still empty.
-    // UC (Unreliable Connection) has no flow control and no retry: a SEND
-    // arriving at a QP with no posted recv WR is silently dropped — no NAK,
-    // no error CQE on either side. The sender's send completes normally
-    // (it only confirms wire transmission, not delivery), while our recv()
-    // polls a CQ for a completion that will never arrive, and the
-    // StallWatch throws "no forward progress" after its timeout. This was
-    // 100% reproducible on PP mode's raw point-to-point send()/recv() calls
-    // (PipelineFirstLayer/PipelineLastLayer) because they are the ONLY
-    // callers of MeshGroup::send/recv in isolation — collectives
-    // (all_sum/all_gather/barrier) never hit this because both ranks post
-    // send AND recv symmetrically within the same call, keeping the queue
-    // primed. PP's rank-0-recv-only / rank-N-send-only pattern has no such
-    // coupling, so the very first call (this process pair's warmup, with
-    // zero prior synchronization on the data QP) hit the race deterministically.
-    //
-    // Fix: post ALL prefill recv_from() WRs to the NIC before calling
-    // ack_sync_pre(), so "I am ready" is only ever signaled once the
-    // receive buffers genuinely exist on the wire. See send()'s
-    // ack_sync_pre() call (kept before its send_to() loop) for the
-    // matching half of this contract: sender waits for the receiver's
-    // ready-ack before transmitting.
+    // Prefill the pipeline FIRST (post all recv buffers to the NIC), THEN
+    // rendezvous. See send()'s matching comment above for the full
+    // rationale — this ordering is what makes the reliable-coordinator
+    // barrier a genuine happens-before guarantee instead of a race.
     int buff = 0;
     while (N * buff < n_bytes && buff < PIPELINE) {
       recv_from(call_id, sz, src, buff);
@@ -1573,7 +1581,9 @@ class MeshImpl {
       buff++;
     }
 
-    if (jaccl_ack_sync_pre_enabled()) {
+    if (coordinator_ != nullptr) {
+      coordinator_->barrier();
+    } else if (jaccl_ack_sync_pre_enabled()) {
       ack_sync_pre(call_id);
     }
 
