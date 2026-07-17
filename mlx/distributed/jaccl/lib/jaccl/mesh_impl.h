@@ -318,6 +318,13 @@ class MeshImpl {
     coordinator_ = coordinator;
   }
 
+  // Wire up the dedicated p2p retry channel for send()/recv() (2026-07-17).
+  // Isolated from coordinator_ -- see p2p_channel_ member comment in
+  // mesh.h for the collision this fixes. Non-owning; outlives this.
+  void set_p2p_channel(SideChannel* p2p_channel) {
+    p2p_channel_ = p2p_channel;
+  }
+
   // ── reliable_all_reduce v2: optimistic, no per-collective TCP barrier ──
   // See jaccl_reliable_optimistic_enabled() for the protocol summary. Wire
   // format: every message is [V2Hdr{call_id, seq, len}][payload]. seq ==
@@ -330,6 +337,11 @@ class MeshImpl {
     uint32_t len;
   };
   static constexpr uint32_t V2_STATUS_SEQ = 0xFFFFFFFFu;
+  // Fixed tag for send()/recv()'s p2p_retry_barrier calls (2026-07-17).
+  // Both send() and recv() always pass this same constant for every round
+  // of a transfer -- see p2p_retry_barrier's doc comment in rdma.h for why
+  // a fixed tag (not call_id) is used here.
+  static constexpr uint32_t kP2PRetryTag = 0xA5A5A5A5u;
   static constexpr int V2_HDR = static_cast<int>(sizeof(V2Hdr));
 
   // v2 uses ONE uniform size class (the reliable cap) for every message.
@@ -1495,245 +1507,291 @@ class MeshImpl {
   }
 
   void send(uint32_t call_id, const char* in_ptr, int64_t n_bytes, int dst) {
-    constexpr int PIPELINE = 2;
-    constexpr int WC_NUM = PIPELINE;
-    auto [sz, N] = buffer_size_from_message(n_bytes);
+    // The retry protocol below (unlike the old pre/post barrier, which had
+    // a UC-based fallback for subgroups) STRUCTURALLY requires the
+    // dedicated p2p retry channel for its retransmit-negotiation barrier --
+    // there is no UC-safe way to exchange a got-bitmask. send()/recv() are
+    // only ever called on exo's PP top-level 2-rank group, which always
+    // has a p2p_channel_ (side_channel_ is populated in that ctor; only
+    // split() subgroups lack one, and PP never splits) -- fail loudly
+    // instead of silently misbehaving if that invariant is ever violated.
+    if (p2p_channel_ == nullptr) {
+      throw std::runtime_error(
+          "[jaccl] send() called with no dedicated p2p retry channel (p2p_channel_) -- the "
+          "retry-on-drop protocol requires it; only top-level groups have "
+          "one, and send()/recv() should only be called on a top-level "
+          "group (exo's Pipeline-Parallel usage)");
+    }
+    // Pre-transfer rendezvous (2026-07-17, earlier fix): ensures the
+    // receiver's initial recv buffers are posted before we send anything,
+    // reducing round-0 misses to the (now-recoverable) common case. No
+    // longer load-bearing for correctness -- the retry loop below recovers
+    // from ANY drop, round 0 included -- just reduces retry rounds needed.
+    p2p_channel_->barrier();
 
-    int in_flight = 0;
-    int64_t read_offset = 0;
-
-    // ROOT-CAUSE FIX (2026-07-17): raw point-to-point send()/recv() (used
-    // ONLY by exo's Pipeline-Parallel mode's PipelineFirstLayer/
-    // PipelineLastLayer p2p handoff — collectives never call these) used
-    // to rendezvous via ack_sync_pre(), a barrier built on the SAME
-    // unreliable UC transport it's meant to protect. UC has no flow
-    // control and no retry: a SEND arriving at a QP with no posted recv
-    // WR is silently dropped (no NAK, no error CQE either side) — so if
-    // the ACK exchange itself races (peer's ACK_SEND arrives before our
-    // ACK_RECV is posted), THAT drops too, just moving the wedge instead
-    // of fixing it. (Confirmed empirically: reordering ack_sync_pre inside
-    // recv() alone moved the failure from "recv STALLED" to "drain_acks
-    // STALLED" — same disease, different symptom.)
-    //
-    // The one rendezvous immune to this is the RELIABLE TCP coordinator
-    // side-channel (`coordinator_`, a plain socket — TCP retransmits and
-    // orders for us, no drop possible). All_reduce() already established
-    // this pattern for its own pre-barrier (see the
-    // jaccl_confirmed_barrier_pre() branch above it): post ALL prefill
-    // recvs on the receiver, THEN barrier over reliable TCP (so the
-    // sender provably knows the receiver's buffers are armed), THEN post
-    // sends. Apply the same pattern here for raw send()/recv(): the
-    // sender waits on the TCP barrier before posting ANY send_to(); the
-    // receiver posts ALL its prefill recv_from()s before hitting that
-    // same barrier. Whichever side reaches the barrier first blocks in
-    // the kernel's TCP recv (not a spin, not vulnerable to UC drop) until
-    // the other arrives — by construction, by the time BOTH sides leave
-    // the barrier, the receiver's buffers exist on the wire.
-    if (coordinator_ != nullptr) {
-      coordinator_->barrier();
-    } else if (jaccl_ack_sync_pre_enabled()) {
-      // No reliable side-channel (should not happen for PP's top-level
-      // group, but keep the old UC-based rendezvous as a fallback for any
-      // other caller of raw send/recv on a subgroup).
-      ack_sync_pre(call_id);
+    if (n_bytes == 0) {
+      p2p_channel_->barrier();
+      return;
     }
 
-    // Prefill the pipeline
-    int buff = 0;
-    while (read_offset < n_bytes && buff < PIPELINE) {
-      std::copy(
-          in_ptr + read_offset,
-          in_ptr + std::min(read_offset + N, n_bytes),
-          send_buffer(sz, buff).begin<char>());
-      send_to(call_id, sz, dst, buff);
-
-      buff++;
-      read_offset += N;
-      in_flight++;
+    auto [sz, buffer_size] = buffer_size_from_message(n_bytes);
+    if (sz > jaccl_reliable_max_sz()) {
+      sz = jaccl_reliable_max_sz();
+      buffer_size = static_cast<int64_t>(FRAME_SIZE) * (1 << sz);
     }
+    const int HDR = static_cast<int>(sizeof(uint32_t));
+    const int64_t chunk_bytes = buffer_size - HDR;
+    const int num_chunks =
+        static_cast<int>((n_bytes + chunk_bytes - 1) / chunk_bytes);
+    const int SEND_INFLIGHT = (sz <= 2)
+        ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
+        : 1;
 
-    // Main loop
-    StallWatch _stall(in_flight);
-    while (in_flight > 0) {
-      _stall.tick(in_flight, "send", rank_, call_id);
-      ibv_wc wc[WC_NUM];
-      int n = connections_[dst].poll(WC_NUM, wc);
-      for (int i = 0; i < n; i++) {
-        // Defense-in-depth error visibility (2026-07-17): connections_ is
-        // now isolated from the jaccl-v2 pool -- see pool_connections_
-        // member comment for the full collision this used to cause
-        // (IBV_WC_LOC_LEN_ERR from differing size classes sharing one QP,
-        // silently discarded without re-arming, eventually wedging both
-        // this path and the pool). Should only ever see our own SEND_WR
-        // completions now; log loudly instead of silently discarding if
-        // that assumption is ever violated.
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          std::fprintf(
-              stderr,
-              "[jaccl] send WC_ERR rank=%d call_id=%u wc_status=%d "
-              "wc_wt=%d wc_buff=%d dst=%d\n",
-              rank_,
-              call_id,
-              static_cast<int>(wc[i].status),
-              wr_id_work_type(wc[i].wr_id),
-              wr_id_buff(wc[i].wr_id),
-              dst);
-          std::fflush(stderr);
-          continue;
-        }
-        if (wr_id_work_type(wc[i].wr_id) != SEND_WR) {
-          std::fprintf(
-              stderr,
-              "[jaccl] send UNEXPECTED_WT rank=%d call_id=%u wc_wt=%d "
-              "(expected SEND_WR=%d) — a completion meant for a different "
-              "path landed on connections_; this should be impossible "
-              "post-pool-QP-split, investigate if seen\n",
-              rank_,
-              call_id,
-              wr_id_work_type(wc[i].wr_id),
-              SEND_WR);
-          std::fflush(stderr);
-          continue;
-        }
-        if (wr_id_call_id(wc[i].wr_id) != call_id) {
-          continue;
-        }
-        int buff = wr_id_buff(wc[i].wr_id);
+    auto post_chunk = [&](int c, int buff) {
+      auto& sb = send_buffer(sz, buff);
+      char* p = sb.data<char>();
+      uint32_t hdr = static_cast<uint32_t>(c);
+      std::memcpy(p, &hdr, HDR);
+      int64_t off = static_cast<int64_t>(c) * chunk_bytes;
+      int64_t len = std::min(chunk_bytes, n_bytes - off);
+      std::memcpy(p + HDR, in_ptr + off, static_cast<size_t>(len));
+      JACCL_DMA_BARRIER();
+      connections_[dst].post_send(sb, make_wr_id(call_id, SEND_WR, buff, dst));
+    };
 
-        in_flight--;
+    std::vector<uint8_t> to_resend; // empty on round 0 (send everything)
+    int next_c = 0;
 
-        if (read_offset < n_bytes) {
-          std::copy(
-              in_ptr + read_offset,
-              in_ptr + std::min(read_offset + N, n_bytes),
-              send_buffer(sz, buff).begin<char>());
-          send_to(call_id, sz, dst, buff);
+    const uint64_t _t0 = mach_absolute_time();
+    const uint64_t _deadline_us = 15000000;
+    const uint64_t drain_quiet_us = jaccl_ack_retransmit_us();
+    const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
-          read_offset += N;
-          in_flight++;
+    for (int round = 0;; round++) {
+      if (round > max_rounds) {
+        throw std::runtime_error(
+            "[jaccl] send() exceeded max retransmit rounds (link "
+            "persistently dropping) — clean re-place");
+      }
+      bool resending = !to_resend.empty();
+
+      int outstanding = 0;
+      int c = next_c;
+      for (int buff = 0; c < num_chunks && buff < SEND_INFLIGHT; c++) {
+        if (!resending || to_resend[c]) {
+          post_chunk(c, buff);
+          buff++;
+          outstanding++;
         }
       }
-    }
-    // Post-drain rendezvous: scoped to send()/recv() ONLY (NOT the shared
-    // ack_sync_post() used by all_reduce()/all_gather() — those work fine
-    // today over UC and adding a TCP round-trip to every TP collective
-    // would be a real perf regression for no benefit). Same UC-drop
-    // hazard as the pre-barrier: ack_sync_post()'s default path is a UC
-    // ACK_SEND/ACK_RECV exchange, itself vulnerable to a silent drop.
-    // confirmed_coord_barrier() (the existing reliable alternative,
-    // gated behind MLX_JACCL_CONFIRMED_BARRIER_POST) is NOT safe to reuse
-    // here: it validates that both ranks report the SAME call_id, but
-    // call_id comes from next_call_id_, a per-rank-LOCAL atomic counter
-    // with no cross-rank synchronization — PP's asymmetric send-only/
-    // recv-only usage has no guarantee the two ranks' local counters
-    // agree for "the same" logical transfer, so confirmed_coord_barrier
-    // would throw a false desync. Use the same value-agnostic
-    // coordinator_->barrier() as the pre-fix instead — it only needs
-    // "both sides showed up", not "both sides agree on a value".
-    if (coordinator_ != nullptr) {
-      coordinator_->barrier();
-    } else {
-      ack_sync_post(call_id);
+
+      uint64_t last_progress = mach_absolute_time();
+      int prev_progress = c;
+      while (outstanding > 0) {
+        if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
+          throw std::runtime_error(
+              "[jaccl] send() deadline in drain — clean re-place");
+        }
+        int cur_progress = c;
+        if (cur_progress != prev_progress) {
+          prev_progress = cur_progress;
+          last_progress = mach_absolute_time();
+        } else if (
+            mach_ticks_to_us(mach_absolute_time() - last_progress) >
+            drain_quiet_us) {
+          break; // quiet -> fall through to barrier + retransmit
+        }
+        ibv_wc wc[16];
+        int n = connections_[dst].poll(16, wc);
+        for (int i = 0; i < n; i++) {
+          if (wr_id_call_id(wc[i].wr_id) != call_id) {
+            continue; // stale (previous call/round)
+          }
+          if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != SEND_WR) {
+            continue; // dropped/erred/unexpected — barrier+retransmit recovers
+          }
+          int wb = wr_id_buff(wc[i].wr_id);
+          outstanding--;
+          while (c < num_chunks && !(!resending || to_resend[c])) {
+            c++;
+          }
+          if (c < num_chunks) {
+            post_chunk(c, wb);
+            c++;
+            outstanding++;
+          }
+          last_progress = mach_absolute_time();
+          prev_progress = c;
+        }
+        if (n == 0) {
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(jaccl_reliable_idle_us()));
+        }
+      }
+
+      // Reliable barrier: receiver reports its got-bitmask (we send a
+      // dummy — we're the source, we always "have everything"). Uses the
+      // framed p2p_retry_barrier (NOT the raw p2p_channel_->all_gather)
+      // because raw all_gather has no framing -- a byte-count mismatch
+      // between the two sides silently misaligns the TCP stream, which is
+      // a permanent hang, not a detectable error (see reliable_barrier's
+      // doc comment in rdma.h). Fixed tag (both send() and recv() always
+      // pass the same constant) + monotonic round gives the same desync
+      // detection reliable_barrier gets from call_id, without requiring
+      // call_id to match across ranks (it structurally can't for this
+      // asymmetric send-only/recv-only usage — see rdma.h's
+      // p2p_retry_barrier doc comment for the full reasoning).
+      auto peer_got = p2p_channel_->p2p_retry_barrier(
+          kP2PRetryTag, static_cast<uint32_t>(round), std::vector<uint8_t>{});
+      bool peer_has_all =
+          static_cast<int>(peer_got.size()) == num_chunks &&
+          std::count(peer_got.begin(), peer_got.end(), 1) == num_chunks;
+      if (peer_has_all) {
+        break;
+      }
+      to_resend.assign(num_chunks, 0);
+      for (int k = 0; k < num_chunks; k++) {
+        if (k >= static_cast<int>(peer_got.size()) || !peer_got[k]) {
+          to_resend[k] = 1;
+        }
+      }
+      next_c = 0;
     }
   }
 
   void recv(uint32_t call_id, char* out_ptr, int64_t n_bytes, int src) {
-    constexpr int PIPELINE = 2;
-    constexpr int WC_NUM = PIPELINE;
-    auto [sz, N] = buffer_size_from_message(n_bytes);
+    // See send()'s matching comment: the retry protocol structurally
+    // requires the dedicated p2p retry channel.
+    if (p2p_channel_ == nullptr) {
+      throw std::runtime_error(
+          "[jaccl] recv() called with no dedicated p2p retry channel (p2p_channel_) -- the "
+          "retry-on-drop protocol requires it; only top-level groups have "
+          "one, and send()/recv() should only be called on a top-level "
+          "group (exo's Pipeline-Parallel usage)");
+    }
+    // Pre-transfer rendezvous — see send()'s matching comment.
+    p2p_channel_->barrier();
 
-    int in_flight = 0;
-    int64_t write_offset = 0;
-
-    // Prefill the pipeline FIRST (post all recv buffers to the NIC), THEN
-    // rendezvous. See send()'s matching comment above for the full
-    // rationale — this ordering is what makes the reliable-coordinator
-    // barrier a genuine happens-before guarantee instead of a race.
-    int buff = 0;
-    while (N * buff < n_bytes && buff < PIPELINE) {
-      recv_from(call_id, sz, src, buff);
-      in_flight++;
-      buff++;
+    if (n_bytes == 0) {
+      p2p_channel_->barrier();
+      return;
     }
 
-    if (coordinator_ != nullptr) {
-      coordinator_->barrier();
-    } else if (jaccl_ack_sync_pre_enabled()) {
-      ack_sync_pre(call_id);
+    auto [sz, buffer_size] = buffer_size_from_message(n_bytes);
+    if (sz > jaccl_reliable_max_sz()) {
+      sz = jaccl_reliable_max_sz();
+      buffer_size = static_cast<int64_t>(FRAME_SIZE) * (1 << sz);
+    }
+    const int HDR = static_cast<int>(sizeof(uint32_t));
+    const int64_t chunk_bytes = buffer_size - HDR;
+    const int num_chunks =
+        static_cast<int>((n_bytes + chunk_bytes - 1) / chunk_bytes);
+    const int RECV_INFLIGHT = (sz <= 2)
+        ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
+        : 1;
+
+    std::vector<uint8_t> got(num_chunks, 0);
+    int all_recv = 0;
+
+    auto post_recv_buff = [&](int buff) {
+      auto& rb = recv_buffer(sz, buff, src);
+      zero_recv_buffer(rb);
+      connections_[src].post_recv(rb, make_wr_id(call_id, RECV_WR, buff, src));
+    };
+    auto consume_recv = [&](int buff) {
+      JACCL_DMA_BARRIER();
+      auto& rb = recv_buffer(sz, buff, src);
+      const char* p = rb.data<char>();
+      uint32_t c;
+      std::memcpy(&c, p, HDR);
+      if (c < static_cast<uint32_t>(num_chunks) && !got[c]) {
+        int64_t off = static_cast<int64_t>(c) * chunk_bytes;
+        int64_t len = std::min(chunk_bytes, n_bytes - off);
+        std::memcpy(out_ptr + off, p + HDR, static_cast<size_t>(len));
+        got[c] = 1;
+        all_recv++;
+      }
+    };
+
+    int posted = 0;
+    for (int b = 0; b < std::min(RECV_INFLIGHT, num_chunks); b++) {
+      post_recv_buff(b);
+      posted++;
     }
 
-    // Main loop
-    StallWatch _stall(in_flight);
-    while (in_flight > 0) {
-      _stall.tick(in_flight, "recv", rank_, call_id);
-      ibv_wc wc[WC_NUM];
-      int n = connections_[src].poll(WC_NUM, wc);
-      for (int i = 0; i < n; i++) {
-        // Defense-in-depth error visibility (2026-07-17): connections_ is
-        // now isolated from the jaccl-v2 pool (see pool_connections_
-        // member comment) so this should only ever see our own RECV_WR
-        // completions -- but log loudly instead of silently discarding
-        // if that assumption is ever violated, so the NEXT architectural
-        // collision surfaces immediately instead of after a multi-hour
-        // debugging session.
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          std::fprintf(
-              stderr,
-              "[jaccl] recv WC_ERR rank=%d call_id=%u wc_status=%d "
-              "wc_wt=%d wc_buff=%d src=%d\n",
-              rank_,
-              call_id,
-              static_cast<int>(wc[i].status),
-              wr_id_work_type(wc[i].wr_id),
-              wr_id_buff(wc[i].wr_id),
-              src);
-          std::fflush(stderr);
-          continue;
-        }
-        if (wr_id_work_type(wc[i].wr_id) != RECV_WR) {
-          std::fprintf(
-              stderr,
-              "[jaccl] recv UNEXPECTED_WT rank=%d call_id=%u wc_wt=%d "
-              "(expected RECV_WR=%d) — a completion meant for a different "
-              "path landed on connections_; this should be impossible "
-              "post-pool-QP-split, investigate if seen\n",
-              rank_,
-              call_id,
-              wr_id_work_type(wc[i].wr_id),
-              RECV_WR);
-          std::fflush(stderr);
-          continue;
-        }
-        if (wr_id_call_id(wc[i].wr_id) != call_id) {
-          continue;
-        }
-        int buff = wr_id_buff(wc[i].wr_id);
+    const uint64_t _t0 = mach_absolute_time();
+    const uint64_t _deadline_us = 15000000;
+    const uint64_t drain_quiet_us = jaccl_ack_retransmit_us();
+    const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
-        in_flight--;
+    for (int round = 0;; round++) {
+      if (round > max_rounds) {
+        throw std::runtime_error(
+            "[jaccl] recv() exceeded max retransmit rounds (link "
+            "persistently dropping) — clean re-place");
+      }
 
-        // Ensure NIC DMA writes to recv_buffer are visible to the CPU.
-        JACCL_DMA_BARRIER();
-        std::copy(
-            recv_buffer(sz, buff, src).begin<char>(),
-            recv_buffer(sz, buff, src).begin<char>() +
-                std::min(n_bytes - write_offset, static_cast<int64_t>(N)),
-            out_ptr + write_offset);
-        write_offset += N;
-
-        if (write_offset + (PIPELINE - 1) * N < n_bytes) {
-          recv_from(call_id, sz, src, buff);
-          in_flight++;
+      uint64_t last_progress = mach_absolute_time();
+      int prev_progress = all_recv;
+      while (all_recv < num_chunks) {
+        if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
+          throw std::runtime_error(
+              "[jaccl] recv() deadline in drain — clean re-place");
+        }
+        if (all_recv != prev_progress) {
+          prev_progress = all_recv;
+          last_progress = mach_absolute_time();
+        } else if (
+            mach_ticks_to_us(mach_absolute_time() - last_progress) >
+            drain_quiet_us) {
+          break; // quiet -> fall through to barrier (report got)
+        }
+        ibv_wc wc[16];
+        int n = connections_[src].poll(16, wc);
+        for (int i = 0; i < n; i++) {
+          if (wr_id_call_id(wc[i].wr_id) != call_id) {
+            continue;
+          }
+          if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != RECV_WR) {
+            continue;
+          }
+          int wb = wr_id_buff(wc[i].wr_id);
+          consume_recv(wb);
+          posted--;
+          if (posted < std::min(RECV_INFLIGHT, num_chunks - all_recv)) {
+            post_recv_buff(wb);
+            posted++;
+          }
+        }
+        if (n == 0) {
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(jaccl_reliable_idle_us()));
         }
       }
+
+      // Report our got-bitmask over the reliable TCP coordinator (unblocks
+      // send()'s matching p2p_retry_barrier call this round regardless of
+      // whether we're actually done — round counts must stay lockstep).
+      // See send()'s matching comment for why p2p_retry_barrier (framed,
+      // fixed-tag) is used instead of raw p2p_channel_->all_gather.
+      p2p_channel_->p2p_retry_barrier(
+          kP2PRetryTag, static_cast<uint32_t>(round), got);
+      if (all_recv >= num_chunks) {
+        break;
+      }
+      // Still missing some chunks: keep enough recvs posted for the
+      // sender's retransmits to land (sliding window invariant).
+      while (posted < std::min(RECV_INFLIGHT, num_chunks - all_recv)) {
+        // Find a buff slot not currently posted — reuse index cycling
+        // 0..RECV_INFLIGHT-1; safe because posted < window here.
+        post_recv_buff(posted % RECV_INFLIGHT);
+        posted++;
+      }
     }
-    // See send()'s matching comment: scoped reliable-TCP post-rendezvous,
-    // not the shared ack_sync_post() (that stays UC-based for
-    // all_reduce/all_gather, which aren't broken).
-    if (coordinator_ != nullptr) {
-      coordinator_->barrier();
-    } else {
-      ack_sync_post(call_id);
-    }
+
+    // Post-transfer rendezvous — scoped to send()/recv(), see send()'s
+    // comment on why this isn't the shared ack_sync_post().
+    p2p_channel_->barrier();
   }
 
   // Pre-post a pool of ACK_RECVs per peer at QP setup time. Called
@@ -2208,6 +2266,12 @@ class MeshImpl {
   // by the confirmed (ack-of-ack) barrier. nullptr on subgroups (no coordinator)
   // and when the confirmed barrier is disabled. Set via set_coordinator().
   SideChannel* coordinator_ = nullptr;
+  // Dedicated p2p retry channel for send()/recv() (2026-07-17). Isolated
+  // from coordinator_ -- see p2p_channel_ member comment in mesh.h for the
+  // collision this fixes. nullptr on subgroups (send()/recv() only run on
+  // exo PP's top-level 2-rank group, which always gets one). Set via
+  // set_p2p_channel().
+  SideChannel* p2p_channel_ = nullptr;
 };
 
 } // namespace jaccl

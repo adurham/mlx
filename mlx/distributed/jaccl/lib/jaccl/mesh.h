@@ -127,6 +127,24 @@ class MeshGroup : public Group {
   int size_;
   int color_ = 0;
   std::optional<SideChannel> side_channel_;
+  // ROOT-CAUSE FIX (2026-07-17): dedicated TCP side-channel for send()/
+  // recv()'s drop-recovery retry protocol (p2p_retry_barrier), isolated
+  // from side_channel_/coordinator_. side_channel_ is ALSO used every
+  // single forward pass by mlx-lm's model-level mx.distributed.all_gather
+  // (deepseek_v4.py, unconditional when pipeline_size>1) -- which routes
+  // through reliable_all_reduce/v2 and posts its own framed messages on
+  // that same socket. A retry-protocol message interleaving with an
+  // all_gather message on one shared socket corrupts BOTH streams' framing
+  // (confirmed: a peer's frame showed our own MAGIC bytes landed in the
+  // wrong field, meaning the two logical operations' bytes literally
+  // interleaved on the wire). Same isolation principle as pool_connections_
+  // (the RDMA QP split earlier tonight) applied to the TCP side-channel:
+  // separate socket entirely, not a shared-socket mutex+demux (which only
+  // fixes local write ordering, not cross-rank operation-identity
+  // confusion -- verified with Fable before implementing). Built eagerly
+  // in the ctor, right after side_channel_, on a port derived
+  // deterministically from the coordinator's own port (+1) -- see ctor.
+  std::optional<SideChannel> p2p_channel_;
   std::vector<std::string> device_names_;
   std::vector<Connection> connections_;
   std::vector<Connection> ack_connections_;

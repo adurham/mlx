@@ -74,6 +74,35 @@ MeshGroup::MeshGroup(
   // Make sure every node has completed QP setup before continuing.
   side_channel_->all_gather<int>(0);
 
+  // ROOT-CAUSE FIX (2026-07-17, revision 2): dedicated TCP side-channel for
+  // send()/recv()'s p2p retry protocol -- see p2p_channel_ member comment
+  // in mesh.h for the full collision this isolation fixes (shared
+  // coordinator_ socket getting interleaved bytes from mlx-lm's per-forward
+  // model-level all_gather AND our retry barrier). Built HERE (right after
+  // side_channel_'s own setup barrier, so both ranks are guaranteed to
+  // reach this point together -- eager construction, not lazy-on-first-use,
+  // per the construction-order hazard Fable flagged: a lazy p2p_channel_
+  // would let one rank block in connect() while the peer is still parked
+  // inside an unrelated all_gather on the primary channel, an avoidable
+  // deadlock). Port is coordinator_addr's own port + 1 -- deterministic,
+  // no dynamic port exchange needed since coordinator_addr is already
+  // uniquely assigned per-instance by exo's placement layer.
+  {
+    auto colon = coordinator_addr.find(':');
+    if (colon == std::string::npos) {
+      std::ostringstream msg;
+      msg << "[jaccl] Can't derive p2p retry channel port from "
+             "coordinator_addr (missing ':'): "
+          << coordinator_addr;
+      throw std::runtime_error(msg.str());
+    }
+    std::string ip = coordinator_addr.substr(0, colon);
+    int port = std::stoi(coordinator_addr.substr(colon + 1));
+    std::ostringstream p2p_addr;
+    p2p_addr << ip << ":" << (port + 1);
+    p2p_channel_.emplace(rank_, size_, p2p_addr.str().c_str());
+  }
+
   mesh_ = MeshImpl(
       rank_,
       size_,
@@ -86,6 +115,9 @@ MeshGroup::MeshGroup(
   // Give the top-level mesh the reliable TCP coordinator for the confirmed
   // (ack-of-ack) barrier. side_channel_ is in-place and outlives mesh_.
   mesh_.set_coordinator(&*side_channel_);
+  // Give the top-level mesh the dedicated p2p retry channel for send()/
+  // recv(). p2p_channel_ is in-place and outlives mesh_.
+  mesh_.set_p2p_channel(&*p2p_channel_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -640,6 +672,13 @@ void MeshGroup::reconnect_fresh() {
       ack_send_buffers_,
       ack_recv_buffers_);
   mesh_.set_coordinator(&*side_channel_);
+  // p2p_channel_ (like side_channel_) survives reconnect_fresh unchanged --
+  // it's a separate TCP socket from the RDMA transport being rebuilt here.
+  // But mesh_ itself is a brand-new MeshImpl, so its pointer needs
+  // re-wiring just like set_coordinator above.
+  if (p2p_channel_.has_value()) {
+    mesh_.set_p2p_channel(&*p2p_channel_);
+  }
   ring_ = RingImpl(
       rank_,
       size_,
