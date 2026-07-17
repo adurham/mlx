@@ -447,51 +447,6 @@ class SideChannel {
     return peer_got;
   }
 
-  // Framed, self-validating 2-rank barrier for send()/recv()'s p2p retry
-  // protocol (2026-07-17). Structurally identical to reliable_barrier()
-  // above (same {MAGIC, tag, round, count} framing to prevent stream
-  // desync -- see that method's doc comment for the full rationale), but
-  // keyed on an explicit `direction_tag` instead of call_id: send()/recv()
-  // are asymmetric (one rank only ever sends for a given transfer, the
-  // other only ever recvs), so their LOCAL call_id counters (next_call_id_,
-  // incremented once per any MeshGroup method call on that rank) are NOT
-  // guaranteed equal for what is semantically "the same" transfer --
-  // reusing reliable_barrier()'s call_id-equality check here would throw a
-  // false DESYNC on every single call. direction_tag is a caller-supplied
-  // constant (e.g. 0xA5) that both send() and recv() pass identically for
-  // every round of the SAME transfer, so the framing validation still
-  // catches a genuinely desynced stream without requiring call_id to match
-  // across ranks.
-  std::vector<uint8_t> p2p_retry_barrier(
-      uint32_t direction_tag,
-      uint32_t round,
-      const std::vector<uint8_t>& got) {
-    const uint32_t MAGIC = 0x4a325032u; // "J2P2" (distinct from reliable_barrier's tag so a stream desync between the two protocols is also detected, not silently misread)
-    const uint32_t n = static_cast<uint32_t>(got.size());
-    std::vector<char> out(16 + n);
-    const uint32_t hdr[4] = {MAGIC, direction_tag, round, n};
-    std::memcpy(out.data(), hdr, 16);
-    if (n) {
-      std::memcpy(out.data() + 16, got.data(), n);
-    }
-    sockets_[0].send(IBV_TAG, out.data(), out.size());
-    uint32_t rhdr[4];
-    sockets_[0].recv(IBV_TAG, rhdr, 16);
-    if (rhdr[0] != MAGIC || rhdr[1] != direction_tag || rhdr[2] != round) {
-      std::ostringstream m;
-      m << "[jaccl] p2p_retry_barrier DESYNC expected direction_tag="
-        << direction_tag << " round=" << round << " but peer magic=0x"
-        << std::hex << rhdr[0] << std::dec << " tag=" << rhdr[1]
-        << " round=" << rhdr[2] << " n=" << rhdr[3];
-      throw std::runtime_error(m.str());
-    }
-    std::vector<uint8_t> peer_got(rhdr[3]);
-    if (rhdr[3]) {
-      sockets_[0].recv(IBV_TAG, peer_got.data(), rhdr[3]);
-    }
-    return peer_got;
-  }
-
  private:
   int rank_;
   int size_;
