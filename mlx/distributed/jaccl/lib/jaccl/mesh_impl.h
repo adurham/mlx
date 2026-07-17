@@ -1557,7 +1557,25 @@ class MeshImpl {
         }
       }
     }
-    if (coordinator_ == nullptr) {
+    // Post-drain rendezvous: scoped to send()/recv() ONLY (NOT the shared
+    // ack_sync_post() used by all_reduce()/all_gather() — those work fine
+    // today over UC and adding a TCP round-trip to every TP collective
+    // would be a real perf regression for no benefit). Same UC-drop
+    // hazard as the pre-barrier: ack_sync_post()'s default path is a UC
+    // ACK_SEND/ACK_RECV exchange, itself vulnerable to a silent drop.
+    // confirmed_coord_barrier() (the existing reliable alternative,
+    // gated behind MLX_JACCL_CONFIRMED_BARRIER_POST) is NOT safe to reuse
+    // here: it validates that both ranks report the SAME call_id, but
+    // call_id comes from next_call_id_, a per-rank-LOCAL atomic counter
+    // with no cross-rank synchronization — PP's asymmetric send-only/
+    // recv-only usage has no guarantee the two ranks' local counters
+    // agree for "the same" logical transfer, so confirmed_coord_barrier
+    // would throw a false desync. Use the same value-agnostic
+    // coordinator_->barrier() as the pre-fix instead — it only needs
+    // "both sides showed up", not "both sides agree on a value".
+    if (coordinator_ != nullptr) {
+      coordinator_->barrier();
+    } else {
       ack_sync_post(call_id);
     }
   }
@@ -1616,7 +1634,14 @@ class MeshImpl {
         }
       }
     }
-    ack_sync_post(call_id);
+    // See send()'s matching comment: scoped reliable-TCP post-rendezvous,
+    // not the shared ack_sync_post() (that stays UC-based for
+    // all_reduce/all_gather, which aren't broken).
+    if (coordinator_ != nullptr) {
+      coordinator_->barrier();
+    } else {
+      ack_sync_post(call_id);
+    }
   }
 
   // Pre-post a pool of ACK_RECVs per peer at QP setup time. Called
