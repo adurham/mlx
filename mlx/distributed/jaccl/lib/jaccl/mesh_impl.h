@@ -1537,17 +1537,44 @@ class MeshImpl {
     int in_flight = 0;
     int64_t write_offset = 0;
 
-    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
-    if (jaccl_ack_sync_pre_enabled()) {
-      ack_sync_pre(call_id);
-    }
-
-    // Prefill the pipeline
+    // Prefill the pipeline FIRST, then signal readiness (ack_sync_pre).
+    //
+    // ROOT-CAUSE FIX (2026-07-17): this used to call ack_sync_pre() BEFORE
+    // posting the prefill recv_from() work requests. ack_sync_pre is a
+    // cross-rank barrier/handshake — its whole purpose is "signal the peer
+    // I'm ready, then let them send." But signaling readiness before the
+    // recv buffers are actually posted to the NIC means the peer's send_to()
+    // can land on the wire while our QP's receive queue is still empty.
+    // UC (Unreliable Connection) has no flow control and no retry: a SEND
+    // arriving at a QP with no posted recv WR is silently dropped — no NAK,
+    // no error CQE on either side. The sender's send completes normally
+    // (it only confirms wire transmission, not delivery), while our recv()
+    // polls a CQ for a completion that will never arrive, and the
+    // StallWatch throws "no forward progress" after its timeout. This was
+    // 100% reproducible on PP mode's raw point-to-point send()/recv() calls
+    // (PipelineFirstLayer/PipelineLastLayer) because they are the ONLY
+    // callers of MeshGroup::send/recv in isolation — collectives
+    // (all_sum/all_gather/barrier) never hit this because both ranks post
+    // send AND recv symmetrically within the same call, keeping the queue
+    // primed. PP's rank-0-recv-only / rank-N-send-only pattern has no such
+    // coupling, so the very first call (this process pair's warmup, with
+    // zero prior synchronization on the data QP) hit the race deterministically.
+    //
+    // Fix: post ALL prefill recv_from() WRs to the NIC before calling
+    // ack_sync_pre(), so "I am ready" is only ever signaled once the
+    // receive buffers genuinely exist on the wire. See send()'s
+    // ack_sync_pre() call (kept before its send_to() loop) for the
+    // matching half of this contract: sender waits for the receiver's
+    // ready-ack before transmitting.
     int buff = 0;
     while (N * buff < n_bytes && buff < PIPELINE) {
       recv_from(call_id, sz, src, buff);
       in_flight++;
       buff++;
+    }
+
+    if (jaccl_ack_sync_pre_enabled()) {
+      ack_sync_pre(call_id);
     }
 
     // Main loop
