@@ -1538,6 +1538,22 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = connections_[dst].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
+        // TEMP DIAGNOSTIC (2026-07-17): log every polled completion
+        // unconditionally, BEFORE the call_id filter, to determine whether
+        // completions are arriving and being wrongly discarded by the
+        // filter (ibv_poll_cq is destructive -- a `continue` here throws
+        // the completion away forever) vs. genuinely never arriving.
+        std::fprintf(
+            stderr,
+            "[jaccl-diag] send POLL rank=%d my_call_id=%u wc_call_id=%u "
+            "wc_buff=%d wc_status=%d dst=%d\n",
+            rank_,
+            call_id,
+            wr_id_call_id(wc[i].wr_id),
+            wr_id_buff(wc[i].wr_id),
+            static_cast<int>(wc[i].status),
+            dst);
+        std::fflush(stderr);
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
         }
@@ -1612,6 +1628,18 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = connections_[src].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
+        // TEMP DIAGNOSTIC (2026-07-17): see send()'s matching comment.
+        std::fprintf(
+            stderr,
+            "[jaccl-diag] recv POLL rank=%d my_call_id=%u wc_call_id=%u "
+            "wc_buff=%d wc_status=%d src=%d\n",
+            rank_,
+            call_id,
+            wr_id_call_id(wc[i].wr_id),
+            wr_id_buff(wc[i].wr_id),
+            static_cast<int>(wc[i].status),
+            src);
+        std::fflush(stderr);
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
         }
