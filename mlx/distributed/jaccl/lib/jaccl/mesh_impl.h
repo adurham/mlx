@@ -342,6 +342,15 @@ class MeshImpl {
   // of a transfer -- see p2p_retry_barrier's doc comment in rdma.h for why
   // a fixed tag (not call_id) is used here.
   static constexpr uint32_t kP2PRetryTag = 0xA5A5A5A5u;
+  // Sentinel round numbers for send()/recv()'s pre/post-transfer
+  // rendezvous calls on p2p_channel_ (2026-07-17, revision 3 -- these
+  // used to be raw, unframed barrier() calls; now framed p2p_retry_barrier
+  // calls, to keep every message on p2p_channel_ uniformly framed -- see
+  // send()'s pre-transfer-rendezvous comment for the full rationale).
+  // max()/max()-1 can never collide with a real retry-loop round (bounded
+  // by max_rounds, ~8-32 typically) or with each other.
+  static constexpr uint32_t kP2PPreBarrierRound = 0xFFFFFFFFu;
+  static constexpr uint32_t kP2PPostBarrierRound = 0xFFFFFFFEu;
   static constexpr int V2_HDR = static_cast<int>(sizeof(V2Hdr));
 
   // v2 uses ONE uniform size class (the reliable cap) for every message.
@@ -1527,10 +1536,27 @@ class MeshImpl {
     // reducing round-0 misses to the (now-recoverable) common case. No
     // longer load-bearing for correctness -- the retry loop below recovers
     // from ANY drop, round 0 included -- just reduces retry rounds needed.
-    p2p_channel_->barrier();
+    //
+    // Uses the FRAMED p2p_retry_barrier (not the raw barrier()) with a
+    // reserved sentinel round number, NOT the raw all_gather<int>-based
+    // barrier(). ROOT-CAUSE (2026-07-17, revision 3): even on p2p_channel_
+    // (already isolated from coordinator_ in revision 2), mixing
+    // p2p_channel_->barrier() [unframed raw all_gather<int>, no header] and
+    // p2p_channel_->p2p_retry_barrier() [16-byte framed header] on the SAME
+    // socket recreates the exact same class of stream-desync bug revision 2
+    // fixed -- an unframed and a framed message have no way to distinguish
+    // their own boundaries from each other. Confirmed empirically (peer
+    // magic showed corrupted/zero values even after the coordinator_ split).
+    // Using p2p_retry_barrier exclusively for ALL p2p_channel_ traffic
+    // (pre-barrier, retry rounds, post-barrier) with reserved sentinel round
+    // numbers for the pre/post phases keeps every message on this channel
+    // uniformly framed.
+    p2p_channel_->p2p_retry_barrier(
+        kP2PRetryTag, kP2PPreBarrierRound, std::vector<uint8_t>{});
 
     if (n_bytes == 0) {
-      p2p_channel_->barrier();
+      p2p_channel_->p2p_retry_barrier(
+          kP2PRetryTag, kP2PPostBarrierRound, std::vector<uint8_t>{});
       return;
     }
 
@@ -1669,11 +1695,14 @@ class MeshImpl {
           "one, and send()/recv() should only be called on a top-level "
           "group (exo's Pipeline-Parallel usage)");
     }
-    // Pre-transfer rendezvous — see send()'s matching comment.
-    p2p_channel_->barrier();
+    // Pre-transfer rendezvous — see send()'s matching comment (uses the
+    // framed p2p_retry_barrier, not raw barrier() -- see revision-3 note).
+    p2p_channel_->p2p_retry_barrier(
+        kP2PRetryTag, kP2PPreBarrierRound, std::vector<uint8_t>{});
 
     if (n_bytes == 0) {
-      p2p_channel_->barrier();
+      p2p_channel_->p2p_retry_barrier(
+          kP2PRetryTag, kP2PPostBarrierRound, std::vector<uint8_t>{});
       return;
     }
 
@@ -1788,10 +1817,15 @@ class MeshImpl {
         posted++;
       }
     }
-
-    // Post-transfer rendezvous — scoped to send()/recv(), see send()'s
-    // comment on why this isn't the shared ack_sync_post().
-    p2p_channel_->barrier();
+    // NOTE: no separate post-transfer barrier call here (unlike the old
+    // ack_sync_post-based version) -- the loop's own final
+    // p2p_retry_barrier call above (the one that observed all_recv >=
+    // num_chunks and broke out) already IS the paired rendezvous with
+    // send()'s matching final p2p_retry_barrier call (the one that sees
+    // peer_has_all=true and breaks). Both sides call p2p_retry_barrier
+    // exactly the same number of times per transfer this way; adding an
+    // extra call here would desync that count against send(), which has
+    // no equivalent trailing call.
   }
 
   // Pre-post a pool of ACK_RECVs per peer at QP setup time. Called
