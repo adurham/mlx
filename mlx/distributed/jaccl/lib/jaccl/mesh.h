@@ -130,6 +130,26 @@ class MeshGroup : public Group {
   std::vector<std::string> device_names_;
   std::vector<Connection> connections_;
   std::vector<Connection> ack_connections_;
+  // ROOT-CAUSE FIX (2026-07-17): dedicated QP for the jaccl-v2 reliable-ARQ
+  // optimistic path (reliable_all_reduce_v2's standing POOL_RECV_WR pool,
+  // gated by MLX_JACCL_RELIABLE_OPTIMISTIC/MLX_JACCL_RELIABLE_DATA -- built
+  // because Apple's RDMA stack doesn't support hardware RC connections, so
+  // this software layer provides reliability over UC for TP's collectives).
+  // It used to share connections_ (the same QP raw send()/recv() posts on
+  // for exo's Pipeline-Parallel p2p handoff). The pool's recv buffers use
+  // ONE uniform size class; send()/recv() post buffers sized per-message.
+  // When a send()/recv() work request landed on a QP slot the hardware
+  // still associated with one of the pool's differently-sized posted
+  // recvs (or vice versa), it threw IBV_WC_LOC_LEN_ERR -- and since both
+  // paths only filtered completions by call_id (not work_type), an errored
+  // pool slot was silently discarded without being re-armed, eventually
+  // exhausting the pool and wedging BOTH paths. Isolating the pool onto
+  // its own QP (same pattern as ack_connections_ below: borrows the peer's
+  // ibv_context, owns its own PD/CQ/QP) removes the collision entirely --
+  // same fix shape as the ACK-QP split that solved an identical problem
+  // for collective barriers sharing the data QP (see MeshGroup ctor
+  // comment, "2026-05-17: restore dedicated ACK QP").
+  std::vector<Connection> pool_connections_;
   std::vector<SharedBuffer> ack_send_buffers_;
   std::vector<SharedBuffer> ack_recv_buffers_;
   std::vector<SharedBuffer> buffers_;

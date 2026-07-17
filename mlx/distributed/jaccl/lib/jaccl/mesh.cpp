@@ -46,6 +46,27 @@ MeshGroup::MeshGroup(
     ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
   }
 
+  // ROOT-CAUSE FIX (2026-07-17): dedicated QP for the jaccl-v2 reliable-ARQ
+  // optimistic path (the standing POOL_RECV_WR pool + its own SEND_WR/
+  // recv traffic in reliable_all_reduce_v2). This feature exists because
+  // Apple's RDMA stack lacks hardware RC connections, so jaccl provides
+  // reliability over UC in software for TP's collectives. It used to
+  // share connections_ (the data QP) with exo's Pipeline-Parallel raw
+  // send()/recv() p2p handoff. The pool's recv buffers use one uniform
+  // size class (v2_pool_sz_); send()/recv() posts buffers sized per
+  // message. A size mismatch on the same QP throws IBV_WC_LOC_LEN_ERR,
+  // and since the completion-filtering in both paths didn't distinguish
+  // work_type, an errored pool slot got silently discarded without
+  // being re-armed -- eventually starving the pool and wedging BOTH
+  // paths (observed: raw send()/recv() stalling mid-transfer even
+  // though its own synchronization was correct). Same fix shape as the
+  // ACK-QP split above: dedicated PD/CQ/QP, borrows the peer's
+  // ibv_context (owns_ctx=false).
+  pool_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
+
   initialize([this](const std::vector<Destination>& info) {
     return side_channel_->all_gather(info);
   });
@@ -58,6 +79,7 @@ MeshGroup::MeshGroup(
       size_,
       connections_,
       ack_connections_,
+      pool_connections_,
       buffers_,
       ack_send_buffers_,
       ack_recv_buffers_);
@@ -142,6 +164,7 @@ MeshGroup::MeshGroup(
       size_,
       connections_,
       ack_connections_,
+      pool_connections_,
       buffers_,
       ack_send_buffers_,
       ack_recv_buffers_);
@@ -324,10 +347,24 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       conn.create_queue_pair();
     }
   }
+  // Create PD/CQ/QP for the jaccl-v2 pool connections — always populated
+  // (see ctor comment); cheap to set up unconditionally and only used if
+  // the reliable-optimistic path is actually enabled at runtime.
+  bool has_pool = !pool_connections_.empty();
+  if (has_pool) {
+    for (auto& conn : pool_connections_) {
+      if (conn.ctx == nullptr) {
+        continue;
+      }
+      conn.allocate_protection_domain();
+      conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
+      conn.create_queue_pair();
+    }
+  }
 
   allocate_buffers();
 
-  // INIT data QPs (and ACK QPs if present).
+  // INIT data QPs (and ACK/pool QPs if present).
   for (int peer = 0; peer < size_; peer++) {
     if (peer == rank_) {
       continue;
@@ -335,6 +372,9 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
     connections_[peer].queue_pair_init();
     if (has_ack) {
       ack_connections_[peer].queue_pair_init();
+    }
+    if (has_pool) {
+      pool_connections_[peer].queue_pair_init();
     }
   }
 
@@ -353,6 +393,16 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       ack_info.emplace_back(conn.info());
     }
     ack_all_infos = exchange(ack_info);
+  }
+
+  // Exchange pool QP destinations across ranks (only if present).
+  std::vector<std::vector<Destination>> pool_all_infos;
+  if (has_pool) {
+    std::vector<Destination> pool_info;
+    for (auto& conn : pool_connections_) {
+      pool_info.emplace_back(conn.info());
+    }
+    pool_all_infos = exchange(pool_info);
   }
 
   // RTR/RTS data QPs.
@@ -387,6 +437,25 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       }
       ack_connections_[peer].queue_pair_rtr(peer_ack_info);
       ack_connections_[peer].queue_pair_rts();
+    }
+  }
+
+  // RTR/RTS pool QPs (only if present).
+  if (has_pool) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto peer_pool_info = pool_all_infos[peer][rank_];
+      if (std::getenv("JACCL_TRACE_SPLIT")) {
+        std::cerr << "[jaccl] init rank=" << rank_ << " peer=" << peer
+                  << " pool_qp_num="
+                  << pool_connections_[peer].src.queue_pair_number
+                  << " peer_pool_qp_num=" << peer_pool_info.queue_pair_number
+                  << std::endl;
+      }
+      pool_connections_[peer].queue_pair_rtr(peer_pool_info);
+      pool_connections_[peer].queue_pair_rts();
     }
   }
 }
@@ -528,6 +597,7 @@ void MeshGroup::reconnect_fresh() {
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
   ack_connections_.clear();
+  pool_connections_.clear();
   connections_.clear();
 
   // 2. Reopen the devices — fresh ibv contexts. This is the whole point:
@@ -537,6 +607,13 @@ void MeshGroup::reconnect_fresh() {
   ack_connections_.reserve(static_cast<size_t>(size_));
   for (auto& data_conn : connections_) {
     ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
+  // Rebuild pool_connections_ too (see ctor comment) — must be reborn
+  // against the fresh ctxs just like ack_connections_, or reconnect_fresh
+  // leaves it dangling against destroyed contexts.
+  pool_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
   }
 
   // 3. Full bring-up, identical to the ctor: PD/CQ/QP creation, buffer
@@ -558,6 +635,7 @@ void MeshGroup::reconnect_fresh() {
       size_,
       connections_,
       ack_connections_,
+      pool_connections_,
       buffers_,
       ack_send_buffers_,
       ack_recv_buffers_);
@@ -621,10 +699,38 @@ void MeshGroup::allocate_buffers() {
                   .register_to_protection_domain(conn.protection_domain);
             }
           }
+          // ROOT-CAUSE FIX (2026-07-17): ALSO register to every peer's
+          // pool_connections_ PD. buffers_ is the SAME array send()/
+          // recv()/all_reduce()/all_gather() use AND that
+          // reliable_all_reduce_v2 (jaccl-v2) now posts via
+          // pool_connections_ (its own dedicated QP, isolated from
+          // connections_ to fix an IBV_WC_LOC_LEN_ERR collision — see
+          // pool_connections_ member comment in mesh.h). SharedBuffer's
+          // lkey lookup is keyed by ibv_pd* (register_to_protection_domain
+          // populates a per-PD map); post_send/post_recv on
+          // pool_connections_[peer] calls to_scatter_gather_entry(
+          // pool_connections_[peer].protection_domain) — WITHOUT this
+          // registration that lookup throws (unregistered PD), so v2
+          // traffic on the new QP would fail immediately on first use.
+          if (!pool_connections_.empty()) {
+            for (auto& conn : pool_connections_) {
+              if (conn.ctx != nullptr) {
+                buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
+                    .register_to_protection_domain(conn.protection_domain);
+              }
+            }
+          }
         } else {
           // Recv buffer from rank j: register to rank j's PD.
           buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
               .register_to_protection_domain(connections_[j].protection_domain);
+          // See comment above: also register to rank j's pool QP PD.
+          if (!pool_connections_.empty() &&
+              pool_connections_[j].ctx != nullptr) {
+            buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
+                .register_to_protection_domain(
+                    pool_connections_[j].protection_domain);
+          }
         }
       }
 

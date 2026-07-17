@@ -297,6 +297,7 @@ class MeshImpl {
       int size,
       std::vector<Connection>& conns,
       std::vector<Connection>& ack_conns,
+      std::vector<Connection>& pool_conns,
       std::vector<SharedBuffer>& buffers,
       std::vector<SharedBuffer>& ack_send_buffers,
       std::vector<SharedBuffer>& ack_recv_buffers)
@@ -304,6 +305,7 @@ class MeshImpl {
         size_(size),
         connections_(conns),
         ack_connections_(ack_conns),
+        pool_connections_(pool_conns),
         buffers_(buffers),
         ack_send_buffers_(ack_send_buffers),
         ack_recv_buffers_(ack_recv_buffers) {}
@@ -347,10 +349,15 @@ class MeshImpl {
       return;
     }
     v2_pool_sz_ = std::min(jaccl_reliable_max_sz(), BUFFER_SIZES - 1);
+    // ROOT-CAUSE FIX (2026-07-17): post on pool_connections_ (dedicated QP),
+    // not connections_ (shared with raw send()/recv(), used by exo's
+    // Pipeline-Parallel p2p handoff). See pool_connections_ member comment
+    // for the full collision this isolation fixes.
     for (int b = 0; b < NUM_BUFFERS; b++) {
       auto& rb = recv_buffer(v2_pool_sz_, b, peer);
       zero_recv_buffer(rb);
-      connections_[peer].post_recv(rb, make_wr_id(0, POOL_RECV_WR, b, peer));
+      pool_connections_[peer].post_recv(
+          rb, make_wr_id(0, POOL_RECV_WR, b, peer));
     }
     v2_pool_posted_ = true;
     std::fprintf(
@@ -376,6 +383,20 @@ class MeshImpl {
     if (size_ != 2) {
       throw std::runtime_error(
           "[jaccl] reliable_all_reduce_v2 only supports 2 ranks");
+    }
+    // Loud-fail instead of silent UB (2026-07-17): reliable_all_reduce_v2
+    // should only be reachable when pool_connections_ was populated at
+    // construction (see MeshGroup ctor / pool_connections_ member
+    // comment) -- but that's currently enforced transitively via the
+    // coordinator_ != nullptr gate at the call site in all_reduce(). If
+    // that gating logic ever drifts, indexing an empty pool_connections_
+    // span below is silent undefined behavior. Assert the real invariant
+    // directly instead of relying on it staying in sync elsewhere.
+    if (pool_connections_.empty()) {
+      throw std::runtime_error(
+          "[jaccl] reliable_all_reduce_v2 called with no pool_connections_ "
+          "(dedicated v2 QP) -- this should be unreachable; check the "
+          "coordinator_ gating in all_reduce()");
     }
     const int peer = (rank_ == 0) ? 1 : 0;
     v2_ensure_pool(peer);
@@ -458,7 +479,7 @@ class MeshImpl {
           p + V2_HDR, reinterpret_cast<const char*>(out_ptr) + off,
           static_cast<size_t>(len));
       JACCL_DMA_BARRIER();
-      connections_[peer].post_send(
+      pool_connections_[peer].post_send(
           sb, make_wr_id(call_id, SEND_WR, slot, peer));
       v2_send_outstanding_[slot]++;
     };
@@ -470,7 +491,7 @@ class MeshImpl {
       std::memcpy(p, &hdr, V2_HDR);
       std::memcpy(p + V2_HDR, got.data(), num_chunks);
       JACCL_DMA_BARRIER();
-      connections_[peer].post_send(
+      pool_connections_[peer].post_send(
           sb, make_wr_id(call_id, SEND_WR, status_slot, peer));
       v2_send_outstanding_[status_slot]++;
     };
@@ -486,7 +507,7 @@ class MeshImpl {
         int slot = prev_base + k;
         if (v2_prev_want_[k] && v2_send_outstanding_[slot] == 0) {
           auto& sb = send_buffer(v2_prev_sz_, slot);
-          connections_[peer].post_send(
+          pool_connections_[peer].post_send(
               sb, make_wr_id(v2_prev_call_, SEND_WR, slot, peer));
           v2_send_outstanding_[slot]++;
           v2_prev_want_[k] = 0;
@@ -586,7 +607,7 @@ class MeshImpl {
       }
       // Re-arm the pool slot (zero first so a dead DMA reads as empty).
       zero_recv_buffer(rb);
-      connections_[peer].post_recv(
+      pool_connections_[peer].post_recv(
           rb, make_wr_id(0, POOL_RECV_WR, buff, peer));
       return progress;
     };
@@ -689,7 +710,7 @@ class MeshImpl {
       }
 
       ibv_wc wc[16];
-      int n = poll(connections_, 16, wc);
+      int n = poll(pool_connections_, 16, wc);
       bool progressed = false;
       for (int i = 0; i < n; i++) {
         int wt = wr_id_work_type(wc[i].wr_id);
@@ -705,7 +726,7 @@ class MeshImpl {
           if (wt == POOL_RECV_WR && wb >= 0 && wb < NUM_BUFFERS) {
             auto& rb = recv_buffer(v2_pool_sz_, wb, peer);
             zero_recv_buffer(rb);
-            connections_[peer].post_recv(
+            pool_connections_[peer].post_recv(
                 rb, make_wr_id(0, POOL_RECV_WR, wb, peer));
           } else if (wt == SEND_WR && wb >= 0 && wb < NUM_BUFFERS &&
                      v2_send_outstanding_[wb] > 0) {
@@ -1538,22 +1559,42 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = connections_[dst].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        // TEMP DIAGNOSTIC (2026-07-17): log every polled completion
-        // unconditionally, BEFORE the call_id filter, to determine whether
-        // completions are arriving and being wrongly discarded by the
-        // filter (ibv_poll_cq is destructive -- a `continue` here throws
-        // the completion away forever) vs. genuinely never arriving.
-        std::fprintf(
-            stderr,
-            "[jaccl-diag] send POLL rank=%d my_call_id=%u wc_call_id=%u "
-            "wc_buff=%d wc_status=%d dst=%d\n",
-            rank_,
-            call_id,
-            wr_id_call_id(wc[i].wr_id),
-            wr_id_buff(wc[i].wr_id),
-            static_cast<int>(wc[i].status),
-            dst);
-        std::fflush(stderr);
+        // Defense-in-depth error visibility (2026-07-17): connections_ is
+        // now isolated from the jaccl-v2 pool -- see pool_connections_
+        // member comment for the full collision this used to cause
+        // (IBV_WC_LOC_LEN_ERR from differing size classes sharing one QP,
+        // silently discarded without re-arming, eventually wedging both
+        // this path and the pool). Should only ever see our own SEND_WR
+        // completions now; log loudly instead of silently discarding if
+        // that assumption is ever violated.
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::fprintf(
+              stderr,
+              "[jaccl] send WC_ERR rank=%d call_id=%u wc_status=%d "
+              "wc_wt=%d wc_buff=%d dst=%d\n",
+              rank_,
+              call_id,
+              static_cast<int>(wc[i].status),
+              wr_id_work_type(wc[i].wr_id),
+              wr_id_buff(wc[i].wr_id),
+              dst);
+          std::fflush(stderr);
+          continue;
+        }
+        if (wr_id_work_type(wc[i].wr_id) != SEND_WR) {
+          std::fprintf(
+              stderr,
+              "[jaccl] send UNEXPECTED_WT rank=%d call_id=%u wc_wt=%d "
+              "(expected SEND_WR=%d) — a completion meant for a different "
+              "path landed on connections_; this should be impossible "
+              "post-pool-QP-split, investigate if seen\n",
+              rank_,
+              call_id,
+              wr_id_work_type(wc[i].wr_id),
+              SEND_WR);
+          std::fflush(stderr);
+          continue;
+        }
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
         }
@@ -1628,18 +1669,41 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = connections_[src].poll(WC_NUM, wc);
       for (int i = 0; i < n; i++) {
-        // TEMP DIAGNOSTIC (2026-07-17): see send()'s matching comment.
-        std::fprintf(
-            stderr,
-            "[jaccl-diag] recv POLL rank=%d my_call_id=%u wc_call_id=%u "
-            "wc_buff=%d wc_status=%d src=%d\n",
-            rank_,
-            call_id,
-            wr_id_call_id(wc[i].wr_id),
-            wr_id_buff(wc[i].wr_id),
-            static_cast<int>(wc[i].status),
-            src);
-        std::fflush(stderr);
+        // Defense-in-depth error visibility (2026-07-17): connections_ is
+        // now isolated from the jaccl-v2 pool (see pool_connections_
+        // member comment) so this should only ever see our own RECV_WR
+        // completions -- but log loudly instead of silently discarding
+        // if that assumption is ever violated, so the NEXT architectural
+        // collision surfaces immediately instead of after a multi-hour
+        // debugging session.
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          std::fprintf(
+              stderr,
+              "[jaccl] recv WC_ERR rank=%d call_id=%u wc_status=%d "
+              "wc_wt=%d wc_buff=%d src=%d\n",
+              rank_,
+              call_id,
+              static_cast<int>(wc[i].status),
+              wr_id_work_type(wc[i].wr_id),
+              wr_id_buff(wc[i].wr_id),
+              src);
+          std::fflush(stderr);
+          continue;
+        }
+        if (wr_id_work_type(wc[i].wr_id) != RECV_WR) {
+          std::fprintf(
+              stderr,
+              "[jaccl] recv UNEXPECTED_WT rank=%d call_id=%u wc_wt=%d "
+              "(expected RECV_WR=%d) — a completion meant for a different "
+              "path landed on connections_; this should be impossible "
+              "post-pool-QP-split, investigate if seen\n",
+              rank_,
+              call_id,
+              wr_id_work_type(wc[i].wr_id),
+              RECV_WR);
+          std::fflush(stderr);
+          continue;
+        }
         if (wr_id_call_id(wc[i].wr_id) != call_id) {
           continue;
         }
@@ -2098,6 +2162,14 @@ class MeshImpl {
   // at the head of the data recv FIFO. Empty for top-level groups
   // (those use the original inline ack on data QP).
   std::span<Connection> ack_connections_;
+  // ROOT-CAUSE FIX (2026-07-17): dedicated QP for the jaccl-v2 reliable-ARQ
+  // optimistic standing pool (POOL_RECV_WR). Same rationale as
+  // ack_connections_ above -- previously shared connections_ with raw
+  // send()/recv() (used by exo's Pipeline-Parallel p2p handoff), whose
+  // differently-sized buffers collided with the pool's uniform size class
+  // and threw IBV_WC_LOC_LEN_ERR, corrupting both paths' QP state. Empty
+  // when the reliable-optimistic path is disabled (nothing to isolate).
+  std::span<Connection> pool_connections_;
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> ack_send_buffers_;
   std::span<SharedBuffer> ack_recv_buffers_;
