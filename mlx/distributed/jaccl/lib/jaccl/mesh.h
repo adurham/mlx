@@ -104,6 +104,17 @@ class MeshGroup : public Group {
 
   void initialize(const ExchangeFn& exchange);
 
+  // (Re)build p2p_channel_ on the fixed derived port (coordinator_addr_'s
+  // port + 1). Used by the ctor AND by reconnect()/reconnect_fresh() --
+  // see p2p_channel_'s member comment for why the p2p retry-barrier
+  // protocol needs its own TCP socket, and coordinator_addr_'s comment for
+  // why a stale/desynced p2p_channel_ from a pre-fault stream must be torn
+  // down and rebuilt rather than reused across a reconnect. Assigning to
+  // an engaged std::optional destroys the old SideChannel first (closing
+  // its fd via ~TCPSocket) before the new one binds/connects, so this is
+  // safe to call with p2p_channel_ already populated.
+  void rebuild_p2p_channel();
+
   // Hard recovery: close and reopen the ibv device contexts and rebuild
   // EVERYTHING device-side (PD/CQ/QP, buffer MR registrations, MeshImpl/
   // RingImpl views) — the in-process equivalent of a runner respawn. The
@@ -145,6 +156,12 @@ class MeshGroup : public Group {
   // in the ctor, right after side_channel_, on a port derived
   // deterministically from the coordinator's own port (+1) -- see ctor.
   std::optional<SideChannel> p2p_channel_;
+  // Stashed verbatim from the ctor arg so reconnect()/reconnect_fresh() can
+  // rebuild p2p_channel_ on the SAME derived port (coordinator_addr's port
+  // + 1) without threading a new parameter through every call site. Empty
+  // on subgroups (which never have a p2p_channel_ to rebuild in the first
+  // place -- see reconnect()'s has_split_ guard).
+  std::string coordinator_addr_;
   std::vector<std::string> device_names_;
   std::vector<Connection> connections_;
   std::vector<Connection> ack_connections_;

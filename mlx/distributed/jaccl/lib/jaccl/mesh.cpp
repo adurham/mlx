@@ -20,6 +20,7 @@ MeshGroup::MeshGroup(
     : rank_(rank),
       size_(device_names.size()),
       side_channel_(std::in_place, rank_, size_, coordinator_addr.c_str()),
+      coordinator_addr_(coordinator_addr),
       device_names_(device_names),
       connections_(create_connections(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
@@ -87,21 +88,7 @@ MeshGroup::MeshGroup(
   // deadlock). Port is coordinator_addr's own port + 1 -- deterministic,
   // no dynamic port exchange needed since coordinator_addr is already
   // uniquely assigned per-instance by exo's placement layer.
-  {
-    auto colon = coordinator_addr.find(':');
-    if (colon == std::string::npos) {
-      std::ostringstream msg;
-      msg << "[jaccl] Can't derive p2p retry channel port from "
-             "coordinator_addr (missing ':'): "
-          << coordinator_addr;
-      throw std::runtime_error(msg.str());
-    }
-    std::string ip = coordinator_addr.substr(0, colon);
-    int port = std::stoi(coordinator_addr.substr(colon + 1));
-    std::ostringstream p2p_addr;
-    p2p_addr << ip << ":" << (port + 1);
-    p2p_channel_.emplace(rank_, size_, p2p_addr.str().c_str());
-  }
+  rebuild_p2p_channel();
 
   mesh_ = MeshImpl(
       rank_,
@@ -492,6 +479,31 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
   }
 }
 
+void MeshGroup::rebuild_p2p_channel() {
+  auto colon = coordinator_addr_.find(':');
+  if (colon == std::string::npos) {
+    std::ostringstream msg;
+    msg << "[jaccl] Can't derive p2p retry channel port from "
+           "coordinator_addr (missing ':'): "
+        << coordinator_addr_;
+    throw std::runtime_error(msg.str());
+  }
+  std::string ip = coordinator_addr_.substr(0, colon);
+  int port = std::stoi(coordinator_addr_.substr(colon + 1));
+  std::ostringstream p2p_addr;
+  p2p_addr << ip << ":" << (port + 1);
+  // Assigning to an already-engaged optional destroys the old SideChannel
+  // (and its TCPSocket, whose dtor shuts down + closes the fd) before the
+  // new one is constructed, so any bytes left over from a pre-fault
+  // p2p_retry_barrier exchange are discarded with the old connection
+  // rather than misread by the next call on a "reconnected" but stale
+  // stream. SO_REUSEADDR/SO_REUSEPORT on the listener (rank 0) and 4x
+  // exponential-backoff retries on the connecting side (TCPSocket::connect,
+  // see SideChannel ctor) absorb the TIME_WAIT / accept-not-yet-listening
+  // races from tearing down and rebinding the same port back to back.
+  p2p_channel_.emplace(rank_, size_, p2p_addr.str().c_str());
+}
+
 void MeshGroup::reconnect() {
   // In-place recovery: reset the wedged QPs and re-establish the connections
   // WITHOUT destroying PD/CQ/MRs or reloading the model. Both ranks call this
@@ -596,8 +608,22 @@ void MeshGroup::reconnect() {
     }
   }
 
-  // 3. Clear stale ACK bookkeeping and re-post the ACK_RECV pool on the fresh
+  // 3. Rebuild the dedicated p2p retry-barrier channel. It survives the RDMA
+  //    QP reset/re-init above untouched (separate TCP socket, not part of
+  //    the ibv device state), so any bytes left mid-frame on it from the
+  //    fault that triggered this reconnect are still sitting there --
+  //    reusing it here would let the very next p2p_retry_barrier() call
+  //    read a stale reply and throw DESYNC. Tear down + rebuild on the same
+  //    derived port instead (see rebuild_p2p_channel()).
+  if (p2p_channel_.has_value()) {
+    rebuild_p2p_channel();
+    mesh_.set_p2p_channel(&*p2p_channel_);
+  }
+
+  // 4. Clear stale ACK bookkeeping and re-post the ACK_RECV pool on the fresh
   //    QPs, then barrier so both ranks are ready before the next collective.
+  //    This barrier also fences step 3 above -- neither rank proceeds until
+  //    both have finished rebuilding p2p_channel_.
   mesh_.reset_ack_state();
   mesh_.post_ack_recvs(0);
   fprintf(stderr, "[jaccl] reconnect rank=%d RTS done; final barrier...\n", rank_);
@@ -672,11 +698,18 @@ void MeshGroup::reconnect_fresh() {
       ack_send_buffers_,
       ack_recv_buffers_);
   mesh_.set_coordinator(&*side_channel_);
-  // p2p_channel_ (like side_channel_) survives reconnect_fresh unchanged --
-  // it's a separate TCP socket from the RDMA transport being rebuilt here.
-  // But mesh_ itself is a brand-new MeshImpl, so its pointer needs
-  // re-wiring just like set_coordinator above.
+  // Rebuild p2p_channel_ same as reconnect() -- it is a separate TCP socket
+  // from the RDMA transport rebuilt above, so it does NOT get cleared by
+  // steps 1-2 and can carry a stale/desynced stream across from whatever
+  // fault triggered this reconnect_fresh() (was previously left as-is here,
+  // which produced a "p2p_retry_barrier DESYNC" throw on the very next p2p
+  // call after an otherwise-successful reconnect_fresh -- see
+  // rebuild_p2p_channel()'s comment for the mechanism). mesh_ is a
+  // brand-new MeshImpl either way, so its pointer needs re-wiring just
+  // like set_coordinator above regardless of whether the channel itself
+  // was rebuilt.
   if (p2p_channel_.has_value()) {
+    rebuild_p2p_channel();
     mesh_.set_p2p_channel(&*p2p_channel_);
   }
   ring_ = RingImpl(
