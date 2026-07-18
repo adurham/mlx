@@ -3,6 +3,9 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -159,24 +162,116 @@ void TCPSocket::set_recv_timeout_secs(int secs) {
 }
 
 void TCPSocket::recv(const char* tag, void* data, size_t len) {
+  // RETRY-ON-EAGAIN FIX (2026-07-18): previously any recv() <= 0 threw
+  // immediately, including errno=EAGAIN/EWOULDBLOCK from a plain
+  // SO_RCVTIMEO expiry -- "peer hasn't sent yet this round" is NOT the
+  // same condition as a dead/closed connection, but was treated
+  // identically. Under the higher-message-frequency PP speculative-
+  // decode protocols (multiple small p2p_retry_barrier round-trips per
+  // decode cycle instead of one), transient scheduling jitter on either
+  // rank (GC pause, Metal command-buffer queueing delay, thermal
+  // throttling, etc.) could exceed one 35s SO_RCVTIMEO window without
+  // the peer being remotely unhealthy -- confirmed empirically: this
+  // threw mid p2p_retry_barrier's 16-byte ack recv (remaining=16, i.e.
+  // the FIRST byte of this round's reply, not a stall mid-message),
+  // self-healed the FIRST time (group.reconnect() succeeded), then
+  // recurred and this time ALSO hit during reconnect's own side_channel_
+  // recv (same TCPSocket::recv), causing the recovery attempt itself to
+  // throw -> RunnerFailed (full re-place) instead of the intended
+  // in-place recovery.
+  //
+  // Fix distinguishes:
+  //   n == 0            -> peer sent FIN (orderly close). FATAL,
+  //                        immediate throw -- errno is not meaningful
+  //                        here (stale from a prior call), so this
+  //                        check must come BEFORE any errno inspection.
+  //   n < 0, EAGAIN/EWOULDBLOCK -> SO_RCVTIMEO expired, zero bytes
+  //                        consumed this call (kernel doesn't discard
+  //                        partial TCP stream data on timeout -- safe
+  //                        to retry into the same buffer offset).
+  //                        Retryable, bounded by an ELAPSED deadline
+  //                        that resets on every partial-progress recv
+  //                        (n > 0), not a raw retry count -- a peer
+  //                        that's slow-but-alive and trickling data
+  //                        keeps getting fresh budget; one that's
+  //                        genuinely wedged for the full deadline with
+  //                        zero progress still throws.
+  //   n < 0, EINTR       -> interrupted by a signal, not a real fault.
+  //                        Retry unconditionally, doesn't consume
+  //                        retry-deadline budget.
+  //   n < 0, anything else (ECONNRESET, EPIPE, ETIMEDOUT, ENOTCONN,
+  //                        EBADF, ...) -> genuinely fatal transport
+  //                        fault. Immediate throw, unchanged behavior.
+  const char* deadline_env = std::getenv("MLX_JACCL_RECV_RETRY_DEADLINE_SECS");
+  const double deadline_secs = deadline_env ? std::atof(deadline_env) : 60.0;
+  auto deadline_start = std::chrono::steady_clock::now();
+  bool warned_once = false;
+
   while (len > 0) {
     auto n = ::recv(sock_, data, len, 0);
-    if (n <= 0) {
-      // Diagnostic detail: n==0 means the PEER closed the connection (EOF);
-      // n<0 with errno=EAGAIN(35) means a non-blocking socket had no data.
-      // flags/nonblock disambiguate a closed coordinator from a socket that
-      // was never blocking. Retained deliberately — recv failures here are
-      // rare (reconnect / init only).
-      int fl = ::fcntl(sock_, F_GETFL);
+    if (n > 0) {
+      len -= n;
+      data = static_cast<char*>(data) + n;
+      deadline_start = std::chrono::steady_clock::now(); // progress: reset
+      warned_once = false;
+      continue;
+    }
+    if (n == 0) {
+      // Peer closed the connection (EOF). errno is NOT meaningful for a
+      // 0-return -- do not inspect it. Always fatal.
       std::ostringstream msg;
-      msg << tag << " Recv failed with errno=" << errno << " n=" << n
-          << " fd=" << sock_ << " remaining=" << len << " flags=0x" << std::hex
-          << fl << std::dec << " nonblock="
-          << ((fl >= 0 && (fl & O_NONBLOCK)) ? 1 : 0);
+      msg << tag << " Recv failed: peer closed connection (EOF) fd=" << sock_
+          << " remaining=" << len;
       throw std::runtime_error(msg.str());
     }
-    len -= n;
-    data = static_cast<char*>(data) + n;
+    // n < 0 from here on.
+    int e = errno;
+    if (e == EINTR) {
+      continue; // Signal interruption, not a fault -- no deadline cost.
+    }
+    if (e == EAGAIN || e == EWOULDBLOCK) {
+      auto elapsed = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - deadline_start)
+                         .count();
+      if (deadline_secs > 0 && elapsed >= deadline_secs) {
+        int fl = ::fcntl(sock_, F_GETFL);
+        std::ostringstream msg;
+        msg << tag << " Recv failed with errno=" << e << " n=" << n
+            << " fd=" << sock_ << " remaining=" << len << " flags=0x"
+            << std::hex << fl << std::dec << " nonblock="
+            << ((fl >= 0 && (fl & O_NONBLOCK)) ? 1 : 0)
+            << " (no progress for " << elapsed << "s, retry deadline "
+            << deadline_secs << "s exceeded)";
+        throw std::runtime_error(msg.str());
+      }
+      if (!warned_once) {
+        // One heartbeat per stall onset (not per SO_RCVTIMEO retry --
+        // that would spam at one line per 35s timeout window) so a
+        // genuinely stuck peer is visible in logs before the deadline
+        // fires, distinguishing "still waiting, within budget" from a
+        // silent multi-minute hang.
+        fprintf(
+            stderr,
+            "[jaccl] %s recv EAGAIN, retrying (remaining=%zu, elapsed=%.1fs, "
+            "deadline=%.1fs)\n",
+            tag,
+            len,
+            elapsed,
+            deadline_secs);
+        fflush(stderr);
+        warned_once = true;
+      }
+      continue; // Retry the same ::recv() call -- no bytes were consumed.
+    }
+    // Any other errno: genuinely fatal (ECONNRESET, EPIPE, ETIMEDOUT,
+    // ENOTCONN, EBADF, ...). Unchanged from the original behavior.
+    int fl = ::fcntl(sock_, F_GETFL);
+    std::ostringstream msg;
+    msg << tag << " Recv failed with errno=" << e << " n=" << n
+        << " fd=" << sock_ << " remaining=" << len << " flags=0x" << std::hex
+        << fl << std::dec << " nonblock="
+        << ((fl >= 0 && (fl & O_NONBLOCK)) ? 1 : 0);
+    throw std::runtime_error(msg.str());
   }
 }
 
