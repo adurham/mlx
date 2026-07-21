@@ -45,6 +45,31 @@ inline void debug_set_primitive_buffer_label(
 #endif
 }
 
+// exo-stall-diag (2026-07-21): cheap, ALWAYS-ON variant of the above
+// (not gated by MLX_METAL_DEBUG, which isn't defined in the production
+// build). Sets the buffer's label to ONLY the most recent primitive
+// name encoded into it (overwriting, not accumulating -- so this is a
+// single NS::String allocation per eval() call, not a growing one).
+// For a live-stuck command buffer, this tells you the LAST op that was
+// encoded before commit, i.e. a strong hint at what's executing right
+// now if the buffer is still Scheduled/running when read back via
+// EXO_CMDBUF_RING_DIAG. No-ops (near-zero cost) unless
+// EXO_CMDBUF_RING_DIAG=1 is set, checked once via a cached atomic bool
+// to avoid a getenv() on every single eval() call.
+inline void debug_set_primitive_buffer_label_cheap(
+    MTL::CommandBuffer* command_buffer,
+    Primitive& primitive) {
+  static const bool enabled = [] {
+    auto* env = std::getenv("EXO_CMDBUF_RING_DIAG");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  if (!enabled) {
+    return;
+  }
+  command_buffer->setLabel(
+      NS::String::string(primitive.name(), NS::UTF8StringEncoding));
+}
+
 template <typename T>
 constexpr bool is_numeric_except_char = std::is_arithmetic_v<T> &&
     !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&

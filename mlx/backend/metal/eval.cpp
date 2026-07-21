@@ -126,6 +126,7 @@ void eval(array& arr) {
     }
 
     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
+    debug_set_primitive_buffer_label_cheap(command_buffer, arr.primitive());
     arr.primitive().eval_gpu(arr.inputs(), outputs);
   }
   std::unordered_set<std::shared_ptr<array::Data>> buffers;

@@ -1053,11 +1053,20 @@ void dump_recent_command_buffers(FILE* out) {
     double gpu_start_s = e.buffer->GPUStartTime();
     double gpu_end_s = e.buffer->GPUEndTime();
     uint64_t scheduled_us = e.scheduled_us ? e.scheduled_us->load() : 0;
+    // exo-stall-diag (2026-07-21): read back the label set by
+    // debug_set_primitive_buffer_label_cheap() in eval.cpp -- the name
+    // of the LAST primitive encoded into this buffer before commit.
+    // For a buffer still Scheduled/executing at dump time, this is a
+    // strong hint at what's actually running right now.
+    const char* label = "?";
+    if (auto* ns_label = e.buffer->label()) {
+      label = ns_label->utf8String();
+    }
     std::fprintf(
         out,
         "  stream=%d ops_at_commit=%d status=%s commit_us=%llu "
         "age_ms=%.1f scheduled_us=%llu commit_to_scheduled_ms=%s "
-        "gpu_start_s=%.6f gpu_end_s=%.6f gpu_running=%s\n",
+        "gpu_start_s=%.6f gpu_end_s=%.6f gpu_running=%s label=%s\n",
         e.stream_index,
         e.ops_at_commit,
         status_name(status),
@@ -1073,7 +1082,8 @@ void dump_recent_command_buffers(FILE* out) {
         // GPUStartTime > 0 with GPUEndTime <= 0 means the GPU has begun
         // this buffer's work but not yet finished it -- i.e. genuinely
         // executing right now, not idle-stalled pre-dispatch.
-        (gpu_start_s > 0.0 && gpu_end_s <= 0.0) ? "yes" : "no");
+        (gpu_start_s > 0.0 && gpu_end_s <= 0.0) ? "yes" : "no",
+        label);
   }
   std::fflush(out);
 }
