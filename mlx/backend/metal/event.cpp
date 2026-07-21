@@ -8,6 +8,7 @@
 
 #include "mlx/event.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/scheduler.h"
 
 namespace mlx::core {
@@ -133,6 +134,14 @@ void Event::wait() {
           static_cast<unsigned long long>(target),
           static_cast<unsigned long long>(timeout_us / 1000));
       fflush(stderr);
+      // exo-stall-diag (2026-07-21): dump recent command-buffer commit/
+      // schedule/completion status right here, at the exact moment a slow
+      // wait is first detected -- this is the one call site that answers
+      // "was a command buffer even committed for the event we're stuck
+      // waiting on, and if so, where is it stuck" without needing to
+      // correlate separate tools' timestamps after the fact. No-op unless
+      // EXO_CMDBUF_RING_DIAG=1.
+      metal::dump_recent_command_buffers(stderr);
     }
     if (timeout_us != 0 && elapsed_us >= 0 &&
         static_cast<uint64_t>(elapsed_us) >= timeout_us) {

@@ -1,7 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -50,6 +52,114 @@ bool dispatch_count_enabled() {
     return false;
   }();
   return enabled;
+}
+
+// exo-stall-diag (2026-07-21): ring buffer of recently-committed command
+// buffers, for the PP+DSpark GPU-idle-stall investigation (repeated 15-47s
+// stalls where `sample`/ioreg show the GPU genuinely idle and the main
+// thread parked in Event::wait()/wait_for_one(), but it was previously
+// unknown whether MLX had even submitted a command buffer for the awaited
+// event, or whether Metal/the driver had it and simply sat on it).
+//
+// Gated on EXO_CMDBUF_RING_DIAG=1 (opt-in, zero overhead when unset — the
+// bookkeeping in commit() is skipped entirely, not just the dump). When
+// enabled: every commit() records a lightweight entry (retained buffer
+// pointer, stream index, ops-at-commit, wall-clock commit timestamp) into
+// a small fixed-size ring (default 32, oldest overwritten). Entries hold a
+// real NS::SharedPtr so the buffer object survives long enough to inspect
+// its ->status()/->GPUStartTime()/->error() even after this function
+// returns, which is the whole point — we need to inspect them later, from
+// Event::wait()'s slow-wait diagnostic, not at commit time.
+struct CmdBufRingEntry {
+  NS::SharedPtr<MTL::CommandBuffer> buffer;
+  int stream_index{-1};
+  int ops_at_commit{0};
+  uint64_t commit_us{0};
+  // Set by an addScheduledHandler callback (fires when Metal/the driver
+  // actually picks the buffer up for execution, distinct from commit()
+  // merely handing it to Metal). A separate heap allocation (not a plain
+  // field) so the handler closure can capture a stable address to write
+  // into even after this entry is later overwritten in the ring — the
+  // shared_ptr keeps the counter alive independently of the ring slot's
+  // lifetime, so a late-firing handler for an evicted entry never
+  // dereferences freed memory, it just writes to an orphaned counter that
+  // nothing reads anymore (harmless).
+  std::shared_ptr<std::atomic<uint64_t>> scheduled_us =
+      std::make_shared<std::atomic<uint64_t>>(0);
+};
+
+constexpr size_t kCmdBufRingSize = 32;
+
+bool cmdbuf_ring_diag_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("EXO_CMDBUF_RING_DIAG");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return enabled;
+}
+
+inline uint64_t ring_now_us() {
+  using namespace std::chrono;
+  return duration_cast<microseconds>(steady_clock::now().time_since_epoch())
+      .count();
+}
+
+struct CmdBufRing {
+  std::mutex mtx;
+  std::vector<CmdBufRingEntry> entries;
+  size_t next_slot{0};
+
+  void record(NS::SharedPtr<MTL::CommandBuffer> buf, int stream_idx, int ops) {
+    auto scheduled = std::make_shared<std::atomic<uint64_t>>(0);
+    // Fires when Metal/the driver actually schedules this buffer for
+    // execution -- separate from commit() itself (which only hands the
+    // buffer to Metal's queue) and separate from completion. A long gap
+    // between commit_us and this firing is a Metal-queue/driver-level
+    // stall; a long gap between this firing and completion (with GPU
+    // idle per ioreg) is a stall INSIDE actual GPU execution/scheduling.
+    buf->addScheduledHandler(
+        [scheduled](MTL::CommandBuffer*) { *scheduled = ring_now_us(); });
+    std::lock_guard<std::mutex> lk(mtx);
+    CmdBufRingEntry entry{
+        std::move(buf), stream_idx, ops, ring_now_us(), scheduled};
+    if (entries.size() < kCmdBufRingSize) {
+      entries.push_back(std::move(entry));
+    } else {
+      entries[next_slot] = std::move(entry);
+      next_slot = (next_slot + 1) % kCmdBufRingSize;
+    }
+  }
+
+  // Snapshot under the lock (SharedPtr copies bump refcount, so the
+  // buffers stay alive for the caller to inspect after unlocking).
+  std::vector<CmdBufRingEntry> snapshot() {
+    std::lock_guard<std::mutex> lk(mtx);
+    return entries;
+  }
+};
+
+CmdBufRing& cmdbuf_ring() {
+  static CmdBufRing ring;
+  return ring;
+}
+
+const char* status_name(MTL::CommandBufferStatus s) {
+  switch (s) {
+    case MTL::CommandBufferStatusNotEnqueued:
+      return "NotEnqueued";
+    case MTL::CommandBufferStatusEnqueued:
+      return "Enqueued";
+    case MTL::CommandBufferStatusCommitted:
+      return "Committed";
+    case MTL::CommandBufferStatusScheduled:
+      return "Scheduled";
+    case MTL::CommandBufferStatusCompleted:
+      return "Completed";
+    case MTL::CommandBufferStatusError:
+      return "Error";
+    default:
+      return "Unknown";
+  }
 }
 
 // Total GPU-busy time accumulated across all completed command buffers,
@@ -297,7 +407,7 @@ CommandEncoder::CommandEncoder(
     Device& d,
     int index,
     ResidencySet& residency_set)
-    : device_(d) {
+    : device_(d), index_(index) {
   auto pool = new_scoped_memory_pool();
   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
   if (!queue_) {
@@ -487,6 +597,12 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit() {
+  if (cmdbuf_ring_diag_enabled()) {
+    // Record the buffer being committed (not the fresh replacement below) —
+    // grab a real SharedPtr copy before commit() so the ring holds a
+    // strong reference independent of buffer_'s lifetime.
+    cmdbuf_ring().record(buffer_, index_, buffer_ops_);
+  }
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
@@ -913,6 +1029,53 @@ void reset_gpu_time() {
 
 void accumulate_gpu_time_ns(uint64_t ns) {
   g_gpu_time_ns_.fetch_add(ns, std::memory_order_relaxed);
+}
+
+// exo-stall-diag (2026-07-21): see the declaration in device.h for the
+// intended call site (Event::wait()'s slow-wait diagnostic). No-op when
+// EXO_CMDBUF_RING_DIAG is unset -- callers don't need their own gate.
+void dump_recent_command_buffers(FILE* out) {
+  if (!cmdbuf_ring_diag_enabled()) {
+    return;
+  }
+  auto entries = cmdbuf_ring().snapshot();
+  uint64_t now = ring_now_us();
+  std::fprintf(
+      out,
+      "[cmdbuf_ring] dumping %zu recent command buffer(s) (now_us=%llu):\n",
+      entries.size(),
+      static_cast<unsigned long long>(now));
+  for (auto& e : entries) {
+    if (!e.buffer) {
+      continue;
+    }
+    auto status = e.buffer->status();
+    double gpu_start_s = e.buffer->GPUStartTime();
+    double gpu_end_s = e.buffer->GPUEndTime();
+    uint64_t scheduled_us = e.scheduled_us ? e.scheduled_us->load() : 0;
+    std::fprintf(
+        out,
+        "  stream=%d ops_at_commit=%d status=%s commit_us=%llu "
+        "age_ms=%.1f scheduled_us=%llu commit_to_scheduled_ms=%s "
+        "gpu_start_s=%.6f gpu_end_s=%.6f gpu_running=%s\n",
+        e.stream_index,
+        e.ops_at_commit,
+        status_name(status),
+        static_cast<unsigned long long>(e.commit_us),
+        (now - e.commit_us) / 1000.0,
+        static_cast<unsigned long long>(scheduled_us),
+        scheduled_us == 0
+            ? "not-yet-scheduled"
+            : fmt::format("{:.1f}", (scheduled_us - e.commit_us) / 1000.0)
+                  .c_str(),
+        gpu_start_s,
+        gpu_end_s,
+        // GPUStartTime > 0 with GPUEndTime <= 0 means the GPU has begun
+        // this buffer's work but not yet finished it -- i.e. genuinely
+        // executing right now, not idle-stalled pre-dispatch.
+        (gpu_start_s > 0.0 && gpu_end_s <= 0.0) ? "yes" : "no");
+  }
+  std::fflush(out);
 }
 
 } // namespace mlx::core::metal

@@ -106,10 +106,18 @@ class MLX_API CommandEncoder {
     return buffer_.get();
   }
 
+  // exo-stall-diag (2026-07-21): stream index, recorded at construction so
+  // EXO_CMDBUF_RING_DIAG can attribute ring-buffer entries back to a stream
+  // without threading an extra parameter through commit().
+  int stream_index() const {
+    return index_;
+  }
+
  private:
   MTL::ComputeCommandEncoder* get_command_encoder();
 
   Device& device_;
+  int index_{-1};
   bool exiting_{false};
 
   // Buffer that stores encoded commands.

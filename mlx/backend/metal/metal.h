@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -41,6 +42,28 @@ MLX_API uint64_t gpu_time_ns();
 MLX_API void reset_gpu_time();
 MLX_API bool gpu_time_enabled();
 MLX_API void accumulate_gpu_time_ns(uint64_t ns);
+
+/** exo-stall-diag (2026-07-21): dumps recent command-buffer commit/schedule/
+ * complete timestamps + status to `out`, for the PP+DSpark GPU-idle-stall
+ * investigation (repeated 15-47s decode stalls where `sample`/ioreg polling
+ * showed the GPU genuinely idle and the main thread parked in
+ * Event::wait()/wait_for_one(), with no prior visibility into whether a
+ * command buffer had even been submitted for the awaited event).
+ *
+ * Gated by the ``EXO_CMDBUF_RING_DIAG`` env var (opt-in, zero overhead when
+ * unset -- both the ring-buffer bookkeeping in CommandEncoder::commit() and
+ * this dump no-op; callers don't need their own gate). Intended to be
+ * called from Event::wait()'s existing "slow wait" diagnostic
+ * (backend/metal/event.cpp) once a wait has been stuck for several
+ * seconds, to answer in one shot: was a command buffer even committed for
+ * the stuck event; if so, is it stuck at Committed (handed to Metal's
+ * queue but the driver hasn't scheduled it), Scheduled-but-not-running
+ * (driver has it, GPU hasn't started), or genuinely mid-execution
+ * (GPUStartTime set, no GPUEndTime yet)? Answering this distinguishes an
+ * MLX/graph-scheduling stall from a Metal-queue/driver-level stall from
+ * true (if unusually slow) GPU execution, without needing separate tools'
+ * output correlated after the fact via wall-clock timestamps. */
+MLX_API void dump_recent_command_buffers(FILE* out);
 
 /** Get information about the GPU and system settings. */
 MLX_API const
