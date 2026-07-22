@@ -1,13 +1,10 @@
 // Copyright © 2024 Apple Inc.
 
-#include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
 
-#include "mlx/event.h"
-#include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/scheduler.h"
 
@@ -37,21 +34,27 @@ inline uint64_t now_us() {
 
 } // namespace
 
-Event::Event(Stream stream) : stream_(stream) {
-  auto dtor = [](void* ptr) {
-    auto p = metal::new_scoped_memory_pool();
-    static_cast<MTL::SharedEvent*>(ptr)->release();
-  };
-  auto p = metal::new_scoped_memory_pool();
-  event_ = std::shared_ptr<void>(
-      metal::device(Device::gpu).mtl_device()->newSharedEvent(), dtor);
-  if (event_ == nullptr) {
+///////////////////////////////////////////////////////////////////////////////
+// EventImpl implementations
+///////////////////////////////////////////////////////////////////////////////
+
+namespace metal {
+
+EventImpl::EventImpl(Device& d) {
+  auto p = new_scoped_memory_pool();
+  mtl_event_ = NS::TransferPtr(d.mtl_device()->newSharedEvent());
+  if (!mtl_event_) {
     throw std::runtime_error(
         "[Event::Event] Failed to create Metal shared event.");
   }
 }
 
-void Event::wait() {
+EventImpl::~EventImpl() {
+  auto p = new_scoped_memory_pool();
+  mtl_event_.reset();
+}
+
+void EventImpl::wait(uint64_t value) {
   // exo-jaccl-fix (2026-07-05): INTERRUPTIBLE wait. Poll the shared event's
   // value in USER space (MTL::SharedEvent::signaledValue() — a non-blocking
   // shared-memory read) instead of Apple's waitUntilSignaledValue, which traps
@@ -63,16 +66,17 @@ void Event::wait() {
   // it can neither honor a timeout, surface a captured stream exception, nor
   // call reconnect() — only SIGKILL frees it (faulting the GPU + leaking RDMA
   // QPs). Polling keeps this thread runnable, so the loop can (a) rethrow a
-  // captured stream-worker exception and (b) honor a total timeout — letting a
-  // wedged peer SELF-ABORT and have the runner reconnect() the transport
-  // in-place instead of dying. Fast path is one signaledValue() read; then a
-  // brief spin (cheap for sub-µs completions), then a low-CPU sleep-poll.
+  // captured stream-worker exception, (b) surface an error poisoned onto this
+  // event by a failed command buffer (upstream's error-propagation model —
+  // check_error() below), and (c) honor a total timeout — letting a wedged
+  // peer SELF-ABORT and have the runner reconnect() the transport in-place
+  // instead of dying. Fast path is one signaledValue() read; then a brief
+  // spin (cheap for sub-µs completions), then a low-CPU sleep-poll.
   // Tunables: MLX_EVENT_WAIT_POLL_US (sleep granularity, default 50),
   // MLX_EVENT_WAIT_SPIN (spins before sleeping, default 2000),
   // MLX_EVENT_WAIT_TIMEOUT_MS (self-abort deadline, default 40000; 0 disables).
-  auto* ev = static_cast<MTL::SharedEvent*>(event_.get());
-  const uint64_t target = value();
-  if (ev->signaledValue() >= target) {
+  check_error();
+  if (mtl_event_->signaledValue() >= value) {
     return;
   }
   static const uint64_t sleep_us = [] {
@@ -82,9 +86,10 @@ void Event::wait() {
   // Escape hatch: sleep_us==0 restores the legacy uninterruptible blocking
   // wait (A/B only — it reintroduces the peer-hang).
   if (sleep_us == 0) {
-    if (!ev->waitUntilSignaledValue(target, -1)) {
+    if (!mtl_event_->waitUntilSignaledValue(value, -1)) {
       throw std::runtime_error("[Event::wait] Timed out");
     }
+    check_error();
     return;
   }
   static const uint64_t timeout_us = [] {
@@ -103,7 +108,7 @@ void Event::wait() {
   // hundreds of real seconds — long after the 45s _check_hang SIGKILL.
   const auto start = std::chrono::steady_clock::now();
   bool logged_slow = false;
-  while (ev->signaledValue() < target) {
+  while (mtl_event_->signaledValue() < value) {
     if (spins < spin_iters) {
       ++spins;
 #if defined(__aarch64__)
@@ -114,8 +119,16 @@ void Event::wait() {
       continue;
     }
     // Unlike the kernel wait, this loop actually runs: surface a captured
-    // stream-worker exception, then honor the total self-abort timeout.
+    // stream-worker exception, then check for an error poisoned onto this
+    // event by a failed command buffer (upstream's error-propagation model),
+    // then honor the total self-abort timeout. Checking check_error() every
+    // iteration (not just once at the end) matters here: if the command
+    // buffer that would have signaled this event itself failed, the event
+    // may never reach `value` at all, and we want to surface the real
+    // root-cause error instead of spinning for the full timeout and then
+    // throwing a generic "wedged event" message that hides it.
     scheduler::throw_if_stream_exception();
+    check_error();
     auto elapsed_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start)
@@ -130,8 +143,8 @@ void Event::wait() {
           "[Event::wait] slow wait: elapsed=%.1fs signaled=%llu target=%llu "
           "(polling; self-abort at %llums)\n",
           elapsed_us / 1e6,
-          static_cast<unsigned long long>(ev->signaledValue()),
-          static_cast<unsigned long long>(target),
+          static_cast<unsigned long long>(mtl_event_->signaledValue()),
+          static_cast<unsigned long long>(value),
           static_cast<unsigned long long>(timeout_us / 1000));
       fflush(stderr);
       // exo-stall-diag (2026-07-21): dump recent command-buffer commit/
@@ -152,31 +165,59 @@ void Event::wait() {
     }
     std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
   }
+  check_error();
+}
+
+void EventImpl::signal(uint64_t value) {
+  mtl_event_->setSignaledValue(value);
+}
+
+void EventImpl::set_error(std::shared_ptr<std::string> error) {
+  std::atomic_store(&error_, std::move(error));
+}
+
+void EventImpl::check_error() {
+  auto error = std::atomic_exchange(&error_, {});
+  if (error) {
+    throw std::runtime_error(*error);
+  }
+}
+
+} // namespace metal
+
+///////////////////////////////////////////////////////////////////////////////
+// Event implementations
+///////////////////////////////////////////////////////////////////////////////
+
+Event::Event(Stream stream) : stream_(stream) {
+  event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device));
+}
+
+void Event::wait() {
+  static_cast<metal::EventImpl*>(event_.get())->wait(value());
 }
 
 void Event::wait(Stream stream) {
+  auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
   if (stream.device == Device::cpu) {
-    scheduler::enqueue(stream, [*this]() mutable { wait(); });
+    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+      impl->wait(value);
+    });
   } else {
     auto& encoder = metal::get_command_encoder(stream);
-    encoder.end_encoding();
-    auto* command_buffer = encoder.get_command_buffer();
-    command_buffer->encodeWait(static_cast<MTL::Event*>(event_.get()), value());
-    command_buffer->addCompletedHandler([*this](MTL::CommandBuffer*) {});
+    encoder.wait_event(std::move(impl), value());
   }
 }
 
 void Event::signal(Stream stream) {
+  auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
   if (stream.device == Device::cpu) {
-    scheduler::enqueue(stream, [*this]() mutable {
-      static_cast<MTL::SharedEvent*>(event_.get())->setSignaledValue(value());
+    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+      impl->signal(value);
     });
   } else {
     auto& encoder = metal::get_command_encoder(stream);
-    encoder.end_encoding();
-    auto* command_buffer = encoder.get_command_buffer();
-    command_buffer->encodeSignalEvent(
-        static_cast<MTL::Event*>(event_.get()), value());
+    encoder.signal_event(std::move(impl), value());
 
     if (signal_probe_enabled()) {
       // Capture state at signal-encode time. ops is the number of compute
@@ -199,9 +240,8 @@ void Event::signal(Stream stream) {
           ops,
           static_cast<unsigned long long>(t_enc_us));
       std::fflush(stderr);
-      command_buffer->addCompletedHandler(
-          [*this, stream_idx, value_at_signal, ops, t_enc_us](
-              MTL::CommandBuffer*) {
+      encoder.get_command_buffer()->addCompletedHandler(
+          [stream_idx, value_at_signal, ops, t_enc_us](MTL::CommandBuffer*) {
             const uint64_t t_done_us = now_us();
             std::fprintf(
                 stderr,
@@ -215,15 +255,13 @@ void Event::signal(Stream stream) {
                 static_cast<unsigned long long>(t_done_us - t_enc_us));
             std::fflush(stderr);
           });
-    } else {
-      command_buffer->addCompletedHandler([*this](MTL::CommandBuffer*) {});
     }
   }
 }
 
 bool Event::is_signaled() const {
-  return static_cast<MTL::SharedEvent*>(event_.get())->signaledValue() >=
-      value();
+  auto* mtl_event = static_cast<metal::EventImpl*>(event_.get())->mtl_event();
+  return mtl_event->signaledValue() >= value();
 }
 
 } // namespace mlx::core

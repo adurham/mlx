@@ -11,6 +11,7 @@
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
+#include "mlx/utils.h"
 
 namespace mlx::core::gpu {
 
@@ -75,6 +76,13 @@ inline void check_error_deferred(MTL::CommandBuffer* cbuf) {
     msg << "[METAL] Command buffer execution failed: " << desc;
     set_deferred_error(msg.str());
   }
+}
+
+void new_thread_unsafe_stream(Stream s) {
+  assert(s.device == Device::gpu);
+  auto& encoders = metal::get_global_command_encoders();
+  auto& d = metal::device(s.device);
+  encoders.try_emplace(s.index, d, s.index, d.residency_set());
 }
 
 // Accumulate GPU-busy time from a completed command buffer when
@@ -186,6 +194,9 @@ void synchronize(Stream s) {
 
 void clear_streams() {
   metal::get_command_encoders().clear();
+  if (is_main_thread()) {
+    metal::get_global_command_encoders().clear();
+  }
 }
 
 } // namespace mlx::core::gpu

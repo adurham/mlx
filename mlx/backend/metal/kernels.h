@@ -212,6 +212,32 @@ MTL::ComputePipelineState* get_steel_conv_3d_kernel(
     int wn,
     bool small_filter);
 
+MTL::ComputePipelineState* get_gemv_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& out,
+    bool transpose_mat,
+    int bm,
+    int bn,
+    int sm,
+    int sn,
+    int tm,
+    int tn,
+    bool nc,
+    bool axpby);
+
+MTL::ComputePipelineState* get_gemv_gather_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& out,
+    bool transpose_mat,
+    int bm,
+    int bn,
+    int sm,
+    int sn,
+    int tm,
+    int tn);
+
 MTL::ComputePipelineState* get_gemv_masked_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -226,6 +252,24 @@ MTL::ComputePipelineState* get_gemv_masked_kernel(
     int tm,
     int tn,
     bool contiguous);
+
+MTL::ComputePipelineState* get_gemv_wide_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& out,
+    int vecs_per_tg,
+    int k_lanes);
+
+MTL::ComputePipelineState* get_gemv_wide_gather_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const std::string& hash_name,
+    const metal::MTLFCList& func_consts,
+    const array& out,
+    int vecs_per_tg,
+    int k_lanes);
 
 MTL::ComputePipelineState* get_steel_conv_general_kernel(
     metal::Device& d,
@@ -318,7 +362,7 @@ MTL::ComputePipelineState* get_steel_gemm_splitk_nax_kernel(
     const std::string& kernel_name,
     const std::string& hash_name,
     const metal::MTLFCList& func_consts,
-    const array& out,
+    const array& in,
     bool transpose_a,
     bool transpose_b,
     int bm,

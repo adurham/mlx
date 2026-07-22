@@ -784,7 +784,9 @@ void sdpa_vector_2pass(
     }
   }
   if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
-    blocks = blocks_env;
+    // The 2-pass reduction consumes the partials in simd-width (32) chunks
+    // and silently drops the tail otherwise, so round up to a multiple of 32.
+    blocks = ((blocks_env + 31) / 32) * 32;
   }
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
@@ -1116,9 +1118,10 @@ bool ScaledDotProductAttention::use_fallback(
   const int gqa_factor = num_query_heads / num_kv_heads;
 
   const bool sdpa_vector_supported_head_dim =
-      query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-       query_head_dim == 192 || query_head_dim == 256);
+      (query_head_dim == value_head_dim &&
+       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+        query_head_dim == 192 || query_head_dim == 256)) ||
+      (query_head_dim == 192 && value_head_dim == 128);
   // For head_dim >= 192, the fused full-attention kernel is slower than
   // unfused for short sequences. Only route to fused when kL is large enough
   // that the unfused path would exceed Metal buffer limits (the fused kernel
