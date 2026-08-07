@@ -1569,6 +1569,22 @@ class MeshImpl {
     const int64_t chunk_bytes = buffer_size - HDR;
     const int num_chunks =
         static_cast<int>((n_bytes + chunk_bytes - 1) / chunk_bytes);
+    if (num_chunks > 0xFFFF) {
+      // The seq/chunk-index packing below assumes chunk indices fit in
+      // the header's lower 16 bits (see the seq-tagging comment on
+      // send_seq_/recv_seq_) -- fail loudly rather than silently
+      // truncate/collide if a message ever needs more chunks than that.
+      throw std::runtime_error(
+          "[jaccl] send(): num_chunks exceeds the 16-bit chunk-index "
+          "field this header packing assumes -- message too large for "
+          "the current buffer size class, or MLX_JACCL_RELIABLE_MAX_SZ "
+          "needs raising");
+    }
+    // Real production incident fix (2026-08-08, see send_seq_/recv_seq_'s
+    // own field comment for the full incident) -- one seq value per
+    // logical send() call to this peer, packed into the header's upper
+    // 16 bits alongside the existing chunk index in the lower 16.
+    const uint32_t seq = static_cast<uint32_t>(send_seq_[dst]++);
     const int SEND_INFLIGHT = (sz <= 2)
         ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
         : 1;
@@ -1576,7 +1592,7 @@ class MeshImpl {
     auto post_chunk = [&](int c, int buff) {
       auto& sb = send_buffer(sz, buff);
       char* p = sb.data<char>();
-      uint32_t hdr = static_cast<uint32_t>(c);
+      uint32_t hdr = (seq << 16) | static_cast<uint32_t>(c & 0xFFFF);
       std::memcpy(p, &hdr, HDR);
       int64_t off = static_cast<int64_t>(c) * chunk_bytes;
       int64_t len = std::min(chunk_bytes, n_bytes - off);
@@ -1718,6 +1734,13 @@ class MeshImpl {
     const int RECV_INFLIGHT = (sz <= 2)
         ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
         : 1;
+    // Real production incident fix (2026-08-08) -- see send_seq_/
+    // recv_seq_'s own field comment and send()'s matching seq-tagging
+    // comment for the full incident/rationale. One seq value per
+    // logical recv() call from this peer -- must increment in lockstep
+    // with the peer's send_seq_[this_rank] on THEIR side, since both
+    // are per-(peer, direction) counters on the same ordered channel.
+    const uint32_t expected_seq = static_cast<uint32_t>(recv_seq_[src]++);
 
     std::vector<uint8_t> got(num_chunks, 0);
     int all_recv = 0;
@@ -1731,8 +1754,34 @@ class MeshImpl {
       JACCL_DMA_BARRIER();
       auto& rb = recv_buffer(sz, buff, src);
       const char* p = rb.data<char>();
-      uint32_t c;
-      std::memcpy(&c, p, HDR);
+      uint32_t hdr;
+      std::memcpy(&hdr, p, HDR);
+      const uint32_t seq = hdr >> 16;
+      const uint32_t c = hdr & 0xFFFFu;
+      if (seq != expected_seq) {
+        // Stale/duplicate message from a call other than the one this
+        // recv() is currently servicing (e.g. an orphaned retransmit
+        // from an earlier call whose original recv already completed
+        // and moved on -- the exact incident this fix closes). Discard
+        // -- do NOT touch got[]/all_recv, and do NOT re-post the buffer
+        // here: the caller (this recv()'s own polling loop, immediately
+        // below) ALREADY unconditionally decrements `posted` and
+        // conditionally re-posts the same buffer slot after every
+        // consume_recv() call, on both the normal and this discard
+        // path -- calling post_recv_buff() here too would double-post
+        // the same buffer (two outstanding recv WRs on one physical
+        // slot), a real RDMA-semantics violation this fix must not
+        // introduce. Loud once per occurrence (not hot-path spam under
+        // normal operation, this should be rare) so a real
+        // reproduction is traceable.
+        std::fprintf(
+            stderr,
+            "[jaccl] recv() discarded stale message: src=%d buff=%d "
+            "received_seq=%u expected_seq=%u chunk=%u\n",
+            src, buff, seq, expected_seq, c);
+        std::fflush(stderr);
+        return;
+      }
       if (c < static_cast<uint32_t>(num_chunks) && !got[c]) {
         int64_t off = static_cast<int64_t>(c) * chunk_bytes;
         int64_t len = std::min(chunk_bytes, n_bytes - off);
@@ -2269,6 +2318,40 @@ class MeshImpl {
   // ahead). drain_acks pulls from here first before polling the CQ.
   // Element = peer index. drain_acks already replenished the recv WR.
   std::vector<int> cached_ack_recvs_;
+
+  // 2026-08-08, real production incident fix: send()/recv()'s on-wire
+  // header (see post_chunk/consume_recv below) previously carried ONLY
+  // the within-call chunk index `c` -- there is no field anywhere on the
+  // wire identifying WHICH logical call this data belongs to. Combined
+  // with send/recv buffer slots being a small, reused pool
+  // (NUM_BUFFERS=8) recycled across every call for the life of the
+  // process, a stale message from jaccl's own retry/retransmit layer
+  // (an orphaned retransmit whose original recv already completed and
+  // moved on, per this fix's own incident writeup) can land in a buffer
+  // slot the CURRENT call has since claimed and be silently accepted as
+  // belonging to it -- reproduced live: exo's chunk-drive protocol
+  // received an 8-byte payload from a call ~700 sends and ~3m39s in the
+  // past, well after both ranks had moved on, with zero detection at
+  // this layer (exo's OWN application-level advance_seq tripwire is
+  // what actually caught it).
+  //
+  // Fix: a per-(peer, direction) 16-bit sequence counter, incremented
+  // once per send()/recv() call to/from that peer -- NOT call_id
+  // (next_call_id() is a per-PROCESS global counter; sender's and
+  // receiver's call_id values for the "same" logical transfer are
+  // independent counters in different processes and do not agree, so
+  // call_id cannot be validated on receive). A per-peer send/recv
+  // sequence, by construction, increments symmetrically on both sides
+  // of one ordered point-to-point channel -- the sender's Nth send() to
+  // peer P and peer P's Nth recv() from this rank are always the same
+  // logical transfer. Packed into the existing 4-byte header's upper 16
+  // bits (`hdr = (seq & 0xFFFF) << 16 | c`) -- the chunk-index `c`
+  // itself never exceeds a small buffer-count per call, so 16 bits is
+  // ample headroom; this preserves the exact header size, buffer
+  // size-class math, and chunk-count calculations send()/recv() already
+  // use, keeping the fix to the header-pack/unpack call sites only.
+  uint16_t send_seq_[2] = {0, 0}; // indexed by dst rank
+  uint16_t recv_seq_[2] = {0, 0}; // indexed by src rank
 
   // ── reliable_all_reduce v2 (optimistic) state ──
   // One-collective lookahead: messages whose header call_id == current+1
