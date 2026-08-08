@@ -488,16 +488,28 @@ void sdpa_full_self_attention_metal(
   // D=512 min-tile spike (2026-07-15): bd=512 doesn't fit the generic
   // bq/bk formula in 32KB threadgroup memory. Use bq=8, bk=8, wm=1.
   // (8+8+8)*512*2 = 24KB — fits with room for padding.
+  //
+  // 2026-08-08: the bq=16 branch below is DEAD -- its matching kernel
+  // instantiation was removed from steel_attention.metal (a real,
+  // always-broken compile-time dead end: TQ==2 for bq=16/wm=1, but
+  // attention()'s own static_assert requires TQ==1 unconditionally;
+  // see that file's own comment for the full incident). Fail loudly
+  // if this never-production-used env var is ever actually set,
+  // rather than silently dispatching to a kernel string that no
+  // longer has a matching instantiation (an undefined-kernel runtime
+  // error at dispatch time, much harder to attribute than this).
   if (bd == 512) {
-    // bq=16 spike: (16+8+8)*512*2 = 32KB (at the threadgroup memory limit)
-    // Env var MLX_SDPA_D512_BQ selects bq=16 (default bq=8)
     if (std::getenv("MLX_SDPA_D512_BQ16") != nullptr) {
-      bq = 16;
-      bk = 8;
-    } else {
-      bq = 8;
-      bk = 8;
+      throw std::runtime_error(
+          "[mlx] MLX_SDPA_D512_BQ16 requests the bq=16/wm=1 D=512 "
+          "attention kernel, which was removed (2026-08-08) -- it was "
+          "an abandoned experiment that never actually compiled "
+          "(TQ==2 fails attention()'s own static_assert(TQ==1)). "
+          "Unset this env var; the production bq=8 D=512 path is "
+          "unaffected.");
     }
+    bq = 8;
+    bk = 8;
     wm = 1;
   }
 
