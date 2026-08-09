@@ -65,12 +65,14 @@ TCPSocket::TCPSocket(const char* tag) {
 
 TCPSocket::TCPSocket(TCPSocket&& s) {
   sock_ = s.sock_;
+  recv_retry_deadline_secs_override_ = s.recv_retry_deadline_secs_override_;
   s.sock_ = -1;
 }
 
 TCPSocket& TCPSocket::operator=(TCPSocket&& s) {
   if (this != &s) {
     sock_ = s.sock_;
+    recv_retry_deadline_secs_override_ = s.recv_retry_deadline_secs_override_;
     s.sock_ = -1;
   }
   return *this;
@@ -161,6 +163,10 @@ void TCPSocket::set_recv_timeout_secs(int secs) {
   setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+void TCPSocket::set_recv_retry_deadline_secs(double secs) {
+  recv_retry_deadline_secs_override_ = secs;
+}
+
 void TCPSocket::recv(const char* tag, void* data, size_t len) {
   // RETRY-ON-EAGAIN FIX (2026-07-18): previously any recv() <= 0 threw
   // immediately, including errno=EAGAIN/EWOULDBLOCK from a plain
@@ -203,7 +209,13 @@ void TCPSocket::recv(const char* tag, void* data, size_t len) {
   //                        EBADF, ...) -> genuinely fatal transport
   //                        fault. Immediate throw, unchanged behavior.
   const char* deadline_env = std::getenv("MLX_JACCL_RECV_RETRY_DEADLINE_SECS");
-  const double deadline_secs = deadline_env ? std::atof(deadline_env) : 60.0;
+  // Per-socket override (set_recv_retry_deadline_secs()) takes priority over
+  // the env var / 60.0 hardcoded default -- see tcp.h's comment on why the
+  // coordinator/recovery side channel needs a DIFFERENT (longer) deadline
+  // than ordinary data-path sockets.
+  const double deadline_secs = recv_retry_deadline_secs_override_ >= 0.0
+      ? recv_retry_deadline_secs_override_
+      : (deadline_env ? std::atof(deadline_env) : 60.0);
   auto deadline_start = std::chrono::steady_clock::now();
   bool warned_once = false;
 

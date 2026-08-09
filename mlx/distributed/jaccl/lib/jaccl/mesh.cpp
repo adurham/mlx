@@ -30,6 +30,53 @@ MeshGroup::MeshGroup(
     throw std::runtime_error(msg.str());
   }
 
+  // CROSS-RANK ASYMMETRIC-DETECTION FIX (2026-08-09, design doc Section 30):
+  // side_channel_ is reused as the RECOVERY handshake path in
+  // MeshGroup::reconnect()/reconnect_fresh() -- both ranks re-exchange QP
+  // info over it after a data-path jaccl fault, and it survives faults
+  // (constructed once, here, never rebuilt). Real-hardware evidence: on a
+  // genuine data-path fault, the two ranks do NOT detect it at the same
+  // time. In the rank0-drives/rank1-mirrors batched-decode topology,
+  // rank0's own data-path recv() (bounded by
+  // MLX_JACCL_RECV_RETRY_DEADLINE_SECS, default 60s) fired, tore down its
+  // device contexts, and entered THIS side channel's recovery handshake to
+  // wait for rank1's fresh QP info -- all before rank1 had independently
+  // detected the SAME underlying fault on its own, differently-timed
+  // data-path recv(). Confirmed on real hardware: rank0 threw its ORIGINAL
+  // fault at t=0s and its RECOVERY handshake attempt itself timed out and
+  // threw at t=70s (the same 60s deadline + ~10s overhead); rank1 didn't
+  // even log its own original fault until t=71s -- 1s AFTER rank0 already
+  // gave up and crashed the whole runner (forcing a full ~90s re-place
+  // instead of the in-place recovery this coordinator path exists for).
+  // The recovery handshake's own deadline was THE SAME constant as the
+  // per-rank detection deadline it has to outlast, which structurally can
+  // never work when detection is asymmetric -- a design invariant
+  // violation, not a tuning question. Fix: give side_channel_'s own retry
+  // deadline enough headroom to outlast the worst-case cross-rank
+  // detection skew (bounded by one full data-path deadline window: rank A
+  // can detect at t=0, rank B's independent clock can still have up to one
+  // full deadline-window left before IT detects, i.e. up to
+  // t=data_path_deadline) PLUS the actual reconnect_fresh() device
+  // teardown/reopen work. NOT applied to p2p_channel_ (the hot-path
+  // send()/recv() retry-barrier channel) -- that one should keep failing
+  // fast on the data-path's own deadline; only the coordinator/recovery
+  // path needs the longer budget. Overridable via
+  // MLX_JACCL_COORD_RECV_RETRY_DEADLINE_SECS for diagnostics.
+  {
+    const double _data_path_deadline = [] {
+      const char* e = std::getenv("MLX_JACCL_RECV_RETRY_DEADLINE_SECS");
+      return e ? std::atof(e) : 60.0;
+    }();
+    const double _coord_retry_deadline = [&] {
+      const char* e = std::getenv("MLX_JACCL_COORD_RECV_RETRY_DEADLINE_SECS");
+      if (e) {
+        return std::atof(e);
+      }
+      return 2.0 * _data_path_deadline + 30.0;
+    }();
+    side_channel_->set_recv_retry_deadline_secs(_coord_retry_deadline);
+  }
+
   // 2026-05-17: restore dedicated ACK QP for top-level groups too.
   // The prior inline-ack-on-data-QP path has an in-call race: legacy
   // ack_sync_post posts ACK_RECV AFTER the data drain, so peer's

@@ -49,6 +49,16 @@ class TCPSocket {
   // (recv throws) instead of hanging forever. 0 = no timeout (default).
   void set_recv_timeout_secs(int secs);
 
+  // Override the ELAPSED no-progress retry deadline recv() enforces on top
+  // of the per-syscall SO_RCVTIMEO above (see recv()'s own comment for the
+  // two-timer distinction). -1 (default) means "no override -- fall back to
+  // MLX_JACCL_RECV_RETRY_DEADLINE_SECS / the 60s hardcoded default", i.e.
+  // unchanged legacy behavior. Added 2026-08-09 (design doc Section 30) so
+  // the coordinator/recovery side channel can be given a LONGER deadline
+  // than ordinary data-path sockets -- see recv()'s comment for why the two
+  // must differ.
+  void set_recv_retry_deadline_secs(double secs);
+
   int detach();
 
   operator int() const {
@@ -66,6 +76,9 @@ class TCPSocket {
   TCPSocket(int sock);
 
   int sock_;
+  // -1 = unset (recv() falls back to MLX_JACCL_RECV_RETRY_DEADLINE_SECS /
+  // 60.0 default). See set_recv_retry_deadline_secs().
+  double recv_retry_deadline_secs_override_ = -1.0;
 };
 
 } // namespace jaccl

@@ -504,6 +504,18 @@ class SideChannel {
     return peer_got;
   }
 
+  // Override the elapsed no-progress retry deadline on EVERY socket in this
+  // channel (see TCPSocket::set_recv_retry_deadline_secs's doc comment).
+  // Used by MeshGroup to give its top-level COORDINATOR side_channel_ (the
+  // one reused as the init/reconnect recovery handshake path) a longer
+  // deadline than the p2p_channel_ hot-path retry channel -- see
+  // MeshGroup's ctor for the full rationale (design doc Section 30).
+  void set_recv_retry_deadline_secs(double secs) {
+    for (auto& s : sockets_) {
+      s.set_recv_retry_deadline_secs(secs);
+    }
+  }
+
  private:
   int rank_;
   int size_;
