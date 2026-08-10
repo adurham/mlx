@@ -1937,13 +1937,48 @@ class MeshImpl {
     // this protocol has is `p2p_retry_barrier()`'s own recv (bounded
     // at 300s by the Section 38 fix, throwing a REAL error only when
     // the peer is actually unreachable/dead, not merely slow) -- that
-    // is now the SOLE way this loop can end in failure. `max_rounds`/
+    // was believed to be the SOLE way this loop can end in failure at
+    // the time this comment was written. CORRECTION (2026-08-10,
+    // Section 43 continued): that belief was wrong -- p2p_retry_barrier/
+    // p2p_retry_exchange's own StallWatch only guards the METADATA
+    // barrier's liveness, not this transfer's actual data progress; see
+    // the DATA-PROGRESS STALLWATCH comment a few lines below for the
+    // real second backstop this loop now has. `max_rounds`/
     // `_deadline_us` are RETAINED as env-tunable knobs (still read
     // below, still logged via [jaccl-prog] MAX_ROUNDS_EXCEEDED/
     // DEADLINE_HIT when set) for diagnostics/opt-in strict-timeout
     // testing, but neither one THROWS anymore -- exceeding either is
     // now purely informational, logged once, and the loop continues
     // retrying exactly as before.
+    //
+    // DATA-PROGRESS STALLWATCH (2026-08-10, Section 43 continued -- fixes
+    // the gap Section 39's fix above unknowingly depended on not existing).
+    // Section 39's own reasoning explicitly claimed "the ONLY genuine
+    // liveness check this protocol has is p2p_retry_exchange's own recv"
+    // -- i.e. p2p_retry_exchange()'s internal StallWatch (see its call
+    // site below and mesh_impl.h's StallWatch class). That assumption is
+    // FALSE: p2p_retry_exchange()'s StallWatch metric is peer_frame_seen
+    // popcount, which tracks liveness of the METADATA BARRIER RPC itself
+    // (the got-bitmask exchange), not whether the actual DATA CHUNK this
+    // send() is transferring is making progress. Confirmed on real
+    // hardware: a call_id can have its barrier round-trip succeed every
+    // ~500ms forever (round number incrementing, peer_frame_seen churning)
+    // while peer_got_count stays PERMANENTLY 0/num_chunks -- the barrier
+    // heartbeat never stops, so p2p_retry_exchange's StallWatch never
+    // fires, so this loop retries the same dropped data chunk forever
+    // with NO liveness backstop at all (grep -c STALLED == 0 on an 8+
+    // minute real hung run). This is a genuinely different failure class
+    // from what Section 39 fixed: Section 39 removed a fatal cap that
+    // fired on legitimately SLOW-BUT-PROGRESSING transfers (round count/
+    // wall-clock deadline, blind to whether new chunks were landing);
+    // this new watch fires ONLY on genuine ZERO PROGRESS in the peer's
+    // reported got-bitmask for the full timeout window, so it does not
+    // reintroduce that false-positive -- a transfer that's merely slow
+    // but still gaining acknowledged chunks every so often keeps resetting
+    // this watch exactly like Section 39 intended.
+    StallWatch _data_stall(-1); // -1 sentinel: primed with the real metric
+                                 // on the first BARRIER report below
+    bool _data_stall_primed = false;
     for (int round = 0;; round++) {
       if (_prog) {
         std::fprintf(
@@ -2080,6 +2115,26 @@ class MeshImpl {
       if (peer_has_all) {
         break;
       }
+      // DATA-PROGRESS STALLWATCH tick (see the loop-entry comment above
+      // for the full rationale). Metric: peer_got_count, the ONLY
+      // signal that actually reflects whether the receiver is making
+      // real progress on THIS transfer -- as opposed to
+      // p2p_retry_exchange()'s own StallWatch, whose metric reflects only
+      // the metadata barrier's liveness and is blind to this. Primed on
+      // the first report (round 0) rather than before the loop so a
+      // send() that starts with peer_got_count=0 doesn't immediately
+      // look like "no progress from an initial nonzero baseline" --
+      // 0 is the expected starting state, not evidence of a stall.
+      {
+        int peer_got_count = static_cast<int>(
+            std::count(peer_got.begin(), peer_got.end(), 1));
+        if (!_data_stall_primed) {
+          _data_stall = StallWatch(peer_got_count);
+          _data_stall.timeout_us = jaccl_p2p_retry_stall_timeout_us();
+          _data_stall_primed = true;
+        }
+        _data_stall.tick(peer_got_count, "send() data-progress", rank_, call_id);
+      }
       to_resend.assign(num_chunks, 0);
       for (int k = 0; k < num_chunks; k++) {
         if (k >= static_cast<int>(peer_got.size()) || !peer_got[k]) {
@@ -2209,6 +2264,16 @@ class MeshImpl {
     // _deadline_us below no longer THROW -- only p2p_retry_barrier's
     // own recv (the real liveness check, 300s per Section 38) can end
     // this loop in failure now.
+    //
+    // DATA-PROGRESS STALLWATCH (2026-08-10, Section 43 continued): mirrors
+    // send()'s own fix above -- see that comment for the full rationale
+    // (Section 39's stated liveness guarantee, p2p_retry_exchange()'s own
+    // StallWatch, only tracks the metadata barrier's heartbeat and is
+    // blind to a permanently-dropped data chunk; confirmed on real
+    // hardware, 8+ min / 900+ rounds with all_recv permanently stuck at
+    // 0/num_chunks and zero STALLED throws).
+    StallWatch _data_stall(-1); // -1 sentinel: primed on first BARRIER report
+    bool _data_stall_primed = false;
     for (int round = 0;; round++) {
       if (_prog) {
         std::fprintf(
@@ -2327,6 +2392,20 @@ class MeshImpl {
       }
       if (all_recv >= num_chunks) {
         break;
+      }
+      // DATA-PROGRESS STALLWATCH tick (see the loop-entry comment above
+      // for the full rationale). Metric: all_recv, this rank's own
+      // directly-observed count of successfully landed data chunks --
+      // strictly more reliable than send()'s peer_got_count (which is
+      // self-reported over the metadata barrier) since recv() doesn't
+      // need to trust anything the peer says about ITS OWN progress.
+      {
+        if (!_data_stall_primed) {
+          _data_stall = StallWatch(all_recv);
+          _data_stall.timeout_us = jaccl_p2p_retry_stall_timeout_us();
+          _data_stall_primed = true;
+        }
+        _data_stall.tick(all_recv, "recv() data-progress", rank_, call_id);
       }
       // Still missing some chunks: keep enough recvs posted for the
       // sender's retransmits to land (sliding window invariant).
