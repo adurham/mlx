@@ -2625,6 +2625,28 @@ class MeshImpl {
     // diagnostic only).
     if (hdr.magic != kP2PFrameMagic || hdr.seq != seq ||
         hdr.data_src_rank != data_src_rank) {
+      // DIAGNOSTIC (2026-08-11, Section 43 investigation): log every
+      // reject so a seq-desync (frames arriving but rejected on a
+      // constant offset from the expected seq) is directly visible,
+      // vs genuinely zero RECV completions ever landing (which would
+      // show no EXCHANGE_REJECT lines at all during a stall). Gated
+      // on JACCL_TRACE_PROGRESS=1, zero cost otherwise.
+      if (jaccl_progress_enabled()) {
+        std::fprintf(
+            stderr,
+            "[jaccl-p2p] EXCHANGE_REJECT rank=%d peer=%d slot=%d "
+            "magic_ok=%d recv_seq=%u expected_seq=%u "
+            "recv_data_src_rank=%u expected_data_src_rank=%u\n",
+            rank_,
+            peer,
+            slot,
+            hdr.magic == kP2PFrameMagic ? 1 : 0,
+            hdr.seq,
+            seq,
+            hdr.data_src_rank,
+            data_src_rank);
+        std::fflush(stderr);
+      }
       return; // stale/foreign frame -- discard, do not merge
     }
     if (hdr.num_frames == 0 ||
@@ -2704,6 +2726,30 @@ class MeshImpl {
     }
     P2PExchange ex;
     ex.my_bitmask = my_bitmask;
+
+    // DIAGNOSTIC (2026-08-11, Section 43 investigation): entry trace for
+    // every p2p_retry_exchange call, to test the seq-desync hypothesis --
+    // if the two ranks ever call this a different number of times for the
+    // same logical direction, send_seq_[dst]/recv_seq_[src] permanently
+    // diverge and every subsequent frame in that direction is silently
+    // dropped by the seq check in p2p_retry_process_completion (matches
+    // observed symptom: metric=0 for the full 300s, both ranks stalling
+    // at overlapping wall-clock times, self-healing via reconnect_fresh's
+    // seq reset). Gated on JACCL_TRACE_PROGRESS=1 (already set by
+    // start_cluster.sh), zero cost otherwise.
+    if (jaccl_progress_enabled()) {
+      std::fprintf(
+          stderr,
+          "[jaccl-p2p] EXCHANGE_ENTER rank=%d peer=%d data_src_rank=%u "
+          "seq=%u round=%u my_bitmask_len=%zu\n",
+          rank_,
+          peer,
+          data_src_rank,
+          seq,
+          round,
+          my_bitmask.size());
+      std::fflush(stderr);
+    }
 
     const uint64_t quiet_us = jaccl_ack_retransmit_us();
     const uint64_t stall_us = jaccl_p2p_retry_stall_timeout_us();
