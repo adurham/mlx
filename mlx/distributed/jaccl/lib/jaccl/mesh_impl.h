@@ -2055,6 +2055,32 @@ class MeshImpl {
         ibv_wc wc[16];
         int n = connections_[dst].poll(16, wc);
         for (int i = 0; i < n; i++) {
+          // DIAGNOSTIC (2026-08-10, Section 43 continued): ibverbs-level
+          // completion trace -- every CQE this poll sees, whether or not
+          // it matches this call, and its raw status. Added because a
+          // deterministic, 100%-reproducible stall was traced down to
+          // THIS exact silent-discard point (both the call_id mismatch
+          // 'continue' and the status/work_type mismatch 'continue' just
+          // below) with zero prior visibility into which branch was
+          // actually firing, or whether ibv_poll_cq ever returned
+          // anything for this call_id at all. Gated on the same
+          // JACCL_TRACE_PROGRESS flag as the rest of this investigation's
+          // instrumentation -- zero cost otherwise.
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-cqe] send() CQE rank=%d this_call_id=%u "
+                "wc_call_id=%u wc_status=%d wc_work_type=%d wc_buff=%d "
+                "matches_call_id=%d\n",
+                rank_,
+                call_id,
+                wr_id_call_id(wc[i].wr_id),
+                static_cast<int>(wc[i].status),
+                wr_id_work_type(wc[i].wr_id),
+                wr_id_buff(wc[i].wr_id),
+                wr_id_call_id(wc[i].wr_id) == call_id ? 1 : 0);
+            std::fflush(stderr);
+          }
           if (wr_id_call_id(wc[i].wr_id) != call_id) {
             continue; // stale (previous call/round)
           }
@@ -2339,6 +2365,23 @@ class MeshImpl {
         ibv_wc wc[16];
         int n = connections_[src].poll(16, wc);
         for (int i = 0; i < n; i++) {
+          // DIAGNOSTIC (2026-08-10, Section 43 continued): mirrors send()'s
+          // own CQE trace above -- see that comment for the full rationale.
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-cqe] recv() CQE rank=%d this_call_id=%u "
+                "wc_call_id=%u wc_status=%d wc_work_type=%d wc_buff=%d "
+                "matches_call_id=%d\n",
+                rank_,
+                call_id,
+                wr_id_call_id(wc[i].wr_id),
+                static_cast<int>(wc[i].status),
+                wr_id_work_type(wc[i].wr_id),
+                wr_id_buff(wc[i].wr_id),
+                wr_id_call_id(wc[i].wr_id) == call_id ? 1 : 0);
+            std::fflush(stderr);
+          }
           if (wr_id_call_id(wc[i].wr_id) != call_id) {
             continue;
           }
