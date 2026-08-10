@@ -115,6 +115,20 @@ MeshGroup::MeshGroup(
     pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
   }
 
+  // DESIGN DOC SECTION 37 PHASE 1 (2026-08-10): dedicated QP for send()/
+  // recv()'s got-bitmask retry exchange (p2p_retry_exchange), migrated off
+  // the TCP p2p_retry_barrier. Same isolation pattern as ack_connections_
+  // and pool_connections_ above -- its own PD/CQ/QP, borrowing the peer's
+  // ibv_context (owns_ctx=false) -- so its standing recv pool's uniform
+  // frame-sized buffers can never collide with the per-message-sized
+  // buffers raw send()/recv() posts on connections_ (the IBV_WC_LOC_LEN_ERR
+  // class of bug this file has already paid to learn twice). See
+  // p2p_retry_connections_'s member comment in mesh.h.
+  p2p_retry_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    p2p_retry_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
+
   initialize([this](const std::vector<Destination>& info) {
     return side_channel_->all_gather(info);
   });
@@ -143,9 +157,12 @@ MeshGroup::MeshGroup(
       connections_,
       ack_connections_,
       pool_connections_,
+      p2p_retry_connections_,
       buffers_,
       ack_send_buffers_,
-      ack_recv_buffers_);
+      ack_recv_buffers_,
+      p2p_retry_send_buffers_,
+      p2p_retry_recv_buffers_);
   // Give the top-level mesh the reliable TCP coordinator for the confirmed
   // (ack-of-ack) barrier. side_channel_ is in-place and outlives mesh_.
   mesh_.set_coordinator(&*side_channel_);
@@ -162,6 +179,11 @@ MeshGroup::MeshGroup(
       ring_recv_buffers_);
 
   mesh_.post_ack_recvs(0);
+  // Pre-post the standing p2p-retry recv pool on the dedicated QP, same
+  // lifecycle point as post_ack_recvs above and fenced by the same
+  // bootstrap barrier below (UC silently drops a send into an empty recv
+  // queue, so both ranks must be armed before either returns from the ctor).
+  mesh_.post_p2p_retry_recvs();
 
   // Bootstrap barrier: guarantee both ranks have completed
   // post_ack_recvs(0) before any rank can return from the ctor and
@@ -225,15 +247,24 @@ MeshGroup::MeshGroup(
   // must be registered before that.
   initialize(exchange);
 
+  // NOTE: like pool_connections_, p2p_retry_connections_ is NOT built for
+  // subgroups -- both stay empty here and are passed through to MeshImpl as
+  // empty vectors. initialize()'s has_pool/has_p2p_retry guards skip their
+  // bring-up accordingly, and post_p2p_retry_recvs()/p2p_retry_exchange()
+  // are no-op/throw on an empty span (send()/recv()'s retry path is a
+  // top-level-group-only concern -- see mesh_impl.h).
   mesh_ = MeshImpl(
       rank_,
       size_,
       connections_,
       ack_connections_,
       pool_connections_,
+      p2p_retry_connections_,
       buffers_,
       ack_send_buffers_,
-      ack_recv_buffers_);
+      ack_recv_buffers_,
+      p2p_retry_send_buffers_,
+      p2p_retry_recv_buffers_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -427,6 +458,20 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       conn.create_queue_pair();
     }
   }
+  // Create PD/CQ/QP for the dedicated p2p-retry connections — populated by
+  // the top-level ctor only (subgroups leave it empty, same as
+  // pool_connections_ above).
+  bool has_p2p_retry = !p2p_retry_connections_.empty();
+  if (has_p2p_retry) {
+    for (auto& conn : p2p_retry_connections_) {
+      if (conn.ctx == nullptr) {
+        continue;
+      }
+      conn.allocate_protection_domain();
+      conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
+      conn.create_queue_pair();
+    }
+  }
 
   allocate_buffers();
 
@@ -441,6 +486,9 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
     }
     if (has_pool) {
       pool_connections_[peer].queue_pair_init();
+    }
+    if (has_p2p_retry) {
+      p2p_retry_connections_[peer].queue_pair_init();
     }
   }
 
@@ -469,6 +517,16 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       pool_info.emplace_back(conn.info());
     }
     pool_all_infos = exchange(pool_info);
+  }
+
+  // Exchange p2p-retry QP destinations across ranks (only if present).
+  std::vector<std::vector<Destination>> p2p_retry_all_infos;
+  if (has_p2p_retry) {
+    std::vector<Destination> p2p_retry_info;
+    for (auto& conn : p2p_retry_connections_) {
+      p2p_retry_info.emplace_back(conn.info());
+    }
+    p2p_retry_all_infos = exchange(p2p_retry_info);
   }
 
   // RTR/RTS data QPs.
@@ -522,6 +580,25 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
       }
       pool_connections_[peer].queue_pair_rtr(peer_pool_info);
       pool_connections_[peer].queue_pair_rts();
+    }
+  }
+
+  // RTR/RTS p2p-retry QPs (only if present).
+  if (has_p2p_retry) {
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      auto peer_p2p_retry_info = p2p_retry_all_infos[peer][rank_];
+      if (std::getenv("JACCL_TRACE_SPLIT")) {
+        std::cerr << "[jaccl] init rank=" << rank_ << " peer=" << peer
+                  << " p2p_retry_qp_num="
+                  << p2p_retry_connections_[peer].src.queue_pair_number
+                  << " peer_p2p_retry_qp_num="
+                  << peer_p2p_retry_info.queue_pair_number << std::endl;
+      }
+      p2p_retry_connections_[peer].queue_pair_rtr(peer_p2p_retry_info);
+      p2p_retry_connections_[peer].queue_pair_rts();
     }
   }
 }
@@ -619,12 +696,24 @@ void MeshGroup::reconnect() {
   }
 
   const bool has_ack = !ack_connections_.empty();
+  // CRITICAL DIVERGENCE FROM pool_connections_ (2026-08-10): unlike
+  // pool_connections_ -- which this soft path deliberately does NOT touch,
+  // since jaccl-v2's reliable-optimistic path is opt-in and idle on the
+  // default configuration -- p2p_retry_connections_ MUST be reset and
+  // re-established here. It replaces p2p_channel_, the ALWAYS-ACTIVE hot
+  // path that every single send()/recv() call depends on; leaving its QPs
+  // wedged across a reconnect would leave the p2p retry protocol dead on
+  // the very next transfer. So it gets the same full lifecycle treatment
+  // as connections_/ack_connections_ below (reset -> init -> exchange ->
+  // RTR/RTS -> re-post recv pool).
+  const bool has_p2p_retry = !p2p_retry_connections_.empty();
   fprintf(
       stderr,
-      "[jaccl] reconnect rank=%d ENTER (size=%d has_ack=%d)\n",
+      "[jaccl] reconnect rank=%d ENTER (size=%d has_ack=%d has_p2p_retry=%d)\n",
       rank_,
       size_,
-      has_ack ? 1 : 0);
+      has_ack ? 1 : 0,
+      has_p2p_retry ? 1 : 0);
   fflush(stderr);
 
   // 1. Reset every QP (flush wedged/in-flight WRs, drain stale CQEs).
@@ -635,6 +724,13 @@ void MeshGroup::reconnect() {
   }
   if (has_ack) {
     for (auto& conn : ack_connections_) {
+      if (conn.ctx != nullptr) {
+        conn.queue_pair_reset();
+      }
+    }
+  }
+  if (has_p2p_retry) {
+    for (auto& conn : p2p_retry_connections_) {
       if (conn.ctx != nullptr) {
         conn.queue_pair_reset();
       }
@@ -654,6 +750,9 @@ void MeshGroup::reconnect() {
     connections_[peer].queue_pair_init();
     if (has_ack) {
       ack_connections_[peer].queue_pair_init();
+    }
+    if (has_p2p_retry) {
+      p2p_retry_connections_[peer].queue_pair_init();
     }
   }
 
@@ -675,6 +774,14 @@ void MeshGroup::reconnect() {
     }
     ack_all_infos = exchange(ack_info);
   }
+  std::vector<std::vector<Destination>> p2p_retry_all_infos;
+  if (has_p2p_retry) {
+    std::vector<Destination> p2p_retry_info;
+    for (auto& conn : p2p_retry_connections_) {
+      p2p_retry_info.emplace_back(conn.info());
+    }
+    p2p_retry_all_infos = exchange(p2p_retry_info);
+  }
   fprintf(stderr, "[jaccl] reconnect rank=%d ack QP info exchanged; RTR/RTS...\n", rank_);
   fflush(stderr);
 
@@ -688,15 +795,28 @@ void MeshGroup::reconnect() {
       ack_connections_[peer].queue_pair_rtr(ack_all_infos[peer][rank_]);
       ack_connections_[peer].queue_pair_rts();
     }
+    if (has_p2p_retry) {
+      p2p_retry_connections_[peer].queue_pair_rtr(
+          p2p_retry_all_infos[peer][rank_]);
+      p2p_retry_connections_[peer].queue_pair_rts();
+    }
   }
 
-  // 3. Rebuild the dedicated p2p retry-barrier channel. It survives the RDMA
-  //    QP reset/re-init above untouched (separate TCP socket, not part of
-  //    the ibv device state), so any bytes left mid-frame on it from the
-  //    fault that triggered this reconnect are still sitting there --
-  //    reusing it here would let the very next p2p_retry_barrier() call
-  //    read a stale reply and throw DESYNC. Tear down + rebuild on the same
-  //    derived port instead (see rebuild_p2p_channel()).
+  // 3. Rebuild the dedicated p2p retry-barrier channel. NOTE (2026-08-10):
+  //    this now happens ALONGSIDE p2p_retry_connections_'s QP reset above,
+  //    not instead of it -- both mechanisms coexist during the migration.
+  //    send()/recv() no longer route their retry exchange through this TCP
+  //    socket (they use the dedicated RDMA QP reset in steps 1-2), so
+  //    p2p_channel_ is structurally unused by the hot path; its lifecycle
+  //    plumbing is deliberately left in place here and in the ctor/
+  //    reconnect_fresh() rather than ripped out mid-migration. The original
+  //    rationale still holds for as long as it IS wired up: it survives the
+  //    RDMA QP reset/re-init untouched (separate TCP socket, not part of the
+  //    ibv device state), so any bytes left mid-frame on it from the fault
+  //    that triggered this reconnect are still sitting there -- reusing it
+  //    would let a p2p_retry_barrier() call read a stale reply and throw
+  //    DESYNC. Tear down + rebuild on the same derived port instead (see
+  //    rebuild_p2p_channel()).
   if (p2p_channel_.has_value()) {
     rebuild_p2p_channel();
     mesh_.set_p2p_channel(&*p2p_channel_);
@@ -708,6 +828,11 @@ void MeshGroup::reconnect() {
   //    both have finished rebuilding p2p_channel_.
   mesh_.reset_ack_state();
   mesh_.post_ack_recvs(0);
+  // The p2p-retry QPs were reset above, which discarded their standing recv
+  // pool along with every other posted WR -- re-arm it here, fenced by the
+  // same final barrier, or the peer's first post-reconnect retry frame lands
+  // on an empty recv queue and UC silently drops it.
+  mesh_.post_p2p_retry_recvs();
   fprintf(stderr, "[jaccl] reconnect rank=%d RTS done; final barrier...\n", rank_);
   fflush(stderr);
   side_channel_->all_gather<int>(0);
@@ -734,10 +859,13 @@ void MeshGroup::reconnect_fresh() {
   buffers_.clear();
   ack_send_buffers_.clear();
   ack_recv_buffers_.clear();
+  p2p_retry_send_buffers_.clear();
+  p2p_retry_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
   ack_connections_.clear();
   pool_connections_.clear();
+  p2p_retry_connections_.clear();
   connections_.clear();
 
   // 2. Reopen the devices — fresh ibv contexts. This is the whole point:
@@ -754,6 +882,12 @@ void MeshGroup::reconnect_fresh() {
   pool_connections_.reserve(static_cast<size_t>(size_));
   for (auto& data_conn : connections_) {
     pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
+  // Same for p2p_retry_connections_ -- reborn against the fresh ctxs, or
+  // send()/recv()'s retry exchange is left pointing at destroyed contexts.
+  p2p_retry_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    p2p_retry_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
   }
 
   // 3. Full bring-up, identical to the ctor: PD/CQ/QP creation, buffer
@@ -776,9 +910,12 @@ void MeshGroup::reconnect_fresh() {
       connections_,
       ack_connections_,
       pool_connections_,
+      p2p_retry_connections_,
       buffers_,
       ack_send_buffers_,
-      ack_recv_buffers_);
+      ack_recv_buffers_,
+      p2p_retry_send_buffers_,
+      p2p_retry_recv_buffers_);
   mesh_.set_coordinator(&*side_channel_);
   // Rebuild p2p_channel_ same as reconnect() -- it is a separate TCP socket
   // from the RDMA transport rebuilt above, so it does NOT get cleared by
@@ -804,6 +941,7 @@ void MeshGroup::reconnect_fresh() {
       ring_recv_buffers_);
 
   mesh_.post_ack_recvs(0);
+  mesh_.post_p2p_retry_recvs();
 
   // Bootstrap barrier — same rationale as the ctor: neither rank may fire
   // its first ack_sync_pre before BOTH have posted their ACK recv pool
@@ -818,6 +956,8 @@ void MeshGroup::allocate_buffers() {
   buffers_.clear();
   ack_send_buffers_.clear();
   ack_recv_buffers_.clear();
+  p2p_retry_send_buffers_.clear();
+  p2p_retry_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
 
@@ -839,6 +979,26 @@ void MeshGroup::allocate_buffers() {
   for (int j = 0; j < size_; j++) {
     ack_send_buffers_.emplace_back(FRAME_SIZE);
     ack_recv_buffers_.emplace_back(FRAME_SIZE);
+  }
+  // Per-peer p2p-retry buffers. BOTH send and recv are P2P_RETRY_NUM_SLOTS-
+  // deep rotating pools per peer, flattened as peer * P2P_RETRY_NUM_SLOTS +
+  // slot -- the exact indexing p2p_retry_send_bitmask/post_p2p_retry_recvs/
+  // p2p_retry_exchange use in mesh_impl.h. A single shared send slot per
+  // peer was an earlier draft that turned out to be unsafe: reusing one
+  // buffer for every frame of a multi-frame bitmask requires blocking to
+  // drain each frame's completion before reusing it, and that blocking
+  // drain polls the SAME CQ the main exchange loop polls for RECV
+  // completions -- silently dropping any interleaved peer frame seen while
+  // waiting (a consult review caught this). Per-frame rotating pools on
+  // BOTH sides make sends fire-and-forget in the common case instead --
+  // see p2p_retry_send_bitmask's own comment in mesh_impl.h for the full
+  // incident this fixes. Self slots are allocated for index alignment and
+  // left unused.
+  for (int j = 0; j < size_; j++) {
+    for (int s = 0; s < MeshImpl::P2P_RETRY_NUM_SLOTS; s++) {
+      p2p_retry_send_buffers_.emplace_back(FRAME_SIZE);
+      p2p_retry_recv_buffers_.emplace_back(FRAME_SIZE);
+    }
   }
 
   for (int k = 0; k < BUFFER_SIZES; k++) {
@@ -915,6 +1075,21 @@ void MeshGroup::allocate_buffers() {
                                 : connections_[j].protection_domain;
     ack_send_buffers_[j].register_to_protection_domain(pd);
     ack_recv_buffers_[j].register_to_protection_domain(pd);
+
+    // Same shape for the p2p-retry buffers: register to the dedicated
+    // p2p_retry QP's PD when that QP exists for this peer (top-level
+    // groups), else fall back to the data conn's PD.
+    bool has_p2p_retry_for_peer = !p2p_retry_connections_.empty() &&
+        p2p_retry_connections_[j].ctx != nullptr;
+    auto* p2p_retry_pd = has_p2p_retry_for_peer
+        ? p2p_retry_connections_[j].protection_domain
+        : connections_[j].protection_domain;
+    for (int s = 0; s < MeshImpl::P2P_RETRY_NUM_SLOTS; s++) {
+      p2p_retry_send_buffers_[j * MeshImpl::P2P_RETRY_NUM_SLOTS + s]
+          .register_to_protection_domain(p2p_retry_pd);
+      p2p_retry_recv_buffers_[j * MeshImpl::P2P_RETRY_NUM_SLOTS + s]
+          .register_to_protection_domain(p2p_retry_pd);
+    }
   }
 }
 

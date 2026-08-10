@@ -37,6 +37,14 @@ constexpr int ACK_RECV_WR = 4;
 // v2). Pool recvs outlive individual collectives, so their wr_id call_id is a
 // sentinel (0) and message routing is by the in-band V2 wire header instead.
 constexpr int POOL_RECV_WR = 5;
+// Design doc Section 37 Phase 1 (2026-08-10): send()/recv()'s got-bitmask
+// retry exchange, migrated off the TCP p2p_retry_barrier onto a dedicated
+// RDMA-UC QP (p2p_retry_connections_ in mesh.h/mesh_impl.h). Standing recv
+// pool, so wr_id call_id is a sentinel (0) and routing is by the in-band
+// P2PFrameHdr wire header (see p2p_retry_exchange's doc comment in
+// mesh_impl.h) -- same shape as POOL_RECV_WR above.
+constexpr int P2P_RETRY_RECV_WR = 6;
+constexpr int P2P_RETRY_SEND_WR = 7;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;

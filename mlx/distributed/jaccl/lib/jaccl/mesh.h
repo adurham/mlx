@@ -185,8 +185,40 @@ class MeshGroup : public Group {
   // for collective barriers sharing the data QP (see MeshGroup ctor
   // comment, "2026-05-17: restore dedicated ACK QP").
   std::vector<Connection> pool_connections_;
+  // DESIGN DOC SECTION 37 PHASE 1 (2026-08-10): dedicated QP for send()/
+  // recv()'s got-bitmask retry exchange (p2p_retry_exchange in
+  // mesh_impl.h), migrated off the TCP p2p_retry_barrier (p2p_channel_
+  // below, now otherwise unused -- kept alive only because bootstrap and
+  // reconnect_fresh() rebuild it as part of the standard side-channel
+  // lifecycle; not calling it from send()/recv() anymore is enough).
+  // ISOLATED onto its own QP rather than sharing ack_connections_ or
+  // pool_connections_, following the SAME established pattern that fixed
+  // two prior IBV_WC_LOC_LEN_ERR collisions in this file (see
+  // ack_connections_ and pool_connections_'s own member comments): a
+  // differently-sized/differently-timed completion landing on a QP another
+  // path also polls is exactly the class of bug this codebase has already
+  // paid to learn not to reintroduce. A standing recv pool (like
+  // pool_connections_'s POOL_RECV_WR) is pre-posted per peer at QP setup
+  // and replenished on consumption; routing is by the in-band P2PFrameHdr
+  // wire header (magic/direction_tag/seq/round/frame_index), not call_id.
+  std::vector<Connection> p2p_retry_connections_;
   std::vector<SharedBuffer> ack_send_buffers_;
   std::vector<SharedBuffer> ack_recv_buffers_;
+  // Buffer pools for p2p_retry_connections_ above. BOTH send and recv are
+  // rotating per-peer pools, P2P_RETRY_NUM_SLOTS deep (flattened as
+  // peer * P2P_RETRY_NUM_SLOTS + slot) -- NOT a single fixed slot like
+  // ack_send/recv_buffers_. A single shared per-peer send slot was an
+  // earlier draft that turned out to be unsafe (a consult review caught
+  // it): reusing one send buffer for every frame of a multi-frame
+  // bitmask requires blocking to drain each frame's completion before
+  // the next post, and that blocking drain polls the SAME CQ the main
+  // exchange loop polls for RECV completions -- silently dropping any
+  // interleaved peer frame it saw while waiting. A per-frame rotating
+  // pool (mirroring the recv side) lets sends be fire-and-forget in the
+  // common case instead. See p2p_retry_send_bitmask's own comment in
+  // mesh_impl.h for the full incident this fixes.
+  std::vector<SharedBuffer> p2p_retry_send_buffers_;
+  std::vector<SharedBuffer> p2p_retry_recv_buffers_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;

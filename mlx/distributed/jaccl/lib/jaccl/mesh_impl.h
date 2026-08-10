@@ -159,6 +159,33 @@ inline int jaccl_ack_retransmit_max() {
   }();
   return v;
 }
+// Liveness backstop for send()/recv()'s new RDMA-native p2p_retry_exchange
+// (design doc Section 37 Phase 1, 2026-08-10), tracking zero-progress time
+// on the PEER's reported bitmask specifically -- NOT the generic
+// jaccl_stall_timeout_us() (8s default) used by drain_acks/StallWatch
+// elsewhere in this file. This distinction is load-bearing, not cosmetic:
+// the OLD TCP p2p_channel_ this replaces was deliberately given its OWN
+// much longer deadline (MLX_JACCL_P2P_RECV_RETRY_DEADLINE_SECS, 300s
+// default -- see mesh.cpp's rebuild_p2p_channel(), design doc Section 38)
+// specifically because real-hardware evidence showed the peer can
+// legitimately take far longer than 8s to report new progress under
+// genuine production load (confirmed via a live faulthandler dump: the
+// peer was actively mid-decode-step, not wedged). Reusing the generic 8s
+// default here would reintroduce exactly the false-positive-timeout bug
+// Section 39 fixed on the DATA path, just relocated to this barrier.
+// Same cost-asymmetry justification as Section 38: a false positive here
+// drops healthy in-flight work for no reason, while a genuinely dead peer
+// still surfaces (RDMA completion errors, not just silence). Default
+// matches Section 38's 300s; distinct env var since the mechanism changed
+// from a TCP-recv deadline to a progress-based StallWatch.
+inline uint64_t jaccl_p2p_retry_stall_timeout_us() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("MLX_JACCL_P2P_RETRY_STALL_TIMEOUT_SECS");
+    const double secs = e ? std::atof(e) : 300.0;
+    return static_cast<uint64_t>(secs * 1e6);
+  }();
+  return v;
+}
 // Confirmed (ack-of-ack) barrier. Default OFF (adds a round-trip per collective).
 // When ON, the ACK barrier is a reliable two-round handshake: a rank does not
 // proceed until it has confirmation the peer RECEIVED its ack — deterministically
@@ -298,17 +325,23 @@ class MeshImpl {
       std::vector<Connection>& conns,
       std::vector<Connection>& ack_conns,
       std::vector<Connection>& pool_conns,
+      std::vector<Connection>& p2p_retry_conns,
       std::vector<SharedBuffer>& buffers,
       std::vector<SharedBuffer>& ack_send_buffers,
-      std::vector<SharedBuffer>& ack_recv_buffers)
+      std::vector<SharedBuffer>& ack_recv_buffers,
+      std::vector<SharedBuffer>& p2p_retry_send_buffers,
+      std::vector<SharedBuffer>& p2p_retry_recv_buffers)
       : rank_(rank),
         size_(size),
         connections_(conns),
         ack_connections_(ack_conns),
         pool_connections_(pool_conns),
+        p2p_retry_connections_(p2p_retry_conns),
         buffers_(buffers),
         ack_send_buffers_(ack_send_buffers),
-        ack_recv_buffers_(ack_recv_buffers) {}
+        ack_recv_buffers_(ack_recv_buffers),
+        p2p_retry_send_buffers_(p2p_retry_send_buffers),
+        p2p_retry_recv_buffers_(p2p_retry_recv_buffers) {}
 
   MeshImpl() : rank_(0), size_(1) {}
 
@@ -352,6 +385,97 @@ class MeshImpl {
   static constexpr uint32_t kP2PPreBarrierRound = 0xFFFFFFFFu;
   static constexpr uint32_t kP2PPostBarrierRound = 0xFFFFFFFEu;
   static constexpr int V2_HDR = static_cast<int>(sizeof(V2Hdr));
+
+  // ── Section 37 Phase 1 (2026-08-10): send()/recv()'s got-bitmask retry
+  // exchange, migrated off the TCP p2p_retry_barrier onto a dedicated
+  // RDMA-UC QP (p2p_retry_connections_). Design consult-reviewed across
+  // three rounds before implementation -- see design doc Section 42/43 for
+  // the full rationale. Three load-bearing decisions this implementation
+  // depends on, summarized here so a future reader doesn't have to
+  // re-derive them from the review transcripts:
+  //
+  // 1. NO lockstep rendezvous. The old TCP barrier was a true 2-way
+  //    blocking rendezvous (both sides send-then-recv simultaneously), so
+  //    round numbers trivially matched on the wire. An RDMA-UC exchange
+  //    CANNOT reproduce that without reintroducing a deadlock risk (a
+  //    consult review caught this directly: naive round-for-round matching
+  //    over lossy UC reintroduces the exact lockstep-desync bug class this
+  //    migration exists to eliminate). Instead: `round` is a DIAGNOSTIC-
+  //    ONLY field, never gated on. Correctness comes from (2) and (3).
+  //
+  // 2. seq (send_seq_[dst] / recv_seq_[src], already computed once per
+  //    transfer by both send() and recv() -- see their own field comments)
+  //    is the epoch key, NOT call_id. A consult review confirmed call_id
+  //    is wrong here for the same reason the 2026-08-08 header-seq fix
+  //    exists: call_id is a per-process global counter, not guaranteed
+  //    equal between the two ranks for "the same" logical transfer. seq is
+  //    a per-(ordered-pair) counter that increments symmetrically on both
+  //    sides by construction. Combined with data_src_rank (below) it
+  //    uniquely identifies one transfer even if both directions are
+  //    active concurrently (send_seq_[B] on rank A and recv_seq_[A] on
+  //    rank B can coincidentally share a numeric value with an unrelated
+  //    transfer in the OPPOSITE direction, since the two directions have
+  //    independent counters).
+  //
+  // 3. NO acking. Bitmask frames are periodically REBROADCAST by whichever
+  //    side has one to report, at the caller's own natural round cadence
+  //    (drain_quiet_us) -- exactly like the data path's own chunk
+  //    retransmit, and exactly like drain_acks' soft-RC retransmit
+  //    elsewhere in this file. The receiver of those frames OR-accumulates
+  //    them (idempotent, safe under drop/dup/reorder -- a got-bit, once
+  //    true, is true for the rest of the transfer). A consult review
+  //    confirmed an explicit ack protocol is not just unnecessary but
+  //    actively risky here: it reintroduces a two-generals tail case (the
+  //    last ack can always be the dropped message) that requires either an
+  //    unbounded resend-forever, a probabilistic N-retransmit mitigation
+  //    (not a real fix), or a retained-replay responder cache (adds real
+  //    complexity). Removing acking sidesteps the whole class: nobody
+  //    waits to learn whether the OTHER side received THEIR report; each
+  //    side only cares about accumulating a complete picture of what IT
+  //    has heard, which is entirely a function of frames it has itself
+  //    received. The existing StallWatch backstop (throw after
+  //    jaccl_stall_timeout_us of zero forward progress, caught by jaccl's
+  //    scheduler exception path for a clean re-place) is the sole failure
+  //    mode if a peer is genuinely gone -- same backstop this file already
+  //    relies on everywhere else, not a new one.
+  //
+  // Wire frame -- one per RDMA-UC message, fits in one FRAME_SIZE (4096B)
+  // buffer on the dedicated p2p_retry_connections_ QP. Payload is the
+  // SAME byte-per-chunk representation send()/recv() already use for
+  // `got` (vector<uint8_t>, 1 byte per chunk, not bit-packed) -- no new
+  // encoding, no bit-indexing scheme, just chunked transmission of the
+  // existing representation. A transfer's bitmask (up to 0xFFFF chunks
+  // per send()'s own throw-guard) is at most 65535 bytes, split into
+  // ceil(65535 / (FRAME_SIZE - sizeof(P2PFrameHdr))) = 17 frames.
+  struct P2PFrameHdr {
+    uint32_t magic; // framing sanity; distinct from V2Hdr/reliable_barrier
+    uint32_t data_src_rank; // rank_ of send()'s caller for this transfer --
+                             // disambiguates two transfers sharing a
+                             // numerically equal `seq` in OPPOSITE
+                             // directions (send_seq_/recv_seq_ are
+                             // independent per-direction counters, so
+                             // equality is only guaranteed WITHIN one
+                             // direction -- see class doc comment above)
+    uint32_t seq; // send_seq_[dst] / recv_seq_[src] for this transfer
+    uint32_t round; // DIAGNOSTIC ONLY -- never gated on, see class comment
+    uint32_t num_frames; // frame count of the bitmask this message is
+                          // part of; receiver sanity-checks against its
+                          // own independently-computed value, does not
+                          // blindly trust it for buffer sizing
+    uint32_t frame_index; // 0..num_frames-1
+    uint32_t frame_len; // valid payload bytes in THIS frame
+  };
+  static constexpr uint32_t kP2PFrameMagic = 0x4a325032u; // "J2P2", reused
+                                                           // from the old
+                                                           // p2p_retry_
+                                                           // barrier's tag
+  static constexpr int P2P_HDR = static_cast<int>(sizeof(P2PFrameHdr));
+  static constexpr int P2P_PAYLOAD_CAP = FRAME_SIZE - P2P_HDR;
+  // Standing recv-pool depth per peer on p2p_retry_connections_. Must
+  // exceed the max 17 frames/bitmask (0xFFFF chunks) with headroom for a
+  // retransmit burst landing before the previous round's frames are all
+  // drained; mirrors ACK_RECV_POOL's pre-post-and-replenish shape.
+  static constexpr int P2P_RETRY_NUM_SLOTS = 24;
 
   // v2 uses ONE uniform size class (the reliable cap) for every message.
   // Apple librdma errors when a send's size class doesn't match the posted
@@ -1531,32 +1655,23 @@ class MeshImpl {
           "one, and send()/recv() should only be called on a top-level "
           "group (exo's Pipeline-Parallel usage)");
     }
-    // Pre-transfer rendezvous (2026-07-17, earlier fix): ensures the
-    // receiver's initial recv buffers are posted before we send anything,
-    // reducing round-0 misses to the (now-recoverable) common case. No
-    // longer load-bearing for correctness -- the retry loop below recovers
-    // from ANY drop, round 0 included -- just reduces retry rounds needed.
-    //
-    // Uses the FRAMED p2p_retry_barrier (not the raw barrier()) with a
-    // reserved sentinel round number, NOT the raw all_gather<int>-based
-    // barrier(). ROOT-CAUSE (2026-07-17, revision 3): even on p2p_channel_
-    // (already isolated from coordinator_ in revision 2), mixing
-    // p2p_channel_->barrier() [unframed raw all_gather<int>, no header] and
-    // p2p_channel_->p2p_retry_barrier() [16-byte framed header] on the SAME
-    // socket recreates the exact same class of stream-desync bug revision 2
-    // fixed -- an unframed and a framed message have no way to distinguish
-    // their own boundaries from each other. Confirmed empirically (peer
-    // magic showed corrupted/zero values even after the coordinator_ split).
-    // Using p2p_retry_barrier exclusively for ALL p2p_channel_ traffic
-    // (pre-barrier, retry rounds, post-barrier) with reserved sentinel round
-    // numbers for the pre/post phases keeps every message on this channel
-    // uniformly framed.
-    p2p_channel_->p2p_retry_barrier(
-        kP2PRetryTag, kP2PPreBarrierRound, std::vector<uint8_t>{});
-
+    // Pre-transfer rendezvous REMOVED (design doc Section 37 Phase 1,
+    // 2026-08-10): the old code's comment already noted this was "no
+    // longer load-bearing for correctness -- the retry loop below
+    // recovers from ANY drop, round 0 included -- just reduces retry
+    // rounds needed." The NEW p2p_retry_exchange has no lockstep
+    // rendezvous primitive to spend on a non-load-bearing optimization
+    // (see class doc comment point 1) -- round-0 misses are now handled
+    // exactly like any other round's misses, at the cost of possibly one
+    // extra round on a cold start. Zero-byte transfers below similarly no
+    // longer need ANY p2p_retry traffic: the old code used the barrier as
+    // a generic paired-call-count rendezvous (every p2p_retry_barrier
+    // call on one side had to be matched by exactly one on the other, to
+    // keep the TCP stream framed correctly); the new exchange has no such
+    // pairing requirement (each call is independently self-contained by
+    // (data_src_rank, seq)), so a transfer with no data simply needs no
+    // wire traffic at all.
     if (n_bytes == 0) {
-      p2p_channel_->p2p_retry_barrier(
-          kP2PRetryTag, kP2PPostBarrierRound, std::vector<uint8_t>{});
       return;
     }
 
@@ -1742,20 +1857,16 @@ class MeshImpl {
         }
       }
 
-      // Reliable barrier: receiver reports its got-bitmask (we send a
-      // dummy — we're the source, we always "have everything"). Uses the
-      // framed p2p_retry_barrier (NOT the raw p2p_channel_->all_gather)
-      // because raw all_gather has no framing -- a byte-count mismatch
-      // between the two sides silently misaligns the TCP stream, which is
-      // a permanent hang, not a detectable error (see reliable_barrier's
-      // doc comment in rdma.h). Fixed tag (both send() and recv() always
-      // pass the same constant) + monotonic round gives the same desync
-      // detection reliable_barrier gets from call_id, without requiring
-      // call_id to match across ranks (it structurally can't for this
-      // asymmetric send-only/recv-only usage — see rdma.h's
-      // p2p_retry_barrier doc comment for the full reasoning).
-      auto peer_got = p2p_channel_->p2p_retry_barrier(
-          kP2PRetryTag, static_cast<uint32_t>(round), std::vector<uint8_t>{});
+      // Report: ask the receiver what it has (we send a dummy -- we're
+      // the source, we always "have everything"). Design doc Section 37
+      // Phase 1 (2026-08-10): migrated off the framed TCP
+      // p2p_channel_->p2p_retry_barrier onto the RDMA-native
+      // p2p_retry_exchange (see class doc comment for the full
+      // no-lockstep/seq-keyed/no-acking rationale). rank_ is passed as
+      // data_src_rank since send() IS the data source for this transfer.
+      auto peer_got = p2p_retry_exchange(
+          dst, static_cast<uint32_t>(rank_), seq, static_cast<uint32_t>(round),
+          std::vector<uint8_t>{});
       bool peer_has_all =
           static_cast<int>(peer_got.size()) == num_chunks &&
           std::count(peer_got.begin(), peer_got.end(), 1) == num_chunks;
@@ -1801,14 +1912,10 @@ class MeshImpl {
           "one, and send()/recv() should only be called on a top-level "
           "group (exo's Pipeline-Parallel usage)");
     }
-    // Pre-transfer rendezvous — see send()'s matching comment (uses the
-    // framed p2p_retry_barrier, not raw barrier() -- see revision-3 note).
-    p2p_channel_->p2p_retry_barrier(
-        kP2PRetryTag, kP2PPreBarrierRound, std::vector<uint8_t>{});
-
+    // Pre-transfer rendezvous REMOVED and zero-byte early-return simplified
+    // -- see send()'s matching comment for the full rationale (design doc
+    // Section 37 Phase 1).
     if (n_bytes == 0) {
-      p2p_channel_->p2p_retry_barrier(
-          kP2PRetryTag, kP2PPostBarrierRound, std::vector<uint8_t>{});
       return;
     }
 
@@ -1987,13 +2094,21 @@ class MeshImpl {
         }
       }
 
-      // Report our got-bitmask over the reliable TCP coordinator (unblocks
-      // send()'s matching p2p_retry_barrier call this round regardless of
-      // whether we're actually done — round counts must stay lockstep).
-      // See send()'s matching comment for why p2p_retry_barrier (framed,
-      // fixed-tag) is used instead of raw p2p_channel_->all_gather.
-      p2p_channel_->p2p_retry_barrier(
-          kP2PRetryTag, static_cast<uint32_t>(round), got);
+      // Report our got-bitmask. Design doc Section 37 Phase 1
+      // (2026-08-10): migrated off the framed TCP
+      // p2p_channel_->p2p_retry_barrier onto the RDMA-native
+      // p2p_retry_exchange (see class doc comment for the full
+      // no-lockstep/seq-keyed/no-acking rationale). `src` is passed as
+      // data_src_rank since recv()'s peer (the sender) is the data
+      // source for this transfer. The returned value (send()'s own
+      // trivially-empty report) is intentionally unused here -- recv()'s
+      // retry-loop decision (all_recv >= num_chunks) is entirely local,
+      // computed from its own got[]/all_recv above; the old barrier's
+      // return value was likewise unused on this side (see the pre-
+      // migration code, which never read this call's own return).
+      p2p_retry_exchange(
+          src, static_cast<uint32_t>(src), expected_seq,
+          static_cast<uint32_t>(round), got);
       if (_prog) {
         std::fprintf(
             stderr,
@@ -2060,6 +2175,18 @@ class MeshImpl {
     v2_prev_want_.clear();
     std::fill(
         std::begin(v2_send_outstanding_), std::end(v2_send_outstanding_), 0);
+    // p2p_retry_connections_' QPs were just reset (MeshGroup::reconnect()/
+    // reconnect_fresh() call this right after queue_pair_reset()/rebuild),
+    // which flushes/discards every in-flight WR -- any slot this rank
+    // still believed had an outstanding send is now stale bookkeeping for
+    // a completion that will never arrive on the fresh QP. Without this
+    // reset, p2p_retry_send_bitmask's wait loop for that slot would spin
+    // until jaccl_stall_timeout_us and throw, even though nothing is
+    // actually wrong post-reconnect. Same rationale as v2_send_outstanding_
+    // just above.
+    for (auto& row : p2p_retry_send_outstanding_) {
+      std::fill(std::begin(row), std::end(row), false);
+    }
   }
 
   void post_ack_recvs(uint32_t call_id) {
@@ -2080,6 +2207,364 @@ class MeshImpl {
             rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
       }
     }
+  }
+
+  // Pre-post the standing recv pool on p2p_retry_connections_. Called from
+  // MeshGroup ctor / reconnect() / reconnect_fresh() (same lifecycle as
+  // post_ack_recvs, mirrored for the new QP) so a peer's very first
+  // p2p_retry_exchange frame always finds a posted recv WR. Uses a
+  // ROTATING pool of P2P_RETRY_NUM_SLOTS buffers (not one fixed slot like
+  // ack_recv_buffers_) since a single round can legitimately have several
+  // frames of one bitmask in flight at once -- see class doc comment.
+  void post_p2p_retry_recvs() {
+    if (p2p_retry_connections_.empty()) {
+      return;
+    }
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      for (int i = 0; i < P2P_RETRY_NUM_SLOTS; i++) {
+        auto& rbuf = p2p_retry_recv_buffers_[peer * P2P_RETRY_NUM_SLOTS + i];
+        std::memset(rbuf.data<char>(), 0, rbuf.size());
+        JACCL_DMA_BARRIER();
+        p2p_retry_connections_[peer].post_recv(
+            rbuf, make_wr_id(0, P2P_RETRY_RECV_WR, i, peer));
+      }
+    }
+  }
+
+  // Per-(peer, direction, seq) accumulator for one send()/recv() transfer's
+  // p2p_retry_exchange. Lives for the duration of one send()/recv() call
+  // (constructed fresh each call, not persisted across calls) EXCEPT for
+  // last_sent_ below, which IS persisted per-peer across calls to answer
+  // stale-round frames from a peer who is still retransmitting into a
+  // transfer this rank has already completed and moved past (the tail
+  // case -- see class doc comment point 3).
+  struct P2PExchange {
+    // What WE report to the peer this transfer (send(): trivially empty,
+    // we're the source and always "have everything" already, matching the
+    // old p2p_retry_barrier's own send()-side convention; recv(): our
+    // real, growing got[] bitmask).
+    std::vector<uint8_t> my_bitmask;
+    // What the PEER has reported to us, accumulated via OR-merge across
+    // every frame received for this (peer, direction, seq) regardless of
+    // round (see class doc comment point 1 -- round is diagnostic only).
+    std::vector<uint8_t> peer_bitmask;
+    // Which frame_indices of peer_bitmask have been written at least once
+    // (coverage mask, NOT a counter -- correctness requirement from the
+    // design doc's consult review). peer_bitmask is only a COMPLETE,
+    // trustworthy reconstruction once every frame_index in
+    // [0, peer_num_frames) has arrived at least once; until then it's a
+    // valid-but-partial OR-accumulation (safe to read speculatively, e.g.
+    // to decide MORE retransmits, but not safe to treat as final).
+    std::vector<bool> peer_frame_seen;
+    int peer_num_frames = -1; // -1 == not yet known (no frame arrived yet)
+    // True length of the peer's bitmask, taken from the LAST frame's
+    // frame_len (peer_bitmask is over-allocated to a full
+    // peer_num_frames*P2P_PAYLOAD_CAP and must be trimmed to this on
+    // return -- the caller's exact-length contract (peer_got.size() ==
+    // num_chunks) depends on it, matching the old TCP barrier's exact-
+    // length framing).
+    int peer_total_len = -1;
+    bool peer_complete = false;
+  };
+
+  // Send every frame of `bitmask` (chunked into P2P_PAYLOAD_CAP-byte
+  // frames) to `peer` for (data_src_rank, seq, round). Caller decides
+  // cadence; this just posts the sends. `my_bitmask` may be empty (the
+  // send()-side "trivially have everything" case) -- num_frames is then 1,
+  // a single frame with frame_len=0, so the peer still gets a liveness
+  // signal and a definite peer_num_frames=1 to converge on, not silence.
+  //
+  // Uses a ROTATING per-frame send-buffer pool (p2p_retry_send_buffers_,
+  // P2P_RETRY_NUM_SLOTS deep per peer -- same shape as the recv pool),
+  // NOT a single per-peer slot. A consult review caught a real bug in an
+  // earlier draft that used one shared send buffer and blocked
+  // (poll-drain) after every single frame to wait for its own completion
+  // before reusing it: that blocking drain polled the SAME CQ the main
+  // exchange loop also polls, and silently discarded any RECV completion
+  // (the peer's own bitmask frames, delivered by the NIC on its own
+  // schedule, NOT gated by any application-level mutex) it happened to
+  // see while waiting -- permanently losing that frame's payload AND
+  // never reposting its recv WR slot, which both stalls the exchange
+  // (missed peer progress) and risks exhausting the standing recv pool
+  // over repeated rounds (a UC recv-pool exhaustion is a SILENT packet
+  // drop at the transport level, unrecoverable without help from a layer
+  // above it). Per-frame slots let sends be fire-and-forget in the common
+  // case (posting frame i+1 doesn't need to wait on frame i at all, only
+  // on ANY prior send still outstanding for the SPECIFIC slot i+1 is
+  // about to reuse -- which, since num_frames <= P2P_RETRY_NUM_SLOTS,
+  // means the first pass through a call to this function never blocks).
+  // The only wait is bounded and uses the unified completion processor
+  // (p2p_retry_process_completion) instead of a special-purpose drain
+  // loop that ignores other completion types -- see that method's own
+  // comment.
+  void p2p_retry_send_bitmask(
+      int peer,
+      uint32_t data_src_rank,
+      uint32_t seq,
+      uint32_t round,
+      const std::vector<uint8_t>& bitmask,
+      P2PExchange& ex) {
+    const int n = static_cast<int>(bitmask.size());
+    const int num_frames = std::max(1, (n + P2P_PAYLOAD_CAP - 1) / P2P_PAYLOAD_CAP);
+    if (num_frames > P2P_RETRY_NUM_SLOTS) {
+      // Structural invariant, not a runtime condition: send()'s own
+      // num_chunks > 0xFFFF guard bounds bitmask.size() to 65535, which
+      // caps num_frames at 17 -- well under P2P_RETRY_NUM_SLOTS (24).
+      // Fail loudly if that invariant is ever violated instead of
+      // silently truncating a bitmask (which would look like data loss).
+      throw std::runtime_error(
+          "[jaccl] p2p_retry_send_bitmask: bitmask needs more frames than "
+          "P2P_RETRY_NUM_SLOTS provides -- invariant violation, not a "
+          "transient condition");
+    }
+    for (int i = 0; i < num_frames; i++) {
+      const int slot = i; // frame index doubles as the send-slot index
+      // Wait (if needed) for this specific slot's PRIOR outstanding send
+      // to complete before overwriting its buffer -- bounded by the same
+      // generous peer-liveness timeout as the main exchange loop (a
+      // local send completion not arriving is a local NIC/QP fault, not
+      // peer-liveness, but reuses the same backstop for simplicity; the
+      // main exchange loop's own StallWatch is the primary liveness
+      // guard for the exchange as a whole).
+      const uint64_t wait_t0 = mach_absolute_time();
+      while (p2p_retry_send_outstanding_[peer][slot]) {
+        ibv_wc wc[16];
+        int n_wc = p2p_retry_connections_[peer].poll(16, wc);
+        for (int w = 0; w < n_wc; w++) {
+          p2p_retry_process_completion(wc[w], peer, seq, data_src_rank, ex);
+        }
+        if (n_wc == 0) {
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(jaccl_reliable_idle_us()));
+        }
+        if (mach_ticks_to_us(mach_absolute_time() - wait_t0) >
+            jaccl_stall_timeout_us()) {
+          throw std::runtime_error(
+              "[jaccl] p2p_retry_send_bitmask: local send-slot completion "
+              "never arrived -- NIC/QP fault, not a peer-liveness issue");
+        }
+      }
+      auto& sb = p2p_retry_send_buffers_[peer * P2P_RETRY_NUM_SLOTS + slot];
+      char* p = sb.data<char>();
+      P2PFrameHdr hdr{};
+      hdr.magic = kP2PFrameMagic;
+      hdr.data_src_rank = data_src_rank;
+      hdr.seq = seq;
+      hdr.round = round;
+      hdr.num_frames = static_cast<uint32_t>(num_frames);
+      hdr.frame_index = static_cast<uint32_t>(i);
+      const int off = i * P2P_PAYLOAD_CAP;
+      const int len = std::min(P2P_PAYLOAD_CAP, n - off);
+      hdr.frame_len = static_cast<uint32_t>(std::max(0, len));
+      std::memcpy(p, &hdr, P2P_HDR);
+      if (len > 0) {
+        std::memcpy(p + P2P_HDR, bitmask.data() + off, static_cast<size_t>(len));
+      }
+      JACCL_DMA_BARRIER();
+      p2p_retry_connections_[peer].post_send(
+          sb, make_wr_id(0, P2P_RETRY_SEND_WR, slot, peer));
+      p2p_retry_send_outstanding_[peer][slot] = true;
+    }
+  }
+
+  // Unified completion dispatcher -- the ONLY place that consumes a CQE
+  // from p2p_retry_connections_[peer]'s CQ. Used by BOTH the send-slot
+  // wait loop above and the main exchange loop below, so no completion
+  // type is ever silently dropped regardless of WHERE in this class's
+  // logic the poll happened to occur (see p2p_retry_send_bitmask's own
+  // comment for the bug this fixes: this QP's single CQ carries both
+  // SEND and RECV completions interleaved, and any code path that polls
+  // it but only understands ONE completion type risks losing the other).
+  void p2p_retry_process_completion(
+      const ibv_wc& wc,
+      int peer,
+      uint32_t seq,
+      uint32_t data_src_rank,
+      P2PExchange& ex) {
+    const int wt = wr_id_work_type(wc.wr_id);
+    const int slot = wr_id_buff(wc.wr_id);
+    if (wt == P2P_RETRY_SEND_WR) {
+      p2p_retry_send_outstanding_[peer][slot] = false;
+      return;
+    }
+    if (wt != P2P_RETRY_RECV_WR) {
+      return; // unrelated/foreign wr_id -- defensive, should be unreachable
+    }
+    // Copy-then-repost (design doc correctness requirement #1): pull the
+    // header+payload OFF the raw NIC-DMA'd buffer into locals BEFORE any
+    // validation/merge decision, then immediately repost the recv WR.
+    // Never hold a live decision-making reference into the buffer while
+    // the NIC could be about to reuse/overwrite it for the next inbound
+    // frame on this slot.
+    JACCL_DMA_BARRIER();
+    auto& rbuf = p2p_retry_recv_buffers_[peer * P2P_RETRY_NUM_SLOTS + slot];
+    P2PFrameHdr hdr;
+    std::memcpy(&hdr, rbuf.data<char>(), P2P_HDR);
+    std::vector<uint8_t> payload;
+    if (hdr.frame_len > 0 &&
+        hdr.frame_len <= static_cast<uint32_t>(P2P_PAYLOAD_CAP)) {
+      payload.assign(
+          rbuf.data<char>() + P2P_HDR,
+          rbuf.data<char>() + P2P_HDR + hdr.frame_len);
+    }
+    // Immediately repost -- this slot must always have a live recv WR.
+    std::memset(rbuf.data<char>(), 0, rbuf.size());
+    JACCL_DMA_BARRIER();
+    p2p_retry_connections_[peer].post_recv(
+        rbuf, make_wr_id(0, P2P_RETRY_RECV_WR, slot, peer));
+
+    // Validation (design doc requirement #1, applied on the COPY above,
+    // not the live buffer): magic + seq + data_src_rank must all match.
+    // seq alone is not sufficient -- send_seq_/recv_seq_ are independent
+    // per-direction counters, so a frame from the OPPOSITE direction's
+    // transfer can coincidentally carry the same numeric seq (see class
+    // doc comment point 2). round is deliberately NOT checked (point 1:
+    // diagnostic only).
+    if (hdr.magic != kP2PFrameMagic || hdr.seq != seq ||
+        hdr.data_src_rank != data_src_rank) {
+      return; // stale/foreign frame -- discard, do not merge
+    }
+    if (hdr.num_frames == 0 ||
+        hdr.num_frames > static_cast<uint32_t>(P2P_RETRY_NUM_SLOTS) ||
+        hdr.frame_index >= hdr.num_frames) {
+      return; // malformed -- defensive, should be unreachable
+    }
+    if (ex.peer_num_frames < 0) {
+      ex.peer_num_frames = static_cast<int>(hdr.num_frames);
+      ex.peer_bitmask.assign(
+          static_cast<size_t>(ex.peer_num_frames) * P2P_PAYLOAD_CAP, 0);
+      ex.peer_frame_seen.assign(ex.peer_num_frames, false);
+    } else if (ex.peer_num_frames != static_cast<int>(hdr.num_frames)) {
+      // A peer's num_frames for one (peer,seq) transfer is fixed at
+      // transfer-size time and cannot legitimately change mid-exchange --
+      // treat a mismatch as a foreign/stale frame rather than corrupting
+      // the reassembly buffer with an inconsistent frame count.
+      return;
+    }
+    // OR-accumulate (monotonic, idempotent -- safe under any drop/dup/
+    // reorder, and safe to mix frames from different rounds per the
+    // round-agnostic design -- design doc requirement #2, bitmap not
+    // counter, applied via peer_frame_seen below).
+    const int off = static_cast<int>(hdr.frame_index) * P2P_PAYLOAD_CAP;
+    for (size_t k = 0; k < payload.size(); k++) {
+      ex.peer_bitmask[off + k] |= payload[k];
+    }
+    ex.peer_frame_seen[hdr.frame_index] = true;
+    // The LAST frame's frame_len gives the exact true bitmask length
+    // (every earlier frame is always exactly P2P_PAYLOAD_CAP bytes by
+    // construction in p2p_retry_send_bitmask -- only the final frame can
+    // be short). Recording it whenever the last frame is seen is safe
+    // under reordering: an EARLIER frame arriving after the last one
+    // doesn't change this value; the last frame's own arrival is what
+    // sets it, regardless of when.
+    if (static_cast<int>(hdr.frame_index) == ex.peer_num_frames - 1) {
+      ex.peer_total_len = off + static_cast<int>(hdr.frame_len);
+    }
+    if (!ex.peer_complete &&
+        std::all_of(
+            ex.peer_frame_seen.begin(),
+            ex.peer_frame_seen.end(),
+            [](bool b) { return b; })) {
+      ex.peer_complete = true;
+    }
+  }
+
+
+  // Core exchange, called identically by send() and recv() (they differ
+  // only in what `my_bitmask` means -- see P2PExchange's field comment).
+  // Blocks until this rank has accumulated the PEER's complete reported
+  // bitmask (peer_complete == true), for BOTH callers uniformly:
+  //   - recv()'s call (my_bitmask == its real, growing got[]): the peer
+  //     it's waiting on is send(), whose reported bitmask is trivially a
+  //     single empty frame (num_frames=1, frame_len=0) -- so this
+  //     resolves near-instantly and is NOT a real wait on send()'s
+  //     progress, just the minimum handshake to know send() is alive and
+  //     has heard this round's report at least once.
+  //   - send()'s call (my_bitmask == empty): the peer it's waiting on is
+  //     recv(), whose reported bitmask is its REAL got[] -- this is the
+  //     actual information send()'s retry loop needs (mirrors the old
+  //     p2p_retry_barrier's peer_got/peer_has_all check exactly).
+  // Both callers use the same exit condition; no separate parameter
+  // needed -- see class doc comment point 3 for why acking (waiting on
+  // the PEER's confirmation of what THIS rank sent) was deliberately
+  // removed instead.
+  std::vector<uint8_t> p2p_retry_exchange(
+      int peer,
+      uint32_t data_src_rank,
+      uint32_t seq,
+      uint32_t round,
+      const std::vector<uint8_t>& my_bitmask) {
+    if (p2p_retry_connections_.empty()) {
+      throw std::runtime_error(
+          "[jaccl] p2p_retry_exchange called with no dedicated p2p retry "
+          "QP (p2p_retry_connections_) -- only top-level groups have one");
+    }
+    P2PExchange ex;
+    ex.my_bitmask = my_bitmask;
+
+    const uint64_t quiet_us = jaccl_ack_retransmit_us();
+    const uint64_t stall_us = jaccl_p2p_retry_stall_timeout_us();
+    StallWatch stall(-1); // -1 sentinel: metric set on first real tick below
+    bool stall_primed = false;
+    uint64_t last_send = 0; // 0 == "never sent yet", forces an immediate
+                             // first broadcast below regardless of quiet_us
+    for (;;) {
+      const uint64_t now = mach_absolute_time();
+      if (last_send == 0 ||
+          mach_ticks_to_us(now - last_send) > quiet_us) {
+        p2p_retry_send_bitmask(peer, data_src_rank, seq, round, ex.my_bitmask, ex);
+        last_send = mach_absolute_time();
+      }
+      if (ex.peer_complete) {
+        break;
+      }
+
+      ibv_wc wc[16];
+      int n = p2p_retry_connections_[peer].poll(16, wc);
+      for (int i = 0; i < n; i++) {
+        if (wr_id_peer(wc[i].wr_id) != peer) {
+          continue; // not ours (another peer's traffic on a shared poll)
+        }
+        // Delegates to the SAME unified processor p2p_retry_send_bitmask's
+        // wait loop uses -- see that method's comment for why this MUST be
+        // unified (a special-cased "only understands RECV" loop here
+        // silently drops any interleaved SEND completion's bookkeeping,
+        // which would permanently wedge p2p_retry_send_outstanding_ for
+        // that slot and eventually make every future send for it block
+        // forever waiting on a completion that already arrived and was
+        // discarded).
+        p2p_retry_process_completion(wc[i], peer, seq, data_src_rank, ex);
+      }
+      if (n == 0) {
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(jaccl_reliable_idle_us()));
+      }
+      // Liveness backstop (class doc comment point 3): throw only on
+      // genuinely zero forward progress for jaccl_p2p_retry_stall_timeout_us
+      // (300s default) -- StallWatch's own tick() already treats an
+      // unchanged metric as "no progress"; feed it peer_frame_seen's
+      // popcount so ANY new frame (even a partial re-accumulation) resets
+      // the clock, matching drain_acks' own pattern.
+      const long metric = static_cast<long>(std::count(
+          ex.peer_frame_seen.begin(), ex.peer_frame_seen.end(), true));
+      if (!stall_primed) {
+        stall = StallWatch(metric);
+        stall.timeout_us = stall_us;
+        stall_primed = true;
+      }
+      stall.tick(metric, "p2p_retry_exchange", rank_, seq);
+
+    }
+    // Trim to the exact bitmask length the peer reported via its last
+    // frame's frame_len (peer_bitmask is over-allocated to
+    // peer_num_frames*P2P_PAYLOAD_CAP padding -- see peer_total_len's own
+    // field comment). peer_complete==true (the only way this loop exits)
+    // guarantees the last frame has been seen, so peer_total_len is set.
+    ex.peer_bitmask.resize(static_cast<size_t>(ex.peer_total_len));
+    return ex.peer_bitmask;
   }
 
  private:
@@ -2467,6 +2952,17 @@ class MeshImpl {
   // and threw IBV_WC_LOC_LEN_ERR, corrupting both paths' QP state. Empty
   // when the reliable-optimistic path is disabled (nothing to isolate).
   std::span<Connection> pool_connections_;
+  // Dedicated QP for send()/recv()'s p2p_retry_exchange (design doc
+  // Section 37 Phase 1). Same isolation rationale as ack_connections_/
+  // pool_connections_ above.
+  std::span<Connection> p2p_retry_connections_;
+  // One send buffer slot per peer (rotated through synchronously --
+  // p2p_retry_send_bitmask drains each frame's completion before reusing
+  // it) and a P2P_RETRY_NUM_SLOTS-deep standing recv pool per peer,
+  // flattened as peer * P2P_RETRY_NUM_SLOTS + slot (see
+  // post_p2p_retry_recvs).
+  std::span<SharedBuffer> p2p_retry_send_buffers_;
+  std::span<SharedBuffer> p2p_retry_recv_buffers_;
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> ack_send_buffers_;
   std::span<SharedBuffer> ack_recv_buffers_;
@@ -2474,6 +2970,15 @@ class MeshImpl {
   // ahead). drain_acks pulls from here first before polling the CQ.
   // Element = peer index. drain_acks already replenished the recv WR.
   std::vector<int> cached_ack_recvs_;
+  // Per-(peer, slot) outstanding-send tracking for p2p_retry_send_bitmask's
+  // rotating send-buffer pool (see that method's own comment for why a
+  // single shared per-peer send slot was unsafe). Sized [MESH_MAX_PEERS]
+  // [P2P_RETRY_NUM_SLOTS] statically -- MESH_MAX_PEERS is this codebase's
+  // existing hard cap (see mesh_impl.h's own top-of-file constant), so no
+  // dynamic sizing/allocation is needed here, mirroring send_seq_/
+  // recv_seq_'s own fixed-size array style below.
+  bool p2p_retry_send_outstanding_[MESH_MAX_PEERS][P2P_RETRY_NUM_SLOTS] = {};
+
 
   // 2026-08-08, real production incident fix: send()/recv()'s on-wire
   // header (see post_chunk/consume_recv below) previously carried ONLY
