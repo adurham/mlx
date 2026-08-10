@@ -217,7 +217,23 @@ void TCPSocket::recv(const char* tag, void* data, size_t len) {
       ? recv_retry_deadline_secs_override_
       : (deadline_env ? std::atof(deadline_env) : 60.0);
   auto deadline_start = std::chrono::steady_clock::now();
+  const auto _wait_t0 = deadline_start;
   bool warned_once = false;
+  // 2026-08-09 (design doc Section 38, real-hardware finding): a recv()
+  // that eventually SUCCEEDS after one or more EAGAIN retries used to be
+  // invisible -- only the DEADLINE-EXCEEDED case ever got logged. That
+  // means every prior deadline-sizing decision (including this comment's
+  // own p2p_channel_ default below) was made from survivorship-biased
+  // data: we only ever saw waits that exceeded whatever deadline was set
+  // at the time, never the FULL distribution of legitimate wait times
+  // that stayed under it. Log any recv() that took longer than
+  // MLX_JACCL_RECV_WAIT_LOG_THRESHOLD_SECS (default 5s) to eventually
+  // succeed, so the NEXT deadline-tuning pass has real data instead of
+  // guessing from deadline-exceeded throws alone.
+  const double _wait_log_threshold_secs = [] {
+    const char* e = std::getenv("MLX_JACCL_RECV_WAIT_LOG_THRESHOLD_SECS");
+    return e ? std::atof(e) : 5.0;
+  }();
 
   while (len > 0) {
     auto n = ::recv(sock_, data, len, 0);
@@ -225,6 +241,21 @@ void TCPSocket::recv(const char* tag, void* data, size_t len) {
       len -= n;
       data = static_cast<char*>(data) + n;
       deadline_start = std::chrono::steady_clock::now(); // progress: reset
+      if (warned_once) {
+        const double _total_wait =
+            std::chrono::duration<double>(deadline_start - _wait_t0).count();
+        if (_total_wait >= _wait_log_threshold_secs) {
+          fprintf(
+              stderr,
+              "[jaccl] %s recv succeeded after a %.1fs stall (deadline was "
+              "%.1fs) -- logged for future deadline-sizing data, not an "
+              "error\n",
+              tag,
+              _total_wait,
+              deadline_secs);
+          fflush(stderr);
+        }
+      }
       warned_once = false;
       continue;
     }

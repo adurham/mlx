@@ -549,6 +549,41 @@ void MeshGroup::rebuild_p2p_channel() {
   // see SideChannel ctor) absorb the TIME_WAIT / accept-not-yet-listening
   // races from tearing down and rebinding the same port back to back.
   p2p_channel_.emplace(rank_, size_, p2p_addr.str().c_str());
+
+  // ROOT-CAUSE FIX (2026-08-09, design doc Section 38, real-hardware
+  // finding): p2p_channel_ previously used the SAME 60s deadline as the
+  // data path, deliberately ("that one should keep failing fast" -- see
+  // this class's own send()/recv() comments). Confirmed on real hardware
+  // via direct instrumentation (design doc Section 35): the RDMA data
+  // path itself is never the bottleneck (retry rounds converge in
+  // 70-200us) -- what actually stalls is p2p_retry_barrier's plain TCP
+  // recv, waiting for the PEER to reach its own matching call site,
+  // which can legitimately take longer than 60s under real production
+  // load (confirmed: the peer was actively mid-decode-step, not wedged
+  // or dead, via a faulthandler dump during the exact stall window).
+  //
+  // Unlike side_channel_'s deadline extension (mesh.cpp ctor, ~line 60),
+  // which is DERIVED from a provable bound (cross-rank fault-detection
+  // skew <= one data-path deadline window), there is no equivalent
+  // principled bound here -- "how long can the peer legitimately be
+  // busy before reaching a barrier call" has no formula, only empirical
+  // headroom. A `consult` review recommended NOT cloning
+  // side_channel_'s 2x+30s formula (that number's derivation doesn't
+  // apply to this question) and NOT keeping 60s as the default (already
+  // empirically falsified by real hardware) -- instead, pick a
+  // generously large default justified by cost asymmetry: a false
+  // positive here fires during HEALTHY operation and drops in-flight
+  // work for no reason, while a genuinely dead/wedged peer will usually
+  // surface via a TCP-level error (ECONNRESET etc., immediate throw,
+  // unaffected by this deadline) well before any reasonable deadline
+  // fires anyway -- so this deadline is really only guarding the rare
+  // hung-but-still-connected case, and erring large costs nothing on
+  // the common healthy path.
+  const double _p2p_retry_deadline = [] {
+    const char* e = std::getenv("MLX_JACCL_P2P_RECV_RETRY_DEADLINE_SECS");
+    return e ? std::atof(e) : 300.0;
+  }();
+  p2p_channel_->set_recv_retry_deadline_secs(_p2p_retry_deadline);
 }
 
 void MeshGroup::reconnect() {
