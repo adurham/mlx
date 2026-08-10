@@ -1609,8 +1609,35 @@ class MeshImpl {
     const uint64_t drain_quiet_us = jaccl_ack_retransmit_us();
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
+    bool _prog = jaccl_progress_enabled();
     for (int round = 0;; round++) {
+      if (_prog) {
+        std::fprintf(
+            stderr,
+            "[jaccl-prog] send() ROUND rank=%d call_id=%u dst=%d round=%d "
+            "num_chunks=%d to_resend_count=%d elapsed_us=%llu\n",
+            rank_,
+            call_id,
+            dst,
+            round,
+            num_chunks,
+            static_cast<int>(std::count(to_resend.begin(), to_resend.end(), 1)),
+            (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
+        std::fflush(stderr);
+      }
       if (round > max_rounds) {
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] send() MAX_ROUNDS_EXCEEDED rank=%d call_id=%u "
+              "dst=%d round=%d max_rounds=%d\n",
+              rank_,
+              call_id,
+              dst,
+              round,
+              max_rounds);
+          std::fflush(stderr);
+        }
         throw std::runtime_error(
             "[jaccl] send() exceeded max retransmit rounds (link "
             "persistently dropping) — clean re-place");
@@ -1631,6 +1658,23 @@ class MeshImpl {
       int prev_progress = c;
       while (outstanding > 0) {
         if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-prog] send() DEADLINE_HIT rank=%d call_id=%u dst=%d "
+                "round=%d outstanding=%d chunks_sent_before_stall=%d/%d "
+                "elapsed_us=%llu\n",
+                rank_,
+                call_id,
+                dst,
+                round,
+                outstanding,
+                c,
+                num_chunks,
+                (unsigned long long)mach_ticks_to_us(
+                    mach_absolute_time() - _t0));
+            std::fflush(stderr);
+          }
           throw std::runtime_error(
               "[jaccl] send() deadline in drain — clean re-place");
         }
@@ -1688,6 +1732,25 @@ class MeshImpl {
       bool peer_has_all =
           static_cast<int>(peer_got.size()) == num_chunks &&
           std::count(peer_got.begin(), peer_got.end(), 1) == num_chunks;
+      if (_prog) {
+        int peer_got_count = static_cast<int>(
+            std::count(peer_got.begin(), peer_got.end(), 1));
+        std::fprintf(
+            stderr,
+            "[jaccl-prog] send() BARRIER rank=%d call_id=%u dst=%d round=%d "
+            "peer_got_size=%d peer_got_count=%d/%d peer_has_all=%d "
+            "elapsed_us=%llu\n",
+            rank_,
+            call_id,
+            dst,
+            round,
+            static_cast<int>(peer_got.size()),
+            peer_got_count,
+            num_chunks,
+            peer_has_all ? 1 : 0,
+            (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
+        std::fflush(stderr);
+      }
       if (peer_has_all) {
         break;
       }
@@ -1802,8 +1865,37 @@ class MeshImpl {
     const uint64_t drain_quiet_us = jaccl_ack_retransmit_us();
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
+    bool _prog = jaccl_progress_enabled();
     for (int round = 0;; round++) {
+      if (_prog) {
+        std::fprintf(
+            stderr,
+            "[jaccl-prog] recv() ROUND rank=%d call_id=%u src=%d round=%d "
+            "all_recv=%d/%d elapsed_us=%llu\n",
+            rank_,
+            call_id,
+            src,
+            round,
+            all_recv,
+            num_chunks,
+            (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
+        std::fflush(stderr);
+      }
       if (round > max_rounds) {
+        if (_prog) {
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] recv() MAX_ROUNDS_EXCEEDED rank=%d call_id=%u "
+              "src=%d round=%d max_rounds=%d all_recv=%d/%d\n",
+              rank_,
+              call_id,
+              src,
+              round,
+              max_rounds,
+              all_recv,
+              num_chunks);
+          std::fflush(stderr);
+        }
         throw std::runtime_error(
             "[jaccl] recv() exceeded max retransmit rounds (link "
             "persistently dropping) — clean re-place");
@@ -1813,6 +1905,21 @@ class MeshImpl {
       int prev_progress = all_recv;
       while (all_recv < num_chunks) {
         if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
+          if (_prog) {
+            std::fprintf(
+                stderr,
+                "[jaccl-prog] recv() DEADLINE_HIT rank=%d call_id=%u src=%d "
+                "round=%d all_recv=%d/%d elapsed_us=%llu\n",
+                rank_,
+                call_id,
+                src,
+                round,
+                all_recv,
+                num_chunks,
+                (unsigned long long)mach_ticks_to_us(
+                    mach_absolute_time() - _t0));
+            std::fflush(stderr);
+          }
           throw std::runtime_error(
               "[jaccl] recv() deadline in drain — clean re-place");
         }
@@ -1854,6 +1961,22 @@ class MeshImpl {
       // fixed-tag) is used instead of raw p2p_channel_->all_gather.
       p2p_channel_->p2p_retry_barrier(
           kP2PRetryTag, static_cast<uint32_t>(round), got);
+      if (_prog) {
+        std::fprintf(
+            stderr,
+            "[jaccl-prog] recv() BARRIER rank=%d call_id=%u src=%d round=%d "
+            "got_count=%d/%d all_recv=%d/%d elapsed_us=%llu\n",
+            rank_,
+            call_id,
+            src,
+            round,
+            static_cast<int>(std::count(got.begin(), got.end(), 1)),
+            num_chunks,
+            all_recv,
+            num_chunks,
+            (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
+        std::fflush(stderr);
+      }
       if (all_recv >= num_chunks) {
         break;
       }
