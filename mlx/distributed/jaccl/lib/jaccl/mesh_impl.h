@@ -2529,6 +2529,23 @@ class MeshImpl {
       // peer-liveness, but reuses the same backstop for simplicity; the
       // main exchange loop's own StallWatch is the primary liveness
       // guard for the exchange as a whole).
+      //
+      // BUG FIX (2026-08-11, Section 43 investigation): this loop's
+      // deadline check used jaccl_stall_timeout_us() (the GENERIC
+      // collective-stall default, 8s) instead of
+      // jaccl_p2p_retry_stall_timeout_us() (this exchange's own,
+      // "generous", 300s default) -- directly contradicting the comment
+      // above, which explicitly documents the intent to reuse the
+      // "generous" 300s backstop "for simplicity". Confirmed on real
+      // hardware: this wrong constant fires a premature fatal
+      // "NIC/QP fault" throw after only 8s whenever a send-slot's own
+      // completion is merely late (not lost) under real 2-node load --
+      // observed directly, crashing a live generation request at ~18s
+      // wall-clock, well before the outer p2p_retry_exchange loop could
+      // ever reach ITS correctly-configured 300s window. This is a
+      // separate, more proximate bug than the p2p_retry_exchange
+      // STALLED issue documented in Section 43 -- it can mask the
+      // original bug entirely by crashing the exchange first.
       const uint64_t wait_t0 = mach_absolute_time();
       while (p2p_retry_send_outstanding_[peer][slot]) {
         ibv_wc wc[16];
@@ -2541,7 +2558,7 @@ class MeshImpl {
               std::chrono::microseconds(jaccl_reliable_idle_us()));
         }
         if (mach_ticks_to_us(mach_absolute_time() - wait_t0) >
-            jaccl_stall_timeout_us()) {
+            jaccl_p2p_retry_stall_timeout_us()) {
           throw std::runtime_error(
               "[jaccl] p2p_retry_send_bitmask: local send-slot completion "
               "never arrived -- NIC/QP fault, not a peer-liveness issue");
