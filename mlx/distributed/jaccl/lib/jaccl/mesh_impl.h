@@ -1610,6 +1610,37 @@ class MeshImpl {
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
+    // ROOT-CAUSE FIX (2026-08-09, design doc Section 39, direct user
+    // correction of the earlier "extend the deadline" instinct): this
+    // loop used to have an ADDITIONAL, unconditional fatal cap
+    // (`max_rounds` below, `_deadline_us` inside the drain `while`)
+    // layered ON TOP of its own retransmit protocol -- it threw
+    // REGARDLESS of whether real progress was happening. Real-hardware
+    // evidence (this session): a transfer legitimately ran 29
+    // retransmit rounds over 15s, with `p2p_retry_barrier()`'s TCP
+    // round-trip SUCCEEDING every single round (proving both ranks
+    // alive and the control channel healthy) -- yet still threw
+    // fatally at round 29, purely because of this arbitrary cap, not
+    // because anything was actually broken. The barrier's own
+    // successful completion IS the real liveness proof this protocol
+    // needs; a cap layered on top of an already-succeeding liveness
+    // check just manufactures failures out of legitimately slow (not
+    // dead) transfers.
+    //
+    // User's direct correction: "the goal is that it's not blocked, or
+    // if that can't be done for whatever reason that it's never a
+    // fatal wait" -- stop treating "this is taking a long time" as
+    // equivalent to "this is broken". The ONLY genuine liveness check
+    // this protocol has is `p2p_retry_barrier()`'s own recv (bounded
+    // at 300s by the Section 38 fix, throwing a REAL error only when
+    // the peer is actually unreachable/dead, not merely slow) -- that
+    // is now the SOLE way this loop can end in failure. `max_rounds`/
+    // `_deadline_us` are RETAINED as env-tunable knobs (still read
+    // below, still logged via [jaccl-prog] MAX_ROUNDS_EXCEEDED/
+    // DEADLINE_HIT when set) for diagnostics/opt-in strict-timeout
+    // testing, but neither one THROWS anymore -- exceeding either is
+    // now purely informational, logged once, and the loop continues
+    // retrying exactly as before.
     for (int round = 0;; round++) {
       if (_prog) {
         std::fprintf(
@@ -1625,22 +1656,17 @@ class MeshImpl {
             (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
         std::fflush(stderr);
       }
-      if (round > max_rounds) {
-        if (_prog) {
-          std::fprintf(
-              stderr,
-              "[jaccl-prog] send() MAX_ROUNDS_EXCEEDED rank=%d call_id=%u "
-              "dst=%d round=%d max_rounds=%d\n",
-              rank_,
-              call_id,
-              dst,
-              round,
-              max_rounds);
-          std::fflush(stderr);
-        }
-        throw std::runtime_error(
-            "[jaccl] send() exceeded max retransmit rounds (link "
-            "persistently dropping) — clean re-place");
+      if (round > max_rounds && _prog) {
+        std::fprintf(
+            stderr,
+            "[jaccl-prog] send() MAX_ROUNDS_EXCEEDED (non-fatal, still "
+            "retrying) rank=%d call_id=%u dst=%d round=%d max_rounds=%d\n",
+            rank_,
+            call_id,
+            dst,
+            round,
+            max_rounds);
+        std::fflush(stderr);
       }
       bool resending = !to_resend.empty();
 
@@ -1656,27 +1682,28 @@ class MeshImpl {
 
       uint64_t last_progress = mach_absolute_time();
       int prev_progress = c;
+      bool _deadline_logged = false;
       while (outstanding > 0) {
-        if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
-          if (_prog) {
-            std::fprintf(
-                stderr,
-                "[jaccl-prog] send() DEADLINE_HIT rank=%d call_id=%u dst=%d "
-                "round=%d outstanding=%d chunks_sent_before_stall=%d/%d "
-                "elapsed_us=%llu\n",
-                rank_,
-                call_id,
-                dst,
-                round,
-                outstanding,
-                c,
-                num_chunks,
-                (unsigned long long)mach_ticks_to_us(
-                    mach_absolute_time() - _t0));
-            std::fflush(stderr);
-          }
-          throw std::runtime_error(
-              "[jaccl] send() deadline in drain — clean re-place");
+        if (!_deadline_logged &&
+            mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us &&
+            _prog) {
+          _deadline_logged = true;
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] send() DEADLINE_HIT (non-fatal, still "
+              "retrying) rank=%d call_id=%u dst=%d round=%d "
+              "outstanding=%d chunks_sent_before_stall=%d/%d "
+              "elapsed_us=%llu\n",
+              rank_,
+              call_id,
+              dst,
+              round,
+              outstanding,
+              c,
+              num_chunks,
+              (unsigned long long)mach_ticks_to_us(
+                  mach_absolute_time() - _t0));
+          std::fflush(stderr);
         }
         int cur_progress = c;
         if (cur_progress != prev_progress) {
@@ -1866,6 +1893,15 @@ class MeshImpl {
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
+    // ROOT-CAUSE FIX (2026-08-09, design doc Section 39): mirrors
+    // send()'s own fix above -- see that comment for the full
+    // rationale (real-hardware evidence of a legitimate 29-round/15s
+    // transfer thrown away by this exact cap despite p2p_retry_barrier
+    // succeeding every round, plus direct user correction that a slow
+    // transfer must never be treated as a fatal one). max_rounds/
+    // _deadline_us below no longer THROW -- only p2p_retry_barrier's
+    // own recv (the real liveness check, 300s per Section 38) can end
+    // this loop in failure now.
     for (int round = 0;; round++) {
       if (_prog) {
         std::fprintf(
@@ -1881,47 +1917,44 @@ class MeshImpl {
             (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
         std::fflush(stderr);
       }
-      if (round > max_rounds) {
-        if (_prog) {
-          std::fprintf(
-              stderr,
-              "[jaccl-prog] recv() MAX_ROUNDS_EXCEEDED rank=%d call_id=%u "
-              "src=%d round=%d max_rounds=%d all_recv=%d/%d\n",
-              rank_,
-              call_id,
-              src,
-              round,
-              max_rounds,
-              all_recv,
-              num_chunks);
-          std::fflush(stderr);
-        }
-        throw std::runtime_error(
-            "[jaccl] recv() exceeded max retransmit rounds (link "
-            "persistently dropping) — clean re-place");
+      if (round > max_rounds && _prog) {
+        std::fprintf(
+            stderr,
+            "[jaccl-prog] recv() MAX_ROUNDS_EXCEEDED (non-fatal, still "
+            "retrying) rank=%d call_id=%u src=%d round=%d max_rounds=%d "
+            "all_recv=%d/%d\n",
+            rank_,
+            call_id,
+            src,
+            round,
+            max_rounds,
+            all_recv,
+            num_chunks);
+        std::fflush(stderr);
       }
 
       uint64_t last_progress = mach_absolute_time();
       int prev_progress = all_recv;
+      bool _deadline_logged = false;
       while (all_recv < num_chunks) {
-        if (mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us) {
-          if (_prog) {
-            std::fprintf(
-                stderr,
-                "[jaccl-prog] recv() DEADLINE_HIT rank=%d call_id=%u src=%d "
-                "round=%d all_recv=%d/%d elapsed_us=%llu\n",
-                rank_,
-                call_id,
-                src,
-                round,
-                all_recv,
-                num_chunks,
-                (unsigned long long)mach_ticks_to_us(
-                    mach_absolute_time() - _t0));
-            std::fflush(stderr);
-          }
-          throw std::runtime_error(
-              "[jaccl] recv() deadline in drain — clean re-place");
+        if (!_deadline_logged &&
+            mach_ticks_to_us(mach_absolute_time() - _t0) > _deadline_us &&
+            _prog) {
+          _deadline_logged = true;
+          std::fprintf(
+              stderr,
+              "[jaccl-prog] recv() DEADLINE_HIT (non-fatal, still "
+              "retrying) rank=%d call_id=%u src=%d "
+              "round=%d all_recv=%d/%d elapsed_us=%llu\n",
+              rank_,
+              call_id,
+              src,
+              round,
+              all_recv,
+              num_chunks,
+              (unsigned long long)mach_ticks_to_us(
+                  mach_absolute_time() - _t0));
+          std::fflush(stderr);
         }
         if (all_recv != prev_progress) {
           prev_progress = all_recv;
