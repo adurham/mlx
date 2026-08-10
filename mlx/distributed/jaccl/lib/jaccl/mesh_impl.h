@@ -1236,7 +1236,18 @@ class MeshImpl {
       ReduceOp reduce_op) {
     // Reliable ARQ data path (gated). Top-level 2-rank group only.
     if (coordinator_ != nullptr && size_ == 2 && jaccl_reliable_data_enabled()) {
-      if (jaccl_reliable_optimistic_enabled()) {
+      // QP-BUDGET GATE (2026-08-10): v2 (optimistic) additionally requires the
+      // dedicated pool QP, which PP mode does NOT allocate -- the Thunderbolt
+      // HCA caps out at max_qp=3, so PP spends its third QP on
+      // p2p_retry_connections_ instead (see mesh.cpp's
+      // jaccl_pipeline_mode_enabled() comment). Selecting v2 purely on the env
+      // toggle would enter reliable_all_reduce_v2 with an empty
+      // pool_connections_ and hit its "should be unreachable" throw on PP's
+      // warmup layer-count all_sum. The non-v2 reliable_all_reduce path is
+      // pool-free -- it posts exclusively on connections_ (the data QP) and
+      // rendezvouses over the TCP coordinator_ -- so it is the correct
+      // fallback here, preserving full ARQ reliability without a 4th QP.
+      if (jaccl_reliable_optimistic_enabled() && !pool_connections_.empty()) {
         reliable_all_reduce_v2<T>(call_id, in_ptr, out_ptr, size, reduce_op);
       } else {
         reliable_all_reduce<T>(call_id, in_ptr, out_ptr, size, reduce_op);
@@ -1655,6 +1666,22 @@ class MeshImpl {
           "one, and send()/recv() should only be called on a top-level "
           "group (exo's Pipeline-Parallel usage)");
     }
+    // QP-BUDGET GATE (2026-08-10): the retry protocol runs over the dedicated
+    // p2p_retry_connections_ QP, which is only allocated in PP mode -- TP
+    // spends that third-and-final QP slot (max_qp=3 on the Thunderbolt HCA) on
+    // pool_connections_ instead. See mesh.cpp's jaccl_pipeline_mode_enabled().
+    // Reaching here with an empty vector means TP-mode code called the PP-only
+    // p2p path; indexing the empty span below would be silent UB, so fail fast
+    // with a message that names the actual misconfiguration.
+    if (p2p_retry_connections_.empty()) {
+      throw std::runtime_error(
+          "[jaccl] send() called with no p2p_retry_connections_ (dedicated p2p "
+          "retry QP) -- this QP is only allocated when "
+          "MLX_JACCL_SHARDING_MODE=Pipeline. Either TP-mode code reached the "
+          "PP-only raw send()/recv() path (TP should use all_reduce/all_gather/"
+          "all_sum), or the runner was launched in PP without "
+          "MLX_JACCL_SHARDING_MODE=Pipeline being set/propagated");
+    }
     // Pre-transfer rendezvous REMOVED (design doc Section 37 Phase 1,
     // 2026-08-10): the old code's comment already noted this was "no
     // longer load-bearing for correctness -- the retry loop below
@@ -1911,6 +1938,18 @@ class MeshImpl {
           "retry-on-drop protocol requires it; only top-level groups have "
           "one, and send()/recv() should only be called on a top-level "
           "group (exo's Pipeline-Parallel usage)");
+    }
+    // QP-BUDGET GATE (2026-08-10): mirrors the identical guard in send() --
+    // p2p_retry_connections_ is PP-only because the Thunderbolt HCA caps at
+    // max_qp=3. See mesh.cpp's jaccl_pipeline_mode_enabled().
+    if (p2p_retry_connections_.empty()) {
+      throw std::runtime_error(
+          "[jaccl] recv() called with no p2p_retry_connections_ (dedicated p2p "
+          "retry QP) -- this QP is only allocated when "
+          "MLX_JACCL_SHARDING_MODE=Pipeline. Either TP-mode code reached the "
+          "PP-only raw send()/recv() path (TP should use all_reduce/all_gather/"
+          "all_sum), or the runner was launched in PP without "
+          "MLX_JACCL_SHARDING_MODE=Pipeline being set/propagated");
     }
     // Pre-transfer rendezvous REMOVED and zero-byte early-return simplified
     // -- see send()'s matching comment for the full rationale (design doc

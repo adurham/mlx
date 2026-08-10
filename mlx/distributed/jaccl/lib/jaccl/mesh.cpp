@@ -13,6 +13,68 @@
 
 namespace jaccl {
 
+// HARDWARE QP BUDGET (2026-08-10, root-cause fix for the PREPARING crash-loop).
+//
+// Apple's Thunderbolt RDMA device reports max_qp=3 per HCA (verified with
+// `ibv_devinfo -v` on BOTH cluster nodes: rdma_en2/rdma_en3 alike report
+// max_qp:3, max_cq:6, max_pd:6). The top-level MeshGroup ctor had grown to
+// unconditionally build FOUR dedicated QP types per peer -- connections_
+// (data), ack_connections_, pool_connections_, and p2p_retry_connections_
+// (added earlier today for the TCP->RDMA p2p-retry migration). The fourth
+// ibv_create_qp therefore ALWAYS failed with EBUSY ("Couldn't create queue
+// pair"). utils_mlx.py's _init_jaccl_with_backoff was written for a genuinely
+// transient cause (leaked QPs from a crashed runner) and retried forever
+// without ever succeeding, because this cause is STRUCTURAL, not transient.
+//
+// The fix is not to retry harder -- it is to stop allocating QPs the running
+// mode will never use. The two modes need disjoint fourth QPs:
+//
+//   PP (Pipeline): connections_ + p2p_retry_connections_ + ack_connections_
+//       send()/recv()'s retry protocol needs p2p_retry_connections_ on every
+//       p2p handoff. ack_connections_ is needed for the ONE warmup-time
+//       collective (pp_batched_decode_glue.py's layer-count all_sum).
+//       pool_connections_ is NOT built -- see the all_reduce() pool-free
+//       fallback in mesh_impl.h that makes that warmup collective work
+//       without the v2 standing pool.
+//
+//   TP (Tensor, and the DEFAULT): connections_ + ack_connections_ +
+//       pool_connections_ -- both are jaccl-v2's reliable-ARQ machinery, used
+//       throughout TP's collectives. TP never calls the raw send()/recv() p2p
+//       path, so p2p_retry_connections_ is NOT built.
+//
+// Either way the mesh allocates exactly 3 QPs per peer and fits the budget.
+//
+// WHY getenv AND NOT A CTOR PARAMETER: MeshGroup's top-level ctor signature
+// (rank, device_names, coordinator_addr) is reached through mlx's generic
+// distributed-backend factory (mx.distributed.init(backend="jaccl")), which
+// has no channel for an exo-specific sharding mode. Threading one through
+// would mean changing the signature for every caller including mlx's own
+// tests. This file already reads runtime toggles via cached getenv helpers
+// (jaccl_ack_sync_pre_enabled() etc. in mesh_impl.h) -- this follows that
+// established pattern instead of widening the API.
+//
+// The value is set by start_cluster.sh from DSV4_SHARDING (the launcher's own
+// PP/TP selector, start_cluster.sh:323 `: "${DSV4_SHARDING:=Pipeline}"`), and
+// is read here as MLX_JACCL_SHARDING_MODE.
+//
+// DEFAULT IS TP (the superset of collective machinery) when the variable is
+// unset or unrecognized: an out-of-tree/testing caller that never sets it
+// keeps working with the full reliable-ARQ path exactly as before this
+// change. Only the raw send()/recv() p2p path -- which is exo-PP-specific and
+// throws a clear diagnostic if reached without its QP -- is lost by default.
+inline bool jaccl_pipeline_mode_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("MLX_JACCL_SHARDING_MODE");
+    // Matches exo's Sharding enum spelling ("Pipeline"/"Tensor"); accept a
+    // lowercase spelling too so a hand-run experiment isn't silently
+    // misclassified as TP (which would omit the p2p-retry QP that PP's
+    // send()/recv() requires).
+    return e != nullptr &&
+        (std::string_view(e) == "Pipeline" || std::string_view(e) == "pipeline");
+  }();
+  return v;
+}
+
 MeshGroup::MeshGroup(
     int rank,
     const std::vector<std::string>& device_names,
@@ -110,9 +172,18 @@ MeshGroup::MeshGroup(
   // though its own synchronization was correct). Same fix shape as the
   // ACK-QP split above: dedicated PD/CQ/QP, borrows the peer's
   // ibv_context (owns_ctx=false).
-  pool_connections_.reserve(static_cast<size_t>(size_));
-  for (auto& data_conn : connections_) {
-    pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  // QP-BUDGET GATE (2026-08-10): built only in TP mode. In PP mode the fourth
+  // QP slot is spent on p2p_retry_connections_ below instead, and this vector
+  // stays EMPTY -- initialize()/reconnect_fresh()/allocate_buffers()'s
+  // existing `has_pool = !pool_connections_.empty()` guards then skip its
+  // bring-up entirely, and all_reduce() routes around the v2 path that would
+  // have needed it. See the jaccl_pipeline_mode_enabled() comment at the top
+  // of this file for the max_qp=3 hardware constraint driving this.
+  if (!jaccl_pipeline_mode_enabled()) {
+    pool_connections_.reserve(static_cast<size_t>(size_));
+    for (auto& data_conn : connections_) {
+      pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+    }
   }
 
   // DESIGN DOC SECTION 37 PHASE 1 (2026-08-10): dedicated QP for send()/
@@ -124,9 +195,17 @@ MeshGroup::MeshGroup(
   // buffers raw send()/recv() posts on connections_ (the IBV_WC_LOC_LEN_ERR
   // class of bug this file has already paid to learn twice). See
   // p2p_retry_connections_'s member comment in mesh.h.
-  p2p_retry_connections_.reserve(static_cast<size_t>(size_));
-  for (auto& data_conn : connections_) {
-    p2p_retry_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  // QP-BUDGET GATE (2026-08-10): built only in PP mode. TP never calls the raw
+  // send()/recv() p2p path (it uses all_reduce/all_gather/all_sum), so in TP
+  // this vector stays EMPTY and its QP slot goes to pool_connections_ above,
+  // keeping the total at the hardware's max_qp=3. mesh_impl.h's send()/recv()
+  // throw a clear diagnostic rather than silently misbehaving if TP-mode code
+  // ever does reach the p2p path.
+  if (jaccl_pipeline_mode_enabled()) {
+    p2p_retry_connections_.reserve(static_cast<size_t>(size_));
+    for (auto& data_conn : connections_) {
+      p2p_retry_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+    }
   }
 
   initialize([this](const std::vector<Destination>& info) {
@@ -879,15 +958,26 @@ void MeshGroup::reconnect_fresh() {
   // Rebuild pool_connections_ too (see ctor comment) — must be reborn
   // against the fresh ctxs just like ack_connections_, or reconnect_fresh
   // leaves it dangling against destroyed contexts.
-  pool_connections_.reserve(static_cast<size_t>(size_));
-  for (auto& data_conn : connections_) {
-    pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  // QP-BUDGET GATE (2026-08-10): mirrors the ctor's mode gating EXACTLY. If
+  // this rebuilt unconditionally, a hard recovery would re-create the 4th QP
+  // that the ctor deliberately skipped and hit the same max_qp=3 EBUSY the
+  // ctor gating exists to avoid -- turning every reconnect_fresh() into a
+  // permanent failure. jaccl_pipeline_mode_enabled() is a cached static, so
+  // it cannot disagree with the value the ctor saw.
+  if (!jaccl_pipeline_mode_enabled()) {
+    pool_connections_.reserve(static_cast<size_t>(size_));
+    for (auto& data_conn : connections_) {
+      pool_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+    }
   }
   // Same for p2p_retry_connections_ -- reborn against the fresh ctxs, or
   // send()/recv()'s retry exchange is left pointing at destroyed contexts.
-  p2p_retry_connections_.reserve(static_cast<size_t>(size_));
-  for (auto& data_conn : connections_) {
-    p2p_retry_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  // Same QP-budget gate as above, inverted: PP-only.
+  if (jaccl_pipeline_mode_enabled()) {
+    p2p_retry_connections_.reserve(static_cast<size_t>(size_));
+    for (auto& data_conn : connections_) {
+      p2p_retry_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+    }
   }
 
   // 3. Full bring-up, identical to the ctor: PD/CQ/QP creation, buffer
