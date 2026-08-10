@@ -1227,6 +1227,158 @@ class MeshImpl {
     reduce_op(reinterpret_cast<T*>(asm_buf.data()), out_ptr, size);
   }
 
+  // ── PP-mode warmup all_reduce over the dedicated ACK QP ──
+  //
+  // WHY (2026-08-10, follow-up to the max_qp=3 mode-gating fix): in PP mode
+  // pool_connections_ is empty by design, so all_reduce()'s dispatch below
+  // fell through to reliable_all_reduce (non-v2), which posts its sends and
+  // recvs on connections_[peer]. That is the SAME physical QP that PP's raw
+  // p2p pipeline traffic uses -- send() posts connections_[dst].post_send()
+  // and recv() posts connections_[src].post_recv() (see ~line 1780 / ~line
+  // 2040). PP's ONE warmup collective (exo's
+  // exchange_prefill_peer_layer_count / handshake_metaframe_protocol) therefore
+  // interleaved with the MetaFrame header traffic that starts immediately
+  // after warmup, and the collective's float payload landed in a MetaFrame
+  // header recv buffer -- observed deterministically (20/20) on the real
+  // 2-node cluster as "MetaFrame protocol version mismatch: received 16256"
+  // (0x3F80 == the high half of IEEE-754 1.0f). Exactly the two-protocols-
+  // on-one-QP bug class this file already paid to learn with ack/pool/
+  // p2p_retry.
+  //
+  // FIX: run this tiny collective on ack_connections_ -- PP's third QP, which
+  // is built but otherwise carries no traffic in PP mode -- reusing the
+  // ALREADY-PRE-POSTED 64-slot ACK_RECV pool that post_ack_recvs(0) arms in
+  // MeshGroup's ctor. Crucially this posts NO new recv WRs of its own: a
+  // freshly posted recv would sit BEHIND those 64, so the peer's send would
+  // consume a pre-existing slot and this rank would read the wrong thing --
+  // the same corruption in a new shape. It sends via ack_connections_ with
+  // the standard ACK_SEND_WR tagging and consumes completions with a private
+  // copy of drain_acks()'s polling loop (see drain_acks_exchange below).
+  //
+  // Constraints: 2 ranks, and the whole message must fit one FRAME_SIZE
+  // (4096B) ack buffer. Both hold for every collective PP actually issues
+  // (a world_size-length int32 vector; a single int64). Anything larger, or
+  // any other topology, still falls through to reliable_all_reduce.
+  template <typename T, typename ReduceOp>
+  bool ack_all_reduce_small(
+      uint32_t call_id,
+      const T* in_ptr,
+      T* out_ptr,
+      int64_t size,
+      ReduceOp reduce_op) {
+    if (size_ != 2 || ack_connections_.empty()) {
+      return false;
+    }
+    const int64_t total_bytes = size * static_cast<int64_t>(sizeof(T));
+    const int peer = (rank_ == 0) ? 1 : 0;
+    if (total_bytes <= 0 ||
+        total_bytes > static_cast<int64_t>(ack_send_buffers_[peer].size()) ||
+        total_bytes > static_cast<int64_t>(ack_recv_buffers_[peer].size())) {
+      return false;
+    }
+    if (in_ptr != out_ptr) {
+      std::memcpy(out_ptr, in_ptr, static_cast<size_t>(total_bytes));
+    }
+    // Stage OUR contribution into the ack send buffer. post_send transmits
+    // the whole FRAME_SIZE buffer (SharedBuffer's SGE is the full buffer), so
+    // zero the tail: the peer reads only the first total_bytes, but leaving
+    // stale bytes behind would be gratuitous.
+    auto& sbuf = ack_send_buffers_[peer];
+    std::memset(sbuf.data<char>(), 0, sbuf.size());
+    std::memcpy(sbuf.data<char>(), in_ptr, static_cast<size_t>(total_bytes));
+    JACCL_DMA_BARRIER();
+    // NOTE: this leaves our payload resident in ack_send_buffers_[peer] for
+    // subsequent ack_sync_pre/ack_sync_post sends to retransmit. That is
+    // harmless -- drain_acks never reads ACK payload bytes, the ack exchange
+    // is purely a completion-count rendezvous.
+    ack_connections_[peer].post_send(
+        sbuf, make_wr_id(call_id, ACK_SEND_WR, 0, peer));
+    std::vector<char> peer_bytes(static_cast<size_t>(total_bytes), 0);
+    drain_acks_exchange(
+        call_id, /*num_peers=*/1, peer_bytes.data(), total_bytes);
+    reduce_op(reinterpret_cast<T*>(peer_bytes.data()), out_ptr, size);
+    return true;
+  }
+
+  // Private variant of drain_acks() for ack_all_reduce_small: identical
+  // polling/replenish/caching structure, with ONE addition -- on each
+  // ACK_RECV completion it copies the landed payload out of
+  // ack_recv_buffers_[peer] BEFORE the replenish path memsets that same
+  // buffer and re-posts it. Forked rather than adding an out-parameter to
+  // drain_acks() because drain_acks() is on the hot path of every
+  // reliable_all_reduce_v2 collective in TP mode (call sites: ack_sync_pre
+  // ~line 2675 and ack_sync_post ~line 2727, themselves called from
+  // all_reduce's UC path ~1321/1532 and all_gather's ~1568/1650) and its
+  // read-then-replenish ordering constraint does not exist for any other
+  // caller. No shared bookkeeping semantics change: cached_ack_recvs_ is
+  // pushed/consumed exactly as drain_acks does, and the pre-posted pool is
+  // replenished one-for-one per consumed ACK_RECV, so later ack_sync_pre/
+  // ack_sync_post callers in this process see an unchanged QP state.
+  void drain_acks_exchange(
+      uint32_t call_id,
+      int num_peers,
+      char* out_bytes,
+      int64_t out_len) {
+    int need_send = num_peers;
+    int need_recv = num_peers;
+    StallWatch _stall(need_send + need_recv);
+    // Deliberately does NOT consume cached_ack_recvs_: a cached entry is an
+    // ACK_RECV whose payload was already discarded (drain_acks zeroes the
+    // buffer on replenish), so it can never be this exchange's message. This
+    // exchange is a strictly paired rendezvous (each rank posts exactly one
+    // send), and it runs at warmup before any other ack traffic exists, so
+    // the cache is empty in practice; leaving it untouched keeps it correct
+    // for the ordinary ack callers if it ever isn't.
+    while (need_send > 0 || need_recv > 0) {
+      _stall.tick(need_send + need_recv, "drain_acks_exchange", rank_, call_id);
+      ibv_wc wc[16];
+      int n = poll(ack_connections_, 16, wc);
+      for (int i = 0; i < n; i++) {
+        int wt = wr_id_work_type(wc[i].wr_id);
+        if (wt == ACK_RECV_WR) {
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            std::ostringstream msg;
+            msg << "[jaccl] ack exchange (recv) wc.status=" << wc[i].status
+                << " wr_id=0x" << std::hex << wc[i].wr_id;
+            throw std::runtime_error(msg.str());
+          }
+          int peer = wr_id_peer(wc[i].wr_id);
+          auto& rbuf = ack_recv_buffers_[peer];
+          if (need_recv > 0) {
+            // READ BEFORE REPLENISH -- the replenish below memsets this very
+            // buffer. This ordering is the whole reason for the fork.
+            std::memcpy(
+                out_bytes, rbuf.data<char>(), static_cast<size_t>(out_len));
+          }
+          // Replenish the pre-posted pool exactly as drain_acks does
+          // (sentinel call_id=0 -- ACK_RECVs are call_id-agnostic).
+          std::memset(rbuf.data<char>(), 0, rbuf.size());
+          JACCL_DMA_BARRIER();
+          ack_connections_[peer].post_recv(
+              rbuf, make_wr_id(0, ACK_RECV_WR, 0, peer));
+          if (need_recv > 0) {
+            need_recv--;
+          } else {
+            cached_ack_recvs_.push_back(peer);
+          }
+        } else if (wt == ACK_SEND_WR) {
+          if (wr_id_call_id(wc[i].wr_id) != call_id) {
+            continue;
+          }
+          if (wc[i].status != IBV_WC_SUCCESS) {
+            std::ostringstream msg;
+            msg << "[jaccl] ack exchange (send) wc.status=" << wc[i].status
+                << " wr_id=0x" << std::hex << wc[i].wr_id;
+            throw std::runtime_error(msg.str());
+          }
+          need_send--;
+        } else {
+          continue;
+        }
+      }
+    }
+  }
+
   template <typename T, typename ReduceOp>
   void all_reduce(
       uint32_t call_id,
@@ -1249,6 +1401,15 @@ class MeshImpl {
       // fallback here, preserving full ARQ reliability without a 4th QP.
       if (jaccl_reliable_optimistic_enabled() && !pool_connections_.empty()) {
         reliable_all_reduce_v2<T>(call_id, in_ptr, out_ptr, size, reduce_op);
+      } else if (
+          pool_connections_.empty() && !ack_connections_.empty() &&
+          ack_all_reduce_small<T>(call_id, in_ptr, out_ptr, size, reduce_op)) {
+        // PP mode (empty pool, ack QP present) and the message fits one
+        // FRAME_SIZE ack buffer: run it on the otherwise-idle ACK QP rather
+        // than on connections_, which PP's raw send()/recv() pipeline traffic
+        // owns. See ack_all_reduce_small's comment for the confirmed
+        // corruption this avoids. Returns false (falling through below) for
+        // anything it can't service, so reliable_all_reduce stays reachable.
       } else {
         reliable_all_reduce<T>(call_id, in_ptr, out_ptr, size, reduce_op);
       }
