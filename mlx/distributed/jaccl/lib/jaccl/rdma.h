@@ -6,8 +6,10 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mach/mach_time.h>
 #include <span>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -343,6 +345,92 @@ struct Connection {
         << " rnr_retry=" << (int)attr.rnr_retry
         << " qp_num=" << queue_pair->qp_num;
     return out.str();
+  }
+
+  // DIAGNOSTIC (2026-08-11, Section 43 continued): distinguishes "the WQE
+  // was never processed by the driver at all" (doorbell/kick silently
+  // lost below the ibverbs API -- Apple's librdma.dylib/
+  // AppleThunderboltRDMA.kext, which we cannot fix) from "WQEs ARE being
+  // processed but something about THIS specific transfer fails" (would
+  // show up as an immediate error CQE, and IS something we can fix in
+  // jaccl/mlx/exo). Posts one throwaway SIGNALED send with a deliberately
+  // invalid lkey (bypasses the local page tables -- this WR can never
+  // reach the wire, it must fail local WQE validation) onto the SAME
+  // stuck QP, then polls briefly for ANY completion:
+  //   - a completion arrives (almost certainly IBV_WC_LOC_PROT_ERR) ->
+  //     the driver IS still consuming/processing WQEs and generating
+  //     CQEs on this QP; the real stalled sends are failing for some
+  //     OTHER reason once posted (or being silently accepted-but-not-
+  //     transmitted specifically for well-formed WRs) -- narrows the
+  //     bug to something jaccl/mlx-side can plausibly work around
+  //     (e.g. periodic full QP teardown/rebuild instead of trusting a
+  //     wedged QP to self-recover, since we now know recovery-via-
+  //     reconnect_fresh is the only thing that has ever unstuck it).
+  //   - nothing arrives even for this poison WR -> the whole QP's WQE
+  //     processing pipeline is wedged at the driver level, below
+  //     anything we can directly instrument; the only viable software
+  //     workaround is faster/cheaper stall DETECTION + reconnect (make
+  //     the existing StallWatch backstop cheap and frequent enough that
+  //     it's not a user-visible tail latency problem, since a hard fix
+  //     isn't ours to make).
+  // Returns a human-readable outcome string for logging. NEVER call this
+  // on a QP still needed for real traffic without an immediate
+  // queue_pair_reset()+reconnect after -- posting a guaranteed-bad WR
+  // pushes the QP to IBV_QPS_ERR (this is intentional and required to
+  // get the diagnostic signal; the caller is expected to already be on
+  // the reconnect_fresh path when this runs).
+  std::string poison_send_probe() {
+    ibv_send_wr wr;
+    ibv_send_wr* bad_wr = nullptr;
+    ibv_sge sge;
+    std::memset(&wr, 0, sizeof(wr));
+    std::memset(&sge, 0, sizeof(sge));
+    char dummy = 0;
+    sge.addr = reinterpret_cast<uint64_t>(&dummy);
+    sge.length = 1;
+    sge.lkey = 0xdeadbeef; // deliberately invalid -- must fail local
+                           // WQE validation before ever touching the wire
+    wr.wr_id = 0xdeadbeefULL << 32;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    int post_rc = ibv_post_send(queue_pair, &wr, &bad_wr);
+    if (post_rc != 0) {
+      std::ostringstream out;
+      out << "post_send itself failed rc=" << post_rc
+          << " (rejected before even entering the SQ -- driver-side "
+             "queue full or QP already in a bad state)";
+      return out.str();
+    }
+    // Poll for up to ~2000 iterations at 1ms each (~2s) -- generous given
+    // every real completion in this codebase's happy path arrives in
+    // microseconds; a poison WR failing local validation should be at
+    // least that fast if the pipeline is alive at all. Iteration-count
+    // bound instead of a wall-clock one to avoid depending on this
+    // header's caller (mesh_impl.h) for its mach_ticks_to_us helper --
+    // rdma.h is a lower-level file and should stay self-contained.
+    ibv_wc wc[4];
+    for (int iter = 0; iter < 2000; iter++) {
+      int n = poll(4, wc);
+      for (int i = 0; i < n; i++) {
+        if (wc[i].wr_id == (0xdeadbeefULL << 32)) {
+          std::ostringstream out;
+          out << "POISON WR COMPLETED: wc_status="
+              << static_cast<int>(wc[i].status)
+              << " (driver IS processing WQEs on this QP -- the stall is "
+                 "NOT a fully-wedged doorbell/kick path)";
+          return out.str();
+        }
+      }
+      if (n == 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(1000));
+      }
+    }
+    return "POISON WR TIMED OUT after ~2000 poll iterations with zero "
+           "completions -- WQE processing pipeline for this QP appears "
+           "fully wedged below the ibverbs API (driver-level; not "
+           "fixable from jaccl/mlx source)";
   }
 };
 

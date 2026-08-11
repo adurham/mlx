@@ -2205,6 +2205,20 @@ class MeshImpl {
               connections_[dst].debug_dump_qp_state().c_str(),
               p2p_retry_connections_[dst].debug_dump_qp_state().c_str());
           std::fflush(stderr);
+          // DIAGNOSTIC (2026-08-11, Section 43 continued): distinguishes
+          // a fully-wedged driver-level WQE pipeline (nothing we can fix)
+          // from a narrower failure mode (something jaccl/mlx CAN work
+          // around). Safe to run here: we're already on the throw path
+          // that's about to trigger reconnect_fresh(), which discards
+          // this QP entirely -- pushing it to IBV_QPS_ERR via the probe
+          // costs nothing extra.
+          std::fprintf(
+              stderr,
+              "[jaccl-qp] POISON PROBE rank=%d call_id=%u result=[%s]\n",
+              rank_,
+              call_id,
+              connections_[dst].poison_send_probe().c_str());
+          std::fflush(stderr);
           throw;
         }
       }
@@ -2509,6 +2523,19 @@ class MeshImpl {
               call_id,
               connections_[src].debug_dump_qp_state().c_str(),
               p2p_retry_connections_[src].debug_dump_qp_state().c_str());
+          std::fflush(stderr);
+          // DIAGNOSTIC (2026-08-11, Section 43 continued): mirrors
+          // send()'s own poison-WR probe -- see that comment for the
+          // full rationale. Same QP object serves both directions, so
+          // probing its SQ here is still diagnostic of whether the WQE
+          // processing pipeline for THIS QP is wedged, even though
+          // recv() itself only issues RQ-side work.
+          std::fprintf(
+              stderr,
+              "[jaccl-qp] POISON PROBE rank=%d call_id=%u result=[%s]\n",
+              rank_,
+              call_id,
+              connections_[src].poison_send_probe().c_str());
           std::fflush(stderr);
           throw;
         }
