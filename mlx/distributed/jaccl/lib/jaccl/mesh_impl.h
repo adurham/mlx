@@ -1901,6 +1901,31 @@ class MeshImpl {
       int64_t len = std::min(chunk_bytes, n_bytes - off);
       std::memcpy(p + HDR, in_ptr + off, static_cast<size_t>(len));
       JACCL_DMA_BARRIER();
+      // DIAGNOSTIC (2026-08-11, Section 43 continued): trace every ACTUAL
+      // ibv_post_send() call for this data QP, distinct from the ROUND
+      // log (which only proves the outer retry loop is iterating, not
+      // that post_chunk was ever invoked or that ibv_post_send didn't
+      // throw). Answers the anomaly found via debug_dump_qp_state(): a
+      // stalled call_id logged 600 ROUNDs with to_resend_count=1 each,
+      // yet the QP's own sq_psn was only 7 at the moment of the stall --
+      // far too low if post_send were actually firing every round. If
+      // POST_CHUNK lines are missing/sparse relative to ROUND lines,
+      // the retry loop's OWN control flow (not the NIC/QP) is silently
+      // failing to re-invoke post_chunk on later rounds -- a Python-
+      // adjacent-tier bug already found once this session (the `or`
+      // short-circuit in pipeline_agree_cancel) may have a C++-side
+      // sibling here.
+      if (jaccl_progress_enabled()) {
+        std::fprintf(
+            stderr,
+            "[jaccl-post] POST_CHUNK rank=%d call_id=%u dst=%d c=%d buff=%d\n",
+            rank_,
+            call_id,
+            dst,
+            c,
+            buff);
+        std::fflush(stderr);
+      }
       connections_[dst].post_send(sb, make_wr_id(call_id, SEND_WR, buff, dst));
     };
 
