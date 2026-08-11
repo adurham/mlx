@@ -138,6 +138,13 @@ struct IBVWrapper {
   int (*query_port)(ibv_context*, uint8_t, ibv_port_attr*);
   int (*query_gid)(ibv_context*, uint8_t, int, ibv_gid*);
   int (*modify_qp)(ibv_qp*, ibv_qp_attr*, int);
+  // Added 2026-08-11 (Section 43 continued) for the QP-state stall
+  // diagnostic below. Dynamically resolved like every other real
+  // ibverbs symbol on this platform -- see IBVWrapper's ctor comment
+  // for why post_send/post_recv/poll_cq are NOT in this list (they're
+  // header-only inline wrappers, not exported symbols; query_qp IS a
+  // real exported symbol and must go through dlsym like the others).
+  int (*query_qp)(ibv_qp*, ibv_qp_attr*, int, ibv_qp_init_attr*);
   ibv_mr* (*reg_mr)(ibv_pd*, void*, size_t, int);
   int (*dereg_mr)(ibv_mr*);
 
@@ -312,7 +319,7 @@ struct Connection {
     int mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RQ_PSN |
         IBV_QP_PATH_MTU | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
         IBV_QP_RNR_RETRY;
-    int rc = ibv_query_qp(queue_pair, &attr, mask, &init_attr);
+    int rc = ibv().query_qp(queue_pair, &attr, mask, &init_attr);
     std::ostringstream out;
     if (rc != 0) {
       out << "ibv_query_qp FAILED rc=" << rc;

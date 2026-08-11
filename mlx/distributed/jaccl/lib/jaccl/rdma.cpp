@@ -55,6 +55,7 @@ IBVWrapper::IBVWrapper() {
   LOAD_SYMBOL(ibv_query_port, query_port);
   LOAD_SYMBOL(ibv_query_gid, query_gid);
   LOAD_SYMBOL(ibv_modify_qp, modify_qp);
+  LOAD_SYMBOL(ibv_query_qp, query_qp);
   LOAD_SYMBOL(ibv_reg_mr, reg_mr);
   LOAD_SYMBOL(ibv_dereg_mr, dereg_mr);
 
