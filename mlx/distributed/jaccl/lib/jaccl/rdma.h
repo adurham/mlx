@@ -289,6 +289,54 @@ struct Connection {
   int poll(int num_completions, ibv_wc* work_completions) {
     return ibv_poll_cq(completion_queue, num_completions, work_completions);
   }
+
+  // DIAGNOSTIC (2026-08-11, Section 43 continued): query the QP's raw
+  // ibverbs state at a moment of interest (e.g. right before a
+  // StallWatch throw) and format it for logging. Answers the single
+  // open question left after ruling out the Python-level short-circuit
+  // bug: is the underlying QP still healthy (RTS, real PSN counters
+  // advancing) while the retry protocol above it sees zero progress --
+  // i.e. genuinely lost/dropped UC datagrams -- or has the QP itself
+  // silently transitioned to an error state (IBV_QPS_ERR) that the
+  // existing code has no visibility into and therefore keeps retrying
+  // into a QP that can never again complete anything? Zero cost unless
+  // called (only invoked from the throw path immediately below).
+  std::string debug_dump_qp_state() const {
+    ibv_qp_attr attr;
+    ibv_qp_init_attr init_attr;
+    std::memset(&attr, 0, sizeof(attr));
+    std::memset(&init_attr, 0, sizeof(init_attr));
+    // IBV_QP_STATE gets qp_state; the SQ/RQ PSN and rnr/timeout fields
+    // ride along in the same query for free -- request everything that
+    // might be diagnostic in one call rather than several.
+    int mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RQ_PSN |
+        IBV_QP_PATH_MTU | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+        IBV_QP_RNR_RETRY;
+    int rc = ibv_query_qp(queue_pair, &attr, mask, &init_attr);
+    std::ostringstream out;
+    if (rc != 0) {
+      out << "ibv_query_qp FAILED rc=" << rc;
+      return out.str();
+    }
+    const char* state_str = "UNKNOWN";
+    switch (attr.qp_state) {
+      case IBV_QPS_RESET: state_str = "RESET"; break;
+      case IBV_QPS_INIT: state_str = "INIT"; break;
+      case IBV_QPS_RTR: state_str = "RTR"; break;
+      case IBV_QPS_RTS: state_str = "RTS"; break;
+      case IBV_QPS_SQD: state_str = "SQD"; break;
+      case IBV_QPS_SQE: state_str = "SQE"; break;
+      case IBV_QPS_ERR: state_str = "ERR"; break;
+      default: break;
+    }
+    out << "qp_state=" << state_str << " sq_psn=" << attr.sq_psn
+        << " rq_psn=" << attr.rq_psn << " path_mtu=" << attr.path_mtu
+        << " timeout=" << (int)attr.timeout
+        << " retry_cnt=" << (int)attr.retry_cnt
+        << " rnr_retry=" << (int)attr.rnr_retry
+        << " qp_num=" << queue_pair->qp_num;
+    return out.str();
+  }
 };
 
 std::vector<Connection> create_connections(

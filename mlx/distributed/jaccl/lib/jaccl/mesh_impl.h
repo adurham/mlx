@@ -2159,7 +2159,29 @@ class MeshImpl {
           _data_stall.timeout_us = jaccl_p2p_retry_stall_timeout_us();
           _data_stall_primed = true;
         }
-        _data_stall.tick(peer_got_count, "send() data-progress", rank_, call_id);
+        // DIAGNOSTIC (2026-08-11, Section 43 continued): on the verge of
+        // throwing, dump BOTH QPs' live ibverbs state first (data QP and
+        // p2p_retry QP for this peer) -- answers whether the underlying
+        // QP silently entered IBV_QPS_ERR (a real transport failure the
+        // retry protocol has no visibility into) vs. remained healthy
+        // RTS the whole time (genuinely lost/dropped UC datagrams, a
+        // different root cause requiring a different fix). try/catch
+        // instead of modifying StallWatch's signature -- keeps this
+        // fully isolated to the one call site that needs it.
+        try {
+          _data_stall.tick(peer_got_count, "send() data-progress", rank_, call_id);
+        } catch (const std::runtime_error&) {
+          std::fprintf(
+              stderr,
+              "[jaccl-qp] STALL QP STATE rank=%d call_id=%u data_qp=[%s] "
+              "p2p_retry_qp=[%s]\n",
+              rank_,
+              call_id,
+              connections_[dst].debug_dump_qp_state().c_str(),
+              p2p_retry_connections_[dst].debug_dump_qp_state().c_str());
+          std::fflush(stderr);
+          throw;
+        }
       }
       to_resend.assign(num_chunks, 0);
       for (int k = 0; k < num_chunks; k++) {
@@ -2448,7 +2470,23 @@ class MeshImpl {
           _data_stall.timeout_us = jaccl_p2p_retry_stall_timeout_us();
           _data_stall_primed = true;
         }
-        _data_stall.tick(all_recv, "recv() data-progress", rank_, call_id);
+        // DIAGNOSTIC (2026-08-11, Section 43 continued): mirrors send()'s
+        // own QP-state dump on the throw path -- see that comment for
+        // the full rationale.
+        try {
+          _data_stall.tick(all_recv, "recv() data-progress", rank_, call_id);
+        } catch (const std::runtime_error&) {
+          std::fprintf(
+              stderr,
+              "[jaccl-qp] STALL QP STATE rank=%d call_id=%u data_qp=[%s] "
+              "p2p_retry_qp=[%s]\n",
+              rank_,
+              call_id,
+              connections_[src].debug_dump_qp_state().c_str(),
+              p2p_retry_connections_[src].debug_dump_qp_state().c_str());
+          std::fflush(stderr);
+          throw;
+        }
       }
       // Still missing some chunks: keep enough recvs posted for the
       // sender's retransmits to land (sliding window invariant).
