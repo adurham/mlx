@@ -3030,7 +3030,45 @@ class MeshImpl {
         stall.timeout_us = stall_us;
         stall_primed = true;
       }
-      stall.tick(metric, "p2p_retry_exchange", rank_, seq);
+      // DIAGNOSTIC (2026-08-15, Section 44 continued): the poison-WR probe
+      // built in mlx@9ccf9b198 was wired ONLY to send()/recv()'s own
+      // data-progress StallWatch (the connections_[dst] data QP) -- it was
+      // NEVER wired here, to p2p_retry_exchange's own StallWatch, despite
+      // THIS being the one that has actually fired in every real
+      // reproduction of the stall so far (metric=peer_frame_seen popcount,
+      // stuck at 0 for the full 300s -- this rank never saw even one valid
+      // reply frame for its own (data_src_rank, seq) query the whole
+      // window). Run the SAME probe here, against the SAME QP this loop
+      // itself uses (p2p_retry_connections_[peer], NOT connections_[dst]/
+      // [src] -- a different physical QP from send()/recv()'s data path)
+      // to answer the identical question this bug's whole investigation
+      // has been chasing: is the driver still processing WQEs on THIS QP
+      // at all, or is the wedge below the ibverbs API here too. Safe to
+      // run here for the same reason as the send()/recv() call site: this
+      // is directly on the throw path that's about to trigger
+      // reconnect_fresh(), which discards this QP entirely regardless.
+      try {
+        stall.tick(metric, "p2p_retry_exchange", rank_, seq);
+      } catch (const std::runtime_error&) {
+        std::fprintf(
+            stderr,
+            "[jaccl-p2p-qp] STALL QP STATE rank=%d peer=%d seq=%u "
+            "p2p_retry_qp=[%s]\n",
+            rank_,
+            peer,
+            seq,
+            p2p_retry_connections_[peer].debug_dump_qp_state().c_str());
+        std::fflush(stderr);
+        std::fprintf(
+            stderr,
+            "[jaccl-p2p-qp] POISON PROBE rank=%d peer=%d seq=%u result=[%s]\n",
+            rank_,
+            peer,
+            seq,
+            p2p_retry_connections_[peer].poison_send_probe().c_str());
+        std::fflush(stderr);
+        throw;
+      }
 
     }
     // Trim to the exact bitmask length the peer reported via its last
