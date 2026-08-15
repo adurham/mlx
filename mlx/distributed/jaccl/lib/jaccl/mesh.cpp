@@ -263,6 +263,11 @@ MeshGroup::MeshGroup(
   // bootstrap barrier below (UC silently drops a send into an empty recv
   // queue, so both ranks must be armed before either returns from the ctor).
   mesh_.post_p2p_retry_recvs();
+  // Section 52 (2026-08-15): same lifecycle, same rationale, for the DATA QP's
+  // sz=0 class -- see post_data_recv_pool() for the measurement showing a
+  // 500ms retransmit stall on ~4.5% of PP decode barriers from exactly this
+  // empty-FIFO UC drop.
+  mesh_.post_data_recv_pool();
 
   // Bootstrap barrier: guarantee both ranks have completed
   // post_ack_recvs(0) before any rank can return from the ctor and
@@ -912,6 +917,11 @@ void MeshGroup::reconnect() {
   // same final barrier, or the peer's first post-reconnect retry frame lands
   // on an empty recv queue and UC silently drops it.
   mesh_.post_p2p_retry_recvs();
+  // Section 52 (2026-08-15): same lifecycle, same rationale, for the DATA QP's
+  // sz=0 class -- see post_data_recv_pool() for the measurement showing a
+  // 500ms retransmit stall on ~4.5% of PP decode barriers from exactly this
+  // empty-FIFO UC drop.
+  mesh_.post_data_recv_pool();
   fprintf(stderr, "[jaccl] reconnect rank=%d RTS done; final barrier...\n", rank_);
   fflush(stderr);
   side_channel_->all_gather<int>(0);
@@ -1032,6 +1042,11 @@ void MeshGroup::reconnect_fresh() {
 
   mesh_.post_ack_recvs(0);
   mesh_.post_p2p_retry_recvs();
+  // Section 52 (2026-08-15): same lifecycle, same rationale, for the DATA QP's
+  // sz=0 class -- see post_data_recv_pool() for the measurement showing a
+  // 500ms retransmit stall on ~4.5% of PP decode barriers from exactly this
+  // empty-FIFO UC drop.
+  mesh_.post_data_recv_pool();
 
   // Bootstrap barrier — same rationale as the ctor: neither rank may fire
   // its first ack_sync_pre before BOTH have posted their ACK recv pool

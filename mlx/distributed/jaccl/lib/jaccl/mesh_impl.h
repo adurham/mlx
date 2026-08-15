@@ -202,6 +202,20 @@ inline bool jaccl_confirmed_barrier_enabled() {
 // Split gates so pre vs post can be isolated (the pre barrier is entangled with
 // RDMA data-recv ordering; post runs after the data has drained). Either the
 // combined flag or the specific one enables each side.
+// Standing pre-posted recv pool on the DATA QP for the sz=0 size class --
+// design doc Section 52 (2026-08-15). Closes the empty-recv-FIFO UC drop
+// that cost a 500ms retransmit timer on ~4.5% of PP decode barriers; see
+// post_data_recv_pool()'s own comment for the full measurement and for why
+// a pool is used instead of a cross-rank barrier. Default ON: the failure it
+// prevents is a silent 500ms-per-occurrence throughput collapse. Set
+// MLX_JACCL_DATA_RECV_POOL=0 to A/B against the old behaviour.
+inline bool jaccl_data_recv_pool_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("MLX_JACCL_DATA_RECV_POOL");
+    return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+  }();
+  return v;
+}
 inline bool jaccl_confirmed_barrier_pre() {
   static const bool v = jaccl_confirmed_barrier_enabled() ||
       jaccl_env_true("MLX_JACCL_CONFIRMED_BARRIER_PRE");
@@ -2617,6 +2631,83 @@ class MeshImpl {
       for (int i = 0; i < ACK_RECV_POOL; i++) {
         ack_connections_[peer].post_recv(
             rbuf, make_wr_id(call_id, ACK_RECV_WR, 0, peer));
+      }
+    }
+  }
+
+  // Pre-post a standing recv pool on the DATA QP (connections_) for the
+  // sz=0 (<=4096-byte) size class -- design doc Section 52, 2026-08-15.
+  //
+  // THE BUG THIS CLOSES. PP decode showed a bimodal barrier latency:
+  //   <100ms : 29101   (healthy path is 71-122 MICROseconds)
+  //   >1s    :  1403   (4.5% of barriers)
+  // Every slow one had the identical shape on both ranks -- rank0 posts its
+  // send in ~45us, immediately observes peer_got_count=0/1, waits the FULL
+  // 500ms retransmit quiet timer, retransmits, and the retransmit SUCCEEDS.
+  // ~1403 x 0.5s = ~700s of pure stall in a single 100K-context run, which
+  // dominated decode throughput (0.48 tok/s vs 18.01 tok/s on identical
+  // config, purely as a function of how many stalls a run happened to hit).
+  //
+  // It is NOT wire loss: en3 reports Ierrs 0 / Oerrs 0 / Coll 0 on a healthy
+  // 8X / 10Gbps link. Two measurements identify it as the empty-recv-FIFO UC
+  // drop that this file's own ack_sync_pre comment already describes ("peer
+  // SEND lands at our empty data-QP recv FIFO and UC silently drops"):
+  //   - SIZE-SPECIFIC: every single retransmit is num_chunks=1; the bulk
+  //     2049-chunk transfers lose NOTHING. Only the FIRST chunk of a transfer
+  //     is exposed, because after that recv()'s own repost loop stays ahead
+  //     (RECV_INFLIGHT == SEND_INFLIGHT, so later chunks can never outrun the
+  //     reposts). A single-chunk message is 100% first-chunk, hence 100%
+  //     exposed -- exactly the observed distribution.
+  //   - SENDER-ASYMMETRIC: rank0 (the driver, which races ahead) took 670
+  //     retransmits vs rank1's 181 (3.7x). Wire loss would be symmetric; a
+  //     send-arrives-before-recv-is-posted race hits whichever side runs
+  //     ahead of its peer's recv() entry.
+  //
+  // WHY A POOL AND NOT A BARRIER. The obvious fix -- mirroring all_reduce's
+  // "post recvs -> confirmed_coord_barrier -> post sends" into the p2p path
+  // -- is WRONG here and would be worse than the bug. That barrier is keyed
+  // on call_id, which is only incidentally aligned across ranks for
+  // collectives (all ranks run them in lockstep). On the p2p path the ranks
+  // make unequal numbers of send()/recv() calls by construction, so the
+  // per-process call_id counters provably diverge and the barrier could
+  // "succeed" while pairing one rank's send #7 with the peer's recv #9 --
+  // silently certifying the WRONG ordering, where today's failure at least
+  // self-heals via retransmit. It would also convert a 500ms stall into a
+  // permanent hang whenever a matching recv() is never entered (the
+  // cancel/abort path). A standing pool needs no cross-rank key at all.
+  //
+  // WHY call_id=0 IS SAFE HERE. Like post_p2p_retry_recvs, these WRs are
+  // tagged with a call_id of 0 because a standing pool is by definition
+  // posted before any particular call exists. recv()'s poll loop skips
+  // completions whose wr_id call_id doesn't match its own, so it will ignore
+  // these -- that is intentional and harmless: their PURPOSE is to keep the
+  // hardware FIFO non-empty so an early-arriving frame is captured by the
+  // NIC rather than silently dropped by UC, not to deliver data. Payload
+  // correctness is unaffected because consume_recv() already validates every
+  // frame against the on-wire (seq, chunk) header and discards stale ones
+  // (the 2026-08-08 stale-message fix) -- call_id is a redundant second gate,
+  // not the integrity mechanism.
+  //
+  // Scoped deliberately to sz=0: buffer_size_from_message maps every message
+  // under FRAME_SIZE (4096B) to size class 0, and the small PP control
+  // messages that make up the entire observed loss population are all in it.
+  // Larger classes are demonstrably not losing frames, so pre-posting them
+  // would spend registered memory to fix a problem they do not have.
+  void post_data_recv_pool() {
+    if (!jaccl_data_recv_pool_enabled()) {
+      return;
+    }
+    if (connections_.empty()) {
+      return;
+    }
+    for (int peer = 0; peer < size_; peer++) {
+      if (peer == rank_) {
+        continue;
+      }
+      for (int b = 0; b < NUM_BUFFERS; b++) {
+        auto& rb = recv_buffer(0, b, peer);
+        zero_recv_buffer(rb);
+        connections_[peer].post_recv(rb, make_wr_id(0, RECV_WR, b, peer));
       }
     }
   }
