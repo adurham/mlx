@@ -42,6 +42,32 @@ inline bool jaccl_ack_sync_pre_enabled() {
 // Output goes to stderr. Inline so the gate-check inlines and the
 // branch is dead-code eliminated when the env var is unset (runtime
 // check is once per call site, not once per WC).
+// Per-COMPLETION CQE tracing, on its own flag (JACCL_TRACE_CQE).
+//
+// Section 75. This is deliberately NOT folded into
+// jaccl_progress_enabled(). The two [jaccl-cqe] traces fire once per
+// completion inside send()'s and recv()'s poll loops -- the hottest
+// path in the transport, with an fflush each. Section 74 added one more
+// write to those same loops and the cluster dropped to zero tokens with
+// "drain_acks STALLED ... no forward progress for >8000ms", which means
+// the pre-existing writes are inside the budget that blew: every
+// progress-traced run in this campaign was paying per-CQE stderr I/O.
+//
+// Splitting the flag makes JACCL_TRACE_PROGRESS safe to leave on for
+// the per-call BARRIER/ROUND lines (which are cheap and carry the
+// numbers this investigation actually reads), while the per-CQE firehose
+// stays opt-in for the rare case where individual completions matter.
+inline bool jaccl_cqe_trace_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char* e = std::getenv("JACCL_TRACE_CQE");
+    enabled = (e != nullptr && e[0] == '1' && e[1] == '\0');
+    checked = true;
+  }
+  return enabled;
+}
+
 inline bool jaccl_progress_enabled() {
   static bool checked = false;
   static bool enabled = false;
@@ -1470,6 +1496,7 @@ class MeshImpl {
       return;
     }
     bool _prog = jaccl_progress_enabled();
+    bool _cqe_trace = jaccl_cqe_trace_enabled();
     if (_prog) {
       std::fprintf(
           stderr,
@@ -2010,6 +2037,7 @@ class MeshImpl {
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
+    bool _cqe_trace = jaccl_cqe_trace_enabled();
     // ROOT-CAUSE FIX (2026-08-09, design doc Section 39, direct user
     // correction of the earlier "extend the deadline" instinct): this
     // loop used to have an ADDITIONAL, unconditional fatal cap
@@ -2163,7 +2191,15 @@ class MeshImpl {
           // anything for this call_id at all. Gated on the same
           // JACCL_TRACE_PROGRESS flag as the rest of this investigation's
           // instrumentation -- zero cost otherwise.
-          if (_prog) {
+          //
+          // Section 75: re-gated onto its OWN flag (JACCL_TRACE_CQE).
+          // This fprintf+fflush fires once PER COMPLETION inside the
+          // hottest loop in the transport. Section 74 added a second
+          // such write here and the cluster went to zero tokens with
+          // drain_acks STALLED, which means this one is also inside the
+          // budget it blew -- every progress-traced run in this campaign
+          // paid it. Progress tracing must not imply per-CQE I/O.
+          if (_cqe_trace) {
             std::fprintf(
                 stderr,
                 "[jaccl-cqe] send() CQE rank=%d this_call_id=%u "
@@ -2182,6 +2218,13 @@ class MeshImpl {
             continue; // stale (previous call/round)
           }
           if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != SEND_WR) {
+            // Section 75: mirror of recv()'s counter. No I/O here --
+            // see that comment and Section 74 for why inline logging in
+            // this loop is not viable.
+            if (wc[i].status == IBV_WC_SUCCESS &&
+                wr_id_work_type(wc[i].wr_id) == RECV_WR) {
+              ++_xconsume_recv_in_send;
+            }
             continue; // dropped/erred/unexpected — barrier+retransmit recovers
           }
           int wb = wr_id_buff(wc[i].wr_id);
@@ -2429,6 +2472,7 @@ class MeshImpl {
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
+    bool _cqe_trace = jaccl_cqe_trace_enabled();
     // ROOT-CAUSE FIX (2026-08-09, design doc Section 39): mirrors
     // send()'s own fix above -- see that comment for the full
     // rationale (real-hardware evidence of a legitimate 29-round/15s
@@ -2514,8 +2558,9 @@ class MeshImpl {
         int n = connections_[src].poll(16, wc);
         for (int i = 0; i < n; i++) {
           // DIAGNOSTIC (2026-08-10, Section 43 continued): mirrors send()'s
-          // own CQE trace above -- see that comment for the full rationale.
-          if (_prog) {
+          // own CQE trace above -- see that comment for the full rationale,
+          // including Section 75's note on why it has its own flag.
+          if (_cqe_trace) {
             std::fprintf(
                 stderr,
                 "[jaccl-cqe] recv() CQE rank=%d this_call_id=%u "
@@ -2534,6 +2579,23 @@ class MeshImpl {
             continue;
           }
           if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != RECV_WR) {
+            // Section 75: count cross-consumed CQEs with NO I/O here.
+            // send() and recv() share one completion queue per QP
+            // (rdma.cpp sets init_attr.send_cq == init_attr.recv_cq), so
+            // a CQE is reaped by whichever loop polls first. A SUCCESSFUL
+            // completion of the wrong work_type is therefore not an
+            // error -- on UC a genuine wire drop yields no CQE at all --
+            // it is the other loop's notification being thrown away,
+            // which presents as a lost frame and forces a retransmit.
+            //
+            // Section 74 tried to log this inline and the added fprintf
+            // per discarded CQE blew the 8s drain_acks budget, producing
+            // zero tokens. The counter is now incremented here and
+            // reported once per call from the BARRIER line below.
+            if (wc[i].status == IBV_WC_SUCCESS &&
+                wr_id_work_type(wc[i].wr_id) == SEND_WR) {
+              ++_xconsume_send_in_recv;
+            }
             continue;
           }
           int wb = wr_id_buff(wc[i].wr_id);
@@ -2569,7 +2631,7 @@ class MeshImpl {
         std::fprintf(
             stderr,
             "[jaccl-prog] recv() BARRIER rank=%d call_id=%u src=%d round=%d "
-            "got_count=%d/%d all_recv=%d/%d elapsed_us=%llu\n",
+            "got_count=%d/%d all_recv=%d/%d elapsed_us=%llu xconsume=%d/%d\n",
             rank_,
             call_id,
             src,
@@ -2578,7 +2640,9 @@ class MeshImpl {
             num_chunks,
             all_recv,
             num_chunks,
-            (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0));
+            (unsigned long long)mach_ticks_to_us(mach_absolute_time() - _t0),
+            _xconsume_send_in_recv,
+            _xconsume_recv_in_send);
         std::fflush(stderr);
       }
       if (all_recv >= num_chunks) {
@@ -3357,6 +3421,7 @@ class MeshImpl {
       return;
     }
     bool _prog = jaccl_progress_enabled();
+    bool _cqe_trace = jaccl_cqe_trace_enabled();
     int num_peers = size_ - 1;
     int in_flight = 2 * num_peers;
     bool has_ack = !ack_connections_.empty();
@@ -3410,6 +3475,7 @@ class MeshImpl {
 
   void drain_acks(uint32_t call_id, int in_flight) {
     bool _prog = jaccl_progress_enabled();
+    bool _cqe_trace = jaccl_cqe_trace_enabled();
     int _iters = 0;
     // Split in_flight into per-side accounting (always 2 * num_peers).
     int need_send = in_flight / 2;
@@ -3725,6 +3791,22 @@ class MeshImpl {
   // use, keeping the fix to the header-pack/unpack call sites only.
   uint16_t send_seq_[2] = {0, 0}; // indexed by dst rank
   uint16_t recv_seq_[2] = {0, 0}; // indexed by src rank
+
+  // Section 75 cross-consumption counters. send() and recv() share ONE
+  // completion queue per QP (rdma.cpp: init_attr.send_cq ==
+  // init_attr.recv_cq) and a CQE is consumed exactly once, by whichever
+  // loop reaps it first. These count SUCCESSFUL completions of the wrong
+  // work_type reaching a loop that then discards them -- i.e. a real
+  // transfer whose notification was thrown away, which the other side
+  // then has to recover via the expensive retransmit path.
+  //
+  // Plain ints, deliberately: std::atomic deletes MeshImpl's implicit
+  // copy-assignment and reconnect_fresh() does `mesh_ = MeshImpl(...)`.
+  // Incremented with NO I/O in the poll loops (Section 74's inline
+  // fprintf broke the 8s drain_acks budget and produced zero tokens);
+  // read once per call from the existing BARRIER trace lines.
+  mutable int _xconsume_recv_in_send{0};
+  mutable int _xconsume_send_in_recv{0};
 
  public:
   // Section 68 diagnostic. Exposes the two sequence counters so the
