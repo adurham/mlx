@@ -2182,6 +2182,31 @@ class MeshImpl {
             continue; // stale (previous call/round)
           }
           if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != SEND_WR) {
+            // Section 74 PROBE. init_attr.send_cq == init_attr.recv_cq
+            // (rdma.cpp:171-172), so send() and recv() share ONE
+            // completion queue on this QP. A CQE is consumed exactly
+            // once, by whichever loop reaps it. A SUCCESSFUL RECV
+            // completion arriving here is therefore not an error -- it
+            // is recv()'s data, and discarding it makes the frame look
+            // lost to recv() even though the wire delivered it.
+            //
+            // Distinguish that from a genuine error: on UC a real wire
+            // drop produces NO CQE at all, so status==SUCCESS with the
+            // wrong work_type can only mean the data actually arrived.
+            if (wc[i].status == IBV_WC_SUCCESS &&
+                wr_id_work_type(wc[i].wr_id) == RECV_WR) {
+              _xconsume_recv_in_send.fetch_add(1, std::memory_order_relaxed);
+              if (_prog) {
+                std::fprintf(
+                    stderr,
+                    "[jaccl-x74] send() REAPED A RECV CQE rank=%d "
+                    "this_call_id=%u wc_call_id=%u buff=%d total=%d\n",
+                    rank_, call_id, wr_id_call_id(wc[i].wr_id),
+                    wr_id_buff(wc[i].wr_id),
+                    _xconsume_recv_in_send.load(std::memory_order_relaxed));
+                std::fflush(stderr);
+              }
+            }
             continue; // dropped/erred/unexpected — barrier+retransmit recovers
           }
           int wb = wr_id_buff(wc[i].wr_id);
@@ -2534,6 +2559,24 @@ class MeshImpl {
             continue;
           }
           if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != RECV_WR) {
+            // Section 74 PROBE, mirror of send()'s. A successful SEND
+            // completion reaped here belongs to send(), which is now
+            // waiting on a completion that already arrived and was
+            // thrown away. Same shared-CQ mechanism, opposite direction.
+            if (wc[i].status == IBV_WC_SUCCESS &&
+                wr_id_work_type(wc[i].wr_id) == SEND_WR) {
+              _xconsume_send_in_recv.fetch_add(1, std::memory_order_relaxed);
+              if (_prog) {
+                std::fprintf(
+                    stderr,
+                    "[jaccl-x74] recv() REAPED A SEND CQE rank=%d "
+                    "this_call_id=%u wc_call_id=%u buff=%d total=%d\n",
+                    rank_, call_id, wr_id_call_id(wc[i].wr_id),
+                    wr_id_buff(wc[i].wr_id),
+                    _xconsume_send_in_recv.load(std::memory_order_relaxed));
+                std::fflush(stderr);
+              }
+            }
             continue;
           }
           int wb = wr_id_buff(wc[i].wr_id);
@@ -3725,6 +3768,19 @@ class MeshImpl {
   // use, keeping the fix to the header-pack/unpack call sites only.
   uint16_t send_seq_[2] = {0, 0}; // indexed by dst rank
   uint16_t recv_seq_[2] = {0, 0}; // indexed by src rank
+
+  // Section 74 probe counters. send() and recv() share ONE completion
+  // queue per QP (rdma.cpp:171-172 set init_attr.send_cq ==
+  // init_attr.recv_cq), and a CQE is consumed exactly once by whichever
+  // poll loop reaps it first. These count the cross-consumptions: a
+  // SUCCESSFUL completion of the wrong work_type reaching a loop that
+  // then discards it. On UC a genuine wire drop yields NO CQE at all, so
+  // status==SUCCESS with the wrong type means the transfer really
+  // happened and the notification was thrown away -- which presents to
+  // the other side as a lost frame and triggers the expensive retransmit
+  // path. Atomic because the two loops can run on different threads.
+  mutable std::atomic<int> _xconsume_recv_in_send{0};
+  mutable std::atomic<int> _xconsume_send_in_recv{0};
 
  public:
   // Section 68 diagnostic. Exposes the two sequence counters so the
