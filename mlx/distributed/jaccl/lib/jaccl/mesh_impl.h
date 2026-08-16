@@ -2933,7 +2933,27 @@ class MeshImpl {
   // and recv_buffer()'s sz index), so this registers no new memory; it only
   // keeps the hardware FIFO non-empty so an early-arriving frame is captured
   // by the NIC instead of being silently dropped by UC.
-  static constexpr int DATA_RECV_POOL_SIZE_CLASSES = 4;
+  // REVERTED TO 1 (Section 80). Section 64 widened this from 1 to 4 size
+  // classes to cover the sz=2 decode activation send. That was the bug.
+  //
+  // 4 classes x NUM_BUFFERS(8) = 32 WRs = the ENTIRE MAX_RECV_WR queue
+  // depth for the QP. The standing pool therefore consumed every recv
+  // slot, leaving none for the per-call post_recv_buff(). On UC a send
+  // that finds no matching receive WR is dropped silently, so EVERY
+  // first send was lost, the receiver burned the full quiet period, and
+  // the retransmit then landed in a recycled slot -- the "systematic
+  // 100% first-send loss" that eight sections chased as a fabric defect.
+  //
+  // Measured, same build, same 100ms drain, only this value changed:
+  //   4 classes (32 WRs): 0.65 tok/s
+  //   1 class   ( 8 WRs): 22.32 tok/s   needle YES both
+  //
+  // Section 66 tested pool-ON vs pool-OFF and found them identical, which
+  // looked like an exoneration. It was measured at the 500ms timer, where
+  // a full 500ms stall per loss swamped the difference. The bug only
+  // becomes visible once the quiet period is small enough for the loss
+  // rate to dominate.
+  static constexpr int DATA_RECV_POOL_SIZE_CLASSES = 1;
 
   void post_data_recv_pool() {
     if (!jaccl_data_recv_pool_enabled()) {
