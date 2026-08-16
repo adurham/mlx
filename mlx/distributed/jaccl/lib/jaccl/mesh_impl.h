@@ -2121,12 +2121,6 @@ class MeshImpl {
             std::fflush(stderr);
           }
           if (wr_id_call_id(wc[i].wr_id) != call_id) {
-            // Section 65: same standing-pool replenishment as recv()'s
-            // loop -- send() polls the SAME data QP, so a pool WR
-            // consumed by an inbound frame can surface here too. Re-post
-            // it rather than letting the pool silently drain. No-op for
-            // ordinary stale completions.
-            repost_data_pool_wr(wc[i].wr_id, dst);
             continue; // stale (previous call/round)
           }
           if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != SEND_WR) {
@@ -2464,13 +2458,6 @@ class MeshImpl {
             std::fflush(stderr);
           }
           if (wr_id_call_id(wc[i].wr_id) != call_id) {
-            // Section 65: a standing-pool WR just absorbed an
-            // early-arriving frame. Re-post it immediately -- otherwise
-            // the pool drains and the empty-FIFO UC drop this pool
-            // exists to prevent comes straight back (measured: fast for
-            // ~30 tokens, then 53 lost first-sends once exhausted).
-            // No-op for any non-pool completion.
-            repost_data_pool_wr(wc[i].wr_id, src);
             continue;
           }
           if (wc[i].status != IBV_WC_SUCCESS || wr_id_work_type(wc[i].wr_id) != RECV_WR) {
@@ -2739,49 +2726,6 @@ class MeshImpl {
   // by the NIC instead of being silently dropped by UC.
   static constexpr int DATA_RECV_POOL_SIZE_CLASSES = 4;
 
-  // Standing-pool WRs are tagged with a call_id of
-  // DATA_POOL_CALL_ID_BASE + sz rather than a plain 0.
-  //
-  // WHY (design doc Section 65). A pool WR consumed by an early-arriving
-  // frame must be RE-POSTED, or the pool drains and the empty-FIFO UC drop
-  // returns. Measured directly: widening the pool alone gave 23.32 tok/s with
-  // ZERO lost sends for ~30 tokens, then collapsed back to 0.48 tok/s with 53
-  // `peer_got_count=0/1` events once the pool was exhausted. A bigger bucket
-  // with the same hole.
-  //
-  // Re-posting requires knowing which size class the completion came from,
-  // and wr_id encodes only (call_id, work_type, buff, peer) -- there is no sz
-  // field (see make_wr_id in rdma.h). Encoding sz in the call_id field of
-  // pool WRs recovers it without a wire-format change. The base is chosen far
-  // above any real call_id so `wr_id_call_id(...) != call_id` still rejects
-  // these from every per-call poll loop exactly as before -- pool WRs are
-  // still never mistaken for call data.
-  static constexpr uint32_t DATA_POOL_CALL_ID_BASE = 0xFFFF0000u;
-
-  // Re-post a consumed standing-pool RECV WR. No-op for any completion that
-  // is not a pool WR, so poll loops can call it unconditionally on the
-  // completions they would otherwise discard.
-  bool repost_data_pool_wr(uint64_t wr_id, int peer) {
-    if (!jaccl_data_recv_pool_enabled()) {
-      return false;
-    }
-    const uint32_t cid = wr_id_call_id(wr_id);
-    if (cid < DATA_POOL_CALL_ID_BASE ||
-        cid >= DATA_POOL_CALL_ID_BASE + DATA_RECV_POOL_SIZE_CLASSES) {
-      return false;
-    }
-    if (connections_.empty() || peer < 0 || peer >= size_ || peer == rank_) {
-      return false;
-    }
-    const int sz = static_cast<int>(cid - DATA_POOL_CALL_ID_BASE);
-    const int b = wr_id_buff(wr_id);
-    auto& rb = recv_buffer(sz, b, peer);
-    zero_recv_buffer(rb);
-    connections_[peer].post_recv(
-        rb, make_wr_id(DATA_POOL_CALL_ID_BASE + sz, RECV_WR, b, peer));
-    return true;
-  }
-
   void post_data_recv_pool() {
     if (!jaccl_data_recv_pool_enabled()) {
       return;
@@ -2797,8 +2741,7 @@ class MeshImpl {
         for (int b = 0; b < NUM_BUFFERS; b++) {
           auto& rb = recv_buffer(sz, b, peer);
           zero_recv_buffer(rb);
-          connections_[peer].post_recv(
-              rb, make_wr_id(DATA_POOL_CALL_ID_BASE + sz, RECV_WR, b, peer));
+          connections_[peer].post_recv(rb, make_wr_id(0, RECV_WR, b, peer));
         }
       }
     }
