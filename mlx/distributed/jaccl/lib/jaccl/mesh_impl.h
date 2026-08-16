@@ -274,7 +274,17 @@ inline uint64_t jaccl_p2p_drain_quiet_for(int num_chunks) {
   if (pinned != 0) {
     return pinned;
   }
-  const uint64_t floor_us = 2000ULL;
+  // FLOOR CORRECTED to 100ms (Section 78). The first version used 2ms,
+  // reasoning from the 150us healthy round trip. That broke 70K outright:
+  // at depth the traffic mix is dominated by SMALL messages (measured at
+  // 70K: 316 calls of num_chunks=1, 36 of 5, 15 of 2049), so a
+  // chunk-count-scaled quiet period makes exactly the messages that
+  // matter LESS patient -- 1-chunk control traffic went from 100ms to
+  // 3ms, a 33x cut, and generation stopped. 100ms is the value already
+  // verified safe at both depths (Section 76), so it is the floor; the
+  // per-chunk term only ever ADDS patience for genuinely large
+  // transfers, which is the direction that was always safe.
+  const uint64_t floor_us = 100000ULL;
   const uint64_t per_chunk_us = 1000ULL;
   const uint64_t n = num_chunks > 0 ? static_cast<uint64_t>(num_chunks) : 1ULL;
   const uint64_t v = floor_us + per_chunk_us * n;
