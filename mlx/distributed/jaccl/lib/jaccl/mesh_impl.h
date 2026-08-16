@@ -206,15 +206,38 @@ inline uint64_t jaccl_ack_retransmit_us() {
 // microseconds, so they can afford a far tighter quiet period without
 // touching the collective path's timing at all.
 //
-// Default 25ms: ~170x the observed healthy round trip (still far above
-// any plausible in-flight window, so it cannot mistake slow for lost),
-// while cutting the per-drop penalty from ~1.0s to ~50ms -- a 20x
-// reduction in the amplifier. Set MLX_JACCL_P2P_DRAIN_QUIET_US to
-// override, or to 500000 to restore the old behaviour exactly.
+// DEFAULT IS 100ms, AND THE VALUE IS DEPTH-SENSITIVE (Section 76).
+//
+// The first version of this shipped 25ms, validated only at 14K context
+// where it is a 48x win (0.47 -> 22.8 tok/s, needle-verified). At 70K it
+// BREAKS GENERATION ENTIRELY -- zero tokens, needle FAIL, with both
+// ranks throwing "drain_acks/all_gather STALLED ... no forward progress
+// for >8000ms". Deeper context means larger activations and more chunks
+// per transfer, so the real in-flight window grows; 25ms starts firing
+// below it and declares live traffic lost. That is precisely the
+// Section 51 failure mode at a different scale, and shipping a timing
+// constant validated at ONE operating point is what caused it.
+//
+// Measured, all needle-gated:
+//
+//   14K ctx:   25ms -> 22.61-22.84 tok/s YES |  500ms -> 0.47 tok/s YES
+//   70K ctx:   25ms ->  0.00 tok/s      NO   |  500ms -> 0.47 tok/s YES
+//              100ms ->  0.59 tok/s     YES  (prefill 248.8 tok/s)
+//
+// 100ms is the tightest value verified safe at BOTH depths tested, and
+// at 70K it is still 26% faster than the old 500ms. It remains ~680x the
+// healthy p2p round trip (69-150us), so it retains most of the amplifier
+// reduction while keeping a wide margin over the real in-flight window.
+//
+// If you lower this, re-verify at 70K AND deeper -- a value that looks
+// good at 14K can be catastrophic at depth, and the per-token probe will
+// happily report a throughput number for a stream that never terminates.
+// Always gate on the needle harness. Set MLX_JACCL_P2P_DRAIN_QUIET_US to
+// override; 500000 restores the original shared-timer behaviour.
 inline uint64_t jaccl_p2p_drain_quiet_us() {
   static const uint64_t v = [] {
     const char* e = std::getenv("MLX_JACCL_P2P_DRAIN_QUIET_US");
-    return e ? std::strtoull(e, nullptr, 10) : 25000ULL;
+    return e ? std::strtoull(e, nullptr, 10) : 100000ULL;
   }();
   return v;
 }
