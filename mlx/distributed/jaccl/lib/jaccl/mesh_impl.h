@@ -2688,11 +2688,44 @@ class MeshImpl {
   // (the 2026-08-08 stale-message fix) -- call_id is a redundant second gate,
   // not the integrity mechanism.
   //
-  // Scoped deliberately to sz=0: buffer_size_from_message maps every message
-  // under FRAME_SIZE (4096B) to size class 0, and the small PP control
-  // messages that make up the entire observed loss population are all in it.
-  // Larger classes are demonstrably not losing frames, so pre-posting them
-  // would spend registered memory to fix a problem they do not have.
+  // SCOPE (CORRECTED 2026-08-15, design doc Section 64). This pool was
+  // originally scoped to sz=0 on the reasoning that "buffer_size_from_message
+  // maps every message under FRAME_SIZE (4096B) to size class 0, and the
+  // small PP control messages that make up the entire observed loss
+  // population are all in it. Larger classes are demonstrably not losing
+  // frames."
+  //
+  // That reasoning was WRONG, and the counter-evidence is direct. Section 52's
+  // sz=0 pool drove true lost-send stalls from 1403 to zero FOR THE TRAFFIC IT
+  // COVERED, but Section 60 then measured 32 surviving `peer_got_count=0/1`
+  // events (peer received NOTHING) after that fix had landed, and Section 63/64
+  // traced them to the PP batched-decode per-token activation send -- which
+  // runs at sz=2 (65536B, `[jaccl-reliable] ENTER ... sz=2 total_bytes=65536`),
+  // not sz=0. "Larger classes are demonstrably not losing frames" was an
+  // inference from the pre-fix loss population, not a measurement of the
+  // post-fix one.
+  //
+  // Cost of each such loss is ~500ms: the retransmit is posted ~1us after the
+  // barrier reports the drop, but the round-1 barrier confirming it does not
+  // return for a full retransmit quiet period, on a link whose healthy round
+  // trip is 56-150us. At roughly one loss per decode token that is the entire
+  // ~60x requirement-3 decode shortfall.
+  //
+  // So the pool now covers the size classes the PP data path actually uses,
+  // not just sz=0.
+  //
+  // WHY NOT ALL EIGHT CLASSES. `MAX_RECV_WR` is 32 per QP (rdma.h) and each
+  // class costs NUM_BUFFERS=8 WRs, so the hard ceiling is 4 classes per peer;
+  // posting all 8 would silently overrun the queue depth. sz 0..3 covers
+  // 4096B through 32768B per frame -- which spans both the small PP control
+  // messages Section 52 fixed AND the sz=2 (65536B total, 16380B chunks)
+  // decode activation send that Sections 63/64 measured losing frames. The
+  // buffers themselves are already allocated for every class (see buffers_
+  // and recv_buffer()'s sz index), so this registers no new memory; it only
+  // keeps the hardware FIFO non-empty so an early-arriving frame is captured
+  // by the NIC instead of being silently dropped by UC.
+  static constexpr int DATA_RECV_POOL_SIZE_CLASSES = 4;
+
   void post_data_recv_pool() {
     if (!jaccl_data_recv_pool_enabled()) {
       return;
@@ -2704,10 +2737,12 @@ class MeshImpl {
       if (peer == rank_) {
         continue;
       }
-      for (int b = 0; b < NUM_BUFFERS; b++) {
-        auto& rb = recv_buffer(0, b, peer);
-        zero_recv_buffer(rb);
-        connections_[peer].post_recv(rb, make_wr_id(0, RECV_WR, b, peer));
+      for (int sz = 0; sz < DATA_RECV_POOL_SIZE_CLASSES; sz++) {
+        for (int b = 0; b < NUM_BUFFERS; b++) {
+          auto& rb = recv_buffer(sz, b, peer);
+          zero_recv_buffer(rb);
+          connections_[peer].post_recv(rb, make_wr_id(0, RECV_WR, b, peer));
+        }
       }
     }
   }
