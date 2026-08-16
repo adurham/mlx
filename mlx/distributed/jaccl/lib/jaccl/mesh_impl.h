@@ -237,9 +237,48 @@ inline uint64_t jaccl_ack_retransmit_us() {
 inline uint64_t jaccl_p2p_drain_quiet_us() {
   static const uint64_t v = [] {
     const char* e = std::getenv("MLX_JACCL_P2P_DRAIN_QUIET_US");
-    return e ? std::strtoull(e, nullptr, 10) : 100000ULL;
+    return e ? std::strtoull(e, nullptr, 10) : 0ULL; // 0 = adaptive
   }();
   return v;
+}
+
+// ADAPTIVE quiet period (Section 77). Returns the wall-clock quiet time
+// this specific transfer should tolerate before declaring a frame lost.
+//
+// WHY ADAPTIVE. A fixed constant provably cannot serve both ends of the
+// range. Measured, all needle-gated:
+//
+//   depth    25ms            100ms      500ms
+//   14K      22.6-22.8 tok/s  0.65       0.47
+//   70K      0.00 (FAIL)      0.59       0.47
+//
+// 25ms wins 14K by ~35x and BREAKS generation at 70K; 100ms is safe
+// everywhere and wins almost nothing. The right quiet period is not a
+// property of the cluster, it is a property of the TRANSFER: it must sit
+// just above the real in-flight window, which grows with chunk count.
+//
+// So scale it: a floor for the fixed per-frame latency, plus a per-chunk
+// term for the pipeline depth actually in flight. The floor (2ms) is
+// ~13x the 150us healthy round trip. The slope (1ms/chunk) covers the
+// serialization of up to SEND_INFLIGHT concurrent 16KB frames plus the
+// receiver's own drain. A 1-chunk control message gets ~3ms; the 5-chunk
+// decode activation send gets ~7ms; a 500-chunk deep-context transfer
+// gets ~502ms, i.e. it naturally recovers the old conservative value
+// exactly where that value was actually needed.
+//
+// Capped at the legacy 500ms so this can never be SLOWER than the
+// behaviour it replaces. Set MLX_JACCL_P2P_DRAIN_QUIET_US to a nonzero
+// value to pin a fixed period instead (500000 = original behaviour).
+inline uint64_t jaccl_p2p_drain_quiet_for(int num_chunks) {
+  const uint64_t pinned = jaccl_p2p_drain_quiet_us();
+  if (pinned != 0) {
+    return pinned;
+  }
+  const uint64_t floor_us = 2000ULL;
+  const uint64_t per_chunk_us = 1000ULL;
+  const uint64_t n = num_chunks > 0 ? static_cast<uint64_t>(num_chunks) : 1ULL;
+  const uint64_t v = floor_us + per_chunk_us * n;
+  return v > 500000ULL ? 500000ULL : v;
 }
 inline int jaccl_ack_retransmit_max() {
   static const int v = [] {
@@ -2056,7 +2095,7 @@ class MeshImpl {
     // jaccl_p2p_drain_quiet_us()'s comment -- this loop's real round trip
     // is 69-150us, so the old shared 500ms timer was purely the cost of
     // noticing a dropped frame, at ~5000x the actual latency.
-    const uint64_t drain_quiet_us = jaccl_p2p_drain_quiet_us();
+    const uint64_t drain_quiet_us = jaccl_p2p_drain_quiet_for(num_chunks);
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
@@ -2491,7 +2530,7 @@ class MeshImpl {
     // jaccl_p2p_drain_quiet_us()'s comment -- this loop's real round trip
     // is 69-150us, so the old shared 500ms timer was purely the cost of
     // noticing a dropped frame, at ~5000x the actual latency.
-    const uint64_t drain_quiet_us = jaccl_p2p_drain_quiet_us();
+    const uint64_t drain_quiet_us = jaccl_p2p_drain_quiet_for(num_chunks);
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
