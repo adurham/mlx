@@ -1902,6 +1902,20 @@ class MeshImpl {
     // logical send() call to this peer, packed into the header's upper
     // 16 bits alongside the existing chunk index in the lower 16.
     const uint32_t seq = static_cast<uint32_t>(send_seq_[dst]++);
+    if (jaccl_progress_enabled()) {
+      // Section 69: per-call counter trace. Section 68 refuted reconnect
+      // as the origin of the constant off-by-one, so the divergence
+      // happens during ordinary early traffic. Logging every increment
+      // on both ranks lets the FIRST divergent call be identified
+      // directly by diffing the two ranks' streams, instead of auditing
+      // send/recv pairs by hand (which found every control-message pair
+      // balanced).
+      std::fprintf(
+          stderr,
+          "[jaccl-seq69] SEND rank=%d dst=%d seq=%u call_id=%u bytes=%lld\n",
+          rank_, dst, seq, call_id, (long long)n_bytes);
+      std::fflush(stderr);
+    }
     const int SEND_INFLIGHT = (sz <= 2)
         ? std::max(1, std::min(jaccl_reliable_inflight(), NUM_BUFFERS))
         : 1;
@@ -2294,6 +2308,17 @@ class MeshImpl {
     // with the peer's send_seq_[this_rank] on THEIR side, since both
     // are per-(peer, direction) counters on the same ordered channel.
     const uint32_t expected_seq = static_cast<uint32_t>(recv_seq_[src]++);
+    if (jaccl_progress_enabled()) {
+      // Section 69: the RECV half of the counter trace. Diff this
+      // stream against the peer's SEND stream to find the first call
+      // where the two counters stop agreeing.
+      std::fprintf(
+          stderr,
+          "[jaccl-seq69] RECV rank=%d src=%d expected_seq=%u call_id=%u "
+          "bytes=%lld\n",
+          rank_, src, expected_seq, call_id, (long long)n_bytes);
+      std::fflush(stderr);
+    }
 
     std::vector<uint8_t> got(num_chunks, 0);
     int all_recv = 0;
