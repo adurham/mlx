@@ -152,6 +152,46 @@ inline uint64_t jaccl_ack_retransmit_us() {
   }();
   return v;
 }
+
+// Quiet period for the p2p send()/recv() DRAIN loops specifically,
+// separate from the collective ack retransmit timer above.
+//
+// WHY THIS IS SPLIT OUT (design doc Section 71). Both loops previously
+// reused jaccl_ack_retransmit_us() (500ms). Measured consequence on the
+// PP batched-decode path: when the first send of a token is genuinely
+// lost on the wire (a real, silent UC drop -- UC has no flow control and
+// no NAK), the receiver sits ~525ms in its drain loop waiting for a
+// chunk that will never arrive, and the sender then waits its own 500ms
+// before retransmitting. Recovery from ONE dropped frame therefore costs
+// ~1.0s, and at roughly one drop per decode token that is the entire
+// ~60x decode-throughput shortfall (0.47 tok/s against a 30 tok/s bar).
+//
+// Healthy calls on this link complete in 69-150us end to end, and p50
+// barrier latency is 39us -- so 500ms is ~5000x the real round trip.
+// The timer is not protecting against anything at that scale; it is
+// purely the cost of NOTICING a drop.
+//
+// Section 51 already proved that lowering the GLOBAL retransmit timer to
+// 10ms breaks generation outright: at that value it fires below the real
+// round trip for large collective transfers and retransmits frames that
+// are merely in flight, producing zero output. That result is why this
+// is a SEPARATE knob rather than a change to the value above -- the p2p
+// drain loops are the only place where the measured round trip is
+// microseconds, so they can afford a far tighter quiet period without
+// touching the collective path's timing at all.
+//
+// Default 25ms: ~170x the observed healthy round trip (still far above
+// any plausible in-flight window, so it cannot mistake slow for lost),
+// while cutting the per-drop penalty from ~1.0s to ~50ms -- a 20x
+// reduction in the amplifier. Set MLX_JACCL_P2P_DRAIN_QUIET_US to
+// override, or to 500000 to restore the old behaviour exactly.
+inline uint64_t jaccl_p2p_drain_quiet_us() {
+  static const uint64_t v = [] {
+    const char* e = std::getenv("MLX_JACCL_P2P_DRAIN_QUIET_US");
+    return e ? std::strtoull(e, nullptr, 10) : 25000ULL;
+  }();
+  return v;
+}
 inline int jaccl_ack_retransmit_max() {
   static const int v = [] {
     const char* e = std::getenv("MLX_JACCL_ACK_RETRANSMIT_MAX");
@@ -1962,7 +2002,11 @@ class MeshImpl {
 
     const uint64_t _t0 = mach_absolute_time();
     const uint64_t _deadline_us = 15000000;
-    const uint64_t drain_quiet_us = jaccl_ack_retransmit_us();
+    // Section 71: p2p-specific quiet period. See
+    // jaccl_p2p_drain_quiet_us()'s comment -- this loop's real round trip
+    // is 69-150us, so the old shared 500ms timer was purely the cost of
+    // noticing a dropped frame, at ~5000x the actual latency.
+    const uint64_t drain_quiet_us = jaccl_p2p_drain_quiet_us();
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
@@ -2377,7 +2421,11 @@ class MeshImpl {
 
     const uint64_t _t0 = mach_absolute_time();
     const uint64_t _deadline_us = 15000000;
-    const uint64_t drain_quiet_us = jaccl_ack_retransmit_us();
+    // Section 71: p2p-specific quiet period. See
+    // jaccl_p2p_drain_quiet_us()'s comment -- this loop's real round trip
+    // is 69-150us, so the old shared 500ms timer was purely the cost of
+    // noticing a dropped frame, at ~5000x the actual latency.
+    const uint64_t drain_quiet_us = jaccl_p2p_drain_quiet_us();
     const int max_rounds = std::max(8, jaccl_ack_retransmit_max());
 
     bool _prog = jaccl_progress_enabled();
