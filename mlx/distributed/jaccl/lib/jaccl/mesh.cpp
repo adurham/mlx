@@ -930,6 +930,22 @@ void MeshGroup::reconnect() {
 }
 
 void MeshGroup::reconnect_fresh() {
+  // Section 68 diagnostic: capture the sequence counters BEFORE the
+  // MeshImpl rebuild below zeroes them. Paired with the post-rebuild log
+  // and the peer's own copy of both, this shows directly whether the
+  // reset is unilateral (this rank zeroes, peer keeps counting) or
+  // symmetric -- which is what distinguishes "reconnect desyncs the
+  // counters" from "the offset comes from a single call counted on one
+  // side only". See send_seq_for()'s comment in mesh_impl.h.
+  const int _peer68 = (rank_ + 1) % size_;
+  const unsigned _pre_send68 = mesh_.send_seq_for(_peer68);
+  const unsigned _pre_recv68 = mesh_.recv_seq_for(_peer68);
+  std::fprintf(
+      stderr,
+      "[jaccl-seq68] reconnect_fresh PRE rank=%d peer=%d send_seq=%u "
+      "recv_seq=%u\n",
+      rank_, _peer68, _pre_send68, _pre_recv68);
+  std::fflush(stderr);
   fprintf(
       stderr,
       "[jaccl] reconnect_fresh rank=%d ENTER (size=%d) — closing device "
@@ -999,6 +1015,38 @@ void MeshGroup::reconnect_fresh() {
     return side_channel_->all_gather(info);
   });
   side_channel_->all_gather<int>(0);
+
+  // Section 68 diagnostic: exchange the PRE-rebuild counters over the
+  // side channel that both ranks already meet on. This is the one
+  // measurement that distinguishes the candidate mechanisms, because it
+  // shows BOTH ranks' state at the moment of divergence rather than a
+  // downstream symptom:
+  //   - this rank nonzero, peer zero (or vice versa) -> the reset is
+  //     UNILATERAL, and the deltas should equal the persistent offsets
+  //     seen in the discard log.
+  //   - both zero -> the reset is symmetric and the off-by-one comes
+  //     from somewhere else (most likely a single in-flight call counted
+  //     by the sender but never delivered to the receiver).
+  //   - deltas that do not match the observed offset -> the mechanism is
+  //     downstream of reconnect entirely.
+  {
+    // Two SCALAR all_gathers rather than one container gather. The
+    // container overload sends a length-prefix round first and this
+    // socket has NO framing (see all_gather()'s own warning in rdma.h),
+    // so a scalar exchange is the smaller, safer diagnostic.
+    const std::vector<int> _sends68 =
+        side_channel_->all_gather<int>(static_cast<int>(_pre_send68));
+    const std::vector<int> _recvs68 =
+        side_channel_->all_gather<int>(static_cast<int>(_pre_recv68));
+    for (size_t i = 0; i < _sends68.size() && i < _recvs68.size(); i++) {
+      std::fprintf(
+          stderr,
+          "[jaccl-seq68] reconnect_fresh BARRIER observer_rank=%d "
+          "of_rank=%zu send_seq=%d recv_seq=%d\n",
+          rank_, i, _sends68[i], _recvs68[i]);
+    }
+    std::fflush(stderr);
+  }
 
   // 4. Rebuild the impl views — MeshImpl/RingImpl hold spans over the
   //    vectors we just rebuilt, so the old instances dangle. A fresh

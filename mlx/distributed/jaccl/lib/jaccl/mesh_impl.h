@@ -3653,6 +3653,36 @@ class MeshImpl {
   uint16_t send_seq_[2] = {0, 0}; // indexed by dst rank
   uint16_t recv_seq_[2] = {0, 0}; // indexed by src rank
 
+ public:
+  // Section 68 diagnostic. Exposes the two sequence counters so the
+  // reconnect path can log them AT THE RENDEZVOUS, on both ranks.
+  //
+  // Why this and not more symptom logging: a constant off-by-one between
+  // send_seq_ and the peer's recv_seq_ makes every first chunk look lost
+  // (`peer_got_count=0/1`), which costs a full 500ms retransmit quiet
+  // period per decode token. The leading theory is that
+  // `reconnect_fresh()` rebuilds MeshImpl -- zeroing both counters --
+  // on only the rank that faulted, while the peer keeps counting.
+  //
+  // But that theory predicts an offset of "whatever the peer's counter
+  // happened to read", i.e. an arbitrary N. The measured offset is
+  // exactly 1, every time, in both directions. So either the reset is
+  // symmetric and the real offset comes from a single call counted on
+  // one side only (e.g. the in-flight send that triggered the fault), or
+  // the mechanism is not reconnect at all. Logging the actual counter
+  // values at the barrier distinguishes those directly, rather than
+  // testing a predicted symptom -- the failure mode that let four
+  // previous hypotheses in this campaign survive testing while being
+  // wrong.
+  uint16_t send_seq_for(int peer) const {
+    return (peer >= 0 && peer < 2) ? send_seq_[peer] : 0;
+  }
+  uint16_t recv_seq_for(int peer) const {
+    return (peer >= 0 && peer < 2) ? recv_seq_[peer] : 0;
+  }
+
+ private:
+
   // ── reliable_all_reduce v2 (optimistic) state ──
   // One-collective lookahead: messages whose header call_id == current+1
   // (peer exited optimistically and ran ahead). Applied on entry to that call.
