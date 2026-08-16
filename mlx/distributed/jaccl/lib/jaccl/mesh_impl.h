@@ -2195,7 +2195,7 @@ class MeshImpl {
             // wrong work_type can only mean the data actually arrived.
             if (wc[i].status == IBV_WC_SUCCESS &&
                 wr_id_work_type(wc[i].wr_id) == RECV_WR) {
-              _xconsume_recv_in_send.fetch_add(1, std::memory_order_relaxed);
+              ++_xconsume_recv_in_send;
               if (_prog) {
                 std::fprintf(
                     stderr,
@@ -2203,7 +2203,7 @@ class MeshImpl {
                     "this_call_id=%u wc_call_id=%u buff=%d total=%d\n",
                     rank_, call_id, wr_id_call_id(wc[i].wr_id),
                     wr_id_buff(wc[i].wr_id),
-                    _xconsume_recv_in_send.load(std::memory_order_relaxed));
+                    _xconsume_recv_in_send);
                 std::fflush(stderr);
               }
             }
@@ -2565,7 +2565,7 @@ class MeshImpl {
             // thrown away. Same shared-CQ mechanism, opposite direction.
             if (wc[i].status == IBV_WC_SUCCESS &&
                 wr_id_work_type(wc[i].wr_id) == SEND_WR) {
-              _xconsume_send_in_recv.fetch_add(1, std::memory_order_relaxed);
+              ++_xconsume_send_in_recv;
               if (_prog) {
                 std::fprintf(
                     stderr,
@@ -2573,7 +2573,7 @@ class MeshImpl {
                     "this_call_id=%u wc_call_id=%u buff=%d total=%d\n",
                     rank_, call_id, wr_id_call_id(wc[i].wr_id),
                     wr_id_buff(wc[i].wr_id),
-                    _xconsume_send_in_recv.load(std::memory_order_relaxed));
+                    _xconsume_send_in_recv);
                 std::fflush(stderr);
               }
             }
@@ -3778,9 +3778,16 @@ class MeshImpl {
   // status==SUCCESS with the wrong type means the transfer really
   // happened and the notification was thrown away -- which presents to
   // the other side as a lost frame and triggers the expensive retransmit
-  // path. Atomic because the two loops can run on different threads.
-  mutable std::atomic<int> _xconsume_recv_in_send{0};
-  mutable std::atomic<int> _xconsume_send_in_recv{0};
+  // path.
+  //
+  // Plain ints, NOT std::atomic: an atomic member deletes MeshImpl's
+  // implicit copy-assignment, and reconnect_fresh() does `mesh_ =
+  // MeshImpl(...)` (mesh.cpp), so an atomic here fails to compile. These
+  // are diagnostic counters on a per-QP path that is not concurrently
+  // entered by two threads for the same peer, so a plain int is both
+  // sufficient and the only option that preserves assignability.
+  mutable int _xconsume_recv_in_send{0};
+  mutable int _xconsume_send_in_recv{0};
 
  public:
   // Section 68 diagnostic. Exposes the two sequence counters so the
