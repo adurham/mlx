@@ -2994,13 +2994,14 @@ class MeshImpl {
     // (shared with raw send()/recv())". This pool predates that fix and
     // never got it.
     //
-    // p2p_retry_connections_ is the established TP/PP discriminator in this
-    // file (it is built for PP and NOT for TP -- same mesh.cpp comment), so
-    // gate on it rather than re-reading the env var: no p2p retry QP means
-    // no raw p2p path means this pool has no legitimate consumer.
-    if (p2p_retry_connections_.empty()) {
-      return;
-    }
+    // NOTE (2026-08-16): commit c5030205d gated this to PP only
+    // (p2p_retry_connections_.empty() -> return) as a containment fix while
+    // the collision was still being localized. That gate is REMOVED now that
+    // the pool has its own buffers (data_pool_recv_buffer) and its own work
+    // type (DATA_POOL_RECV_WR), which is the structural fix -- a collective
+    // can no longer share a slot with a standing pool recv, so arming the
+    // pool under Tensor sharding is safe. Keeping the gate would also have
+    // left TP without the Section 52 empty-FIFO protection.
     for (int peer = 0; peer < size_; peer++) {
       if (peer == rank_) {
         continue;
