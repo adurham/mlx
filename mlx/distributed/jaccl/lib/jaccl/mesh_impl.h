@@ -2962,6 +2962,43 @@ class MeshImpl {
     if (connections_.empty()) {
       return;
     }
+    // ROOT-CAUSE FIX (2026-08-16, design doc Section 112): this pool exists
+    // ONLY to serve the raw send()/recv() p2p path -- it closes the
+    // empty-FIFO UC drop that cost ~500ms per PP decode stall (Section 52).
+    // It posts generic RECV_WR work requests into recv_buffer(sz=0, b, peer)
+    // on connections_, the DATA QP -- which the COLLECTIVE path also posts
+    // into (see the reliable all_reduce's post_recv_buff, ~line 1206, and
+    // recv()'s at ~line 2488, all three sharing the same buffer array and
+    // the same WR type). consume_recv reads only the chunk header and
+    // validates `c < num_chunks`; it never checks call_id, so a standing
+    // pool WR (posted with call_id=0) is indistinguishable from a live
+    // collective's WR.
+    //
+    // Under TP that is fatal: TP NEVER calls the raw send()/recv() p2p path
+    // (see the QP-budget comment at the top of mesh.cpp), so every WR this
+    // pool posts can only ever be consumed by a collective -- corrupting the
+    // very first all_gather of warmup:
+    //     [jaccl] all_gather STALLED ... UC completion lost
+    //     [jaccl] reconnect FRESH requested but subgroups borrow our
+    //             contexts -- falling back to QP-only reset
+    //     Fatal Python error: Segmentation fault
+    // Confirmed by live gate-toggle A/B on one build: pool ON = 3 segfaults
+    // across 2 launches, both ranks RunnerFailed; MLX_JACCL_DATA_RECV_POOL=0
+    // = READY (2/2), 0 segfaults, API 200.
+    //
+    // jaccl-v2 already learned this lesson on 2026-07-17 and fixed it the
+    // same way: v2_ensure_pool posts on the DEDICATED pool_connections_ QP
+    // with a DISTINCT POOL_RECV_WR type, explicitly "not connections_
+    // (shared with raw send()/recv())". This pool predates that fix and
+    // never got it.
+    //
+    // p2p_retry_connections_ is the established TP/PP discriminator in this
+    // file (it is built for PP and NOT for TP -- same mesh.cpp comment), so
+    // gate on it rather than re-reading the env var: no p2p retry QP means
+    // no raw p2p path means this pool has no legitimate consumer.
+    if (p2p_retry_connections_.empty()) {
+      return;
+    }
     for (int peer = 0; peer < size_; peer++) {
       if (peer == rank_) {
         continue;
