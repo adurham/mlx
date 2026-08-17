@@ -219,6 +219,23 @@ class MeshGroup : public Group {
   // mesh_impl.h for the full incident this fixes.
   std::vector<SharedBuffer> p2p_retry_send_buffers_;
   std::vector<SharedBuffer> p2p_retry_recv_buffers_;
+  // ROOT-CAUSE FIX (2026-08-16, exo design doc Sections 112/115): DEDICATED
+  // buffers for the standing data-QP recv pool (post_data_recv_pool). The
+  // pool used to post into buffers_ at recv_buffer(sz=0, b, peer) -- the same
+  // slots a SMALL collective lands in, because buffer_size_from_message maps
+  // a tiny message (e.g. mx_barrier's all_sum(1.0)) to size class 0. Two
+  // writers, one slot: the pool's standing recv and the collective's own
+  // recv both target that buffer, so the peer's collective payload could DMA
+  // into a slot the pool had armed (or vice versa). Under Tensor sharding
+  // that corrupted the FIRST all_gather of warmup -- "all_gather STALLED ...
+  // UC completion lost" -> reconnect -> segfault, 100% reproducible,
+  // confirmed by live gate-toggle A/B.
+  //
+  // Same isolation shape as p2p_retry_recv_buffers_ / ack_recv_buffers_
+  // above: the pool gets its own storage so no collective can ever share a
+  // slot with it. Paired with DATA_POOL_RECV_WR (rdma.h) so completion
+  // filtering can route the pool's CQEs unambiguously.
+  std::vector<SharedBuffer> data_pool_recv_buffers_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> ring_send_buffers_;
   std::vector<SharedBuffer> ring_recv_buffers_;

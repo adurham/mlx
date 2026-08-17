@@ -482,7 +482,8 @@ class MeshImpl {
       std::vector<SharedBuffer>& ack_send_buffers,
       std::vector<SharedBuffer>& ack_recv_buffers,
       std::vector<SharedBuffer>& p2p_retry_send_buffers,
-      std::vector<SharedBuffer>& p2p_retry_recv_buffers)
+      std::vector<SharedBuffer>& p2p_retry_recv_buffers,
+      std::vector<SharedBuffer>& data_pool_recv_buffers)
       : rank_(rank),
         size_(size),
         connections_(conns),
@@ -493,7 +494,8 @@ class MeshImpl {
         ack_send_buffers_(ack_send_buffers),
         ack_recv_buffers_(ack_recv_buffers),
         p2p_retry_send_buffers_(p2p_retry_send_buffers),
-        p2p_retry_recv_buffers_(p2p_retry_recv_buffers) {}
+        p2p_retry_recv_buffers_(p2p_retry_recv_buffers),
+        data_pool_recv_buffers_(data_pool_recv_buffers) {}
 
   MeshImpl() : rank_(0), size_(1) {}
 
@@ -3005,9 +3007,10 @@ class MeshImpl {
       }
       for (int sz = 0; sz < DATA_RECV_POOL_SIZE_CLASSES; sz++) {
         for (int b = 0; b < NUM_BUFFERS; b++) {
-          auto& rb = recv_buffer(sz, b, peer);
+          auto& rb = data_pool_recv_buffer(sz, b, peer);
           zero_recv_buffer(rb);
-          connections_[peer].post_recv(rb, make_wr_id(0, RECV_WR, b, peer));
+          connections_[peer].post_recv(
+              rb, make_wr_id(0, DATA_POOL_RECV_WR, b, peer));
         }
       }
     }
@@ -3820,6 +3823,13 @@ class MeshImpl {
     return buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank];
   }
 
+  // Standing data-QP recv pool's OWN storage (Sections 112/115). Same
+  // [sz][buff][peer] indexing as recv_buffer(), but into a separate
+  // allocation so the pool can never share a slot with a collective.
+  SharedBuffer& data_pool_recv_buffer(int sz, int buff, int rank) {
+    return data_pool_recv_buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank];
+  }
+
   void post_send_all(uint32_t call_id, int sz, int buff) {
     auto& b = send_buffer(sz, buff);
     for (int i = 0; i < size_; i++) {
@@ -3870,6 +3880,9 @@ class MeshImpl {
   // post_p2p_retry_recvs).
   std::span<SharedBuffer> p2p_retry_send_buffers_;
   std::span<SharedBuffer> p2p_retry_recv_buffers_;
+  // Dedicated storage for the standing data-QP recv pool (Sections 112/115) --
+  // see data_pool_recv_buffers_ in mesh.h for why it must not live in buffers_.
+  std::span<SharedBuffer> data_pool_recv_buffers_;
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> ack_send_buffers_;
   std::span<SharedBuffer> ack_recv_buffers_;

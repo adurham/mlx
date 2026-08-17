@@ -47,6 +47,22 @@ constexpr int POOL_RECV_WR = 5;
 // mesh_impl.h) -- same shape as POOL_RECV_WR above.
 constexpr int P2P_RETRY_RECV_WR = 6;
 constexpr int P2P_RETRY_SEND_WR = 7;
+// ROOT-CAUSE FIX (2026-08-16, exo design doc Sections 112/115): the standing
+// data-QP recv pool (post_data_recv_pool, added for the Section 52 p2p decode
+// stall) used to post GENERIC RECV_WR into the shared recv_buffer() array on
+// connections_ -- the same WR type and the same buffers the COLLECTIVE path
+// uses. A collective's consume_recv reads only the chunk header and validates
+// `c < num_chunks`; it never checks call_id, so it could not tell a standing
+// pool WR (posted with the sentinel call_id 0) from its own. Under Tensor
+// sharding that corrupted the FIRST all_gather of warmup -- "all_gather
+// STALLED ... UC completion lost" -> reconnect -> segfault, 100% reproducible,
+// confirmed by live gate-toggle A/B.
+//
+// Same shape of fix jaccl-v2 already applied for the identical collision on
+// 2026-07-17 (POOL_RECV_WR above): a DISTINCT work type so completion
+// filtering can route the pool's WRs to the pool and nothing else. Pool recvs
+// outlive individual collectives, so the wr_id call_id stays a sentinel (0).
+constexpr int DATA_POOL_RECV_WR = 8;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;

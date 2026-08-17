@@ -241,7 +241,8 @@ MeshGroup::MeshGroup(
       ack_send_buffers_,
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
-      p2p_retry_recv_buffers_);
+      p2p_retry_recv_buffers_,
+      data_pool_recv_buffers_);
   // Give the top-level mesh the reliable TCP coordinator for the confirmed
   // (ack-of-ack) barrier. side_channel_ is in-place and outlives mesh_.
   mesh_.set_coordinator(&*side_channel_);
@@ -348,7 +349,8 @@ MeshGroup::MeshGroup(
       ack_send_buffers_,
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
-      p2p_retry_recv_buffers_);
+      p2p_retry_recv_buffers_,
+      data_pool_recv_buffers_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -966,6 +968,7 @@ void MeshGroup::reconnect_fresh() {
   ack_recv_buffers_.clear();
   p2p_retry_send_buffers_.clear();
   p2p_retry_recv_buffers_.clear();
+  data_pool_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
   ack_connections_.clear();
@@ -1063,7 +1066,8 @@ void MeshGroup::reconnect_fresh() {
       ack_send_buffers_,
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
-      p2p_retry_recv_buffers_);
+      p2p_retry_recv_buffers_,
+      data_pool_recv_buffers_);
   mesh_.set_coordinator(&*side_channel_);
   // Rebuild p2p_channel_ same as reconnect() -- it is a separate TCP socket
   // from the RDMA transport rebuilt above, so it does NOT get cleared by
@@ -1111,6 +1115,7 @@ void MeshGroup::allocate_buffers() {
   ack_recv_buffers_.clear();
   p2p_retry_send_buffers_.clear();
   p2p_retry_recv_buffers_.clear();
+  data_pool_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
 
@@ -1126,6 +1131,20 @@ void MeshGroup::allocate_buffers() {
       }
     }
   }
+  // Dedicated storage for the standing data-QP recv pool (Sections 112/115).
+  // Layout mirrors recv_buffer()'s indexing for the pool's own size classes:
+  // [sz][buff][peer], sz in [0, DATA_RECV_POOL_SIZE_CLASSES). Kept OUT of
+  // buffers_ so a small collective -- which lands in size class 0 via
+  // buffer_size_from_message -- can never share a slot with a standing pool
+  // recv.
+  for (int k = 0; k < MeshImpl::DATA_RECV_POOL_SIZE_CLASSES; k++) {
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+      for (int j = 0; j < size_; j++) {
+        data_pool_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+      }
+    }
+  }
+
   // Per-peer ack buffers (one slot per peer, including self for index
   // alignment — self slot is unused). FRAME_SIZE avoids macOS librdma
   // rejecting sub-page-size SGEs at ack-recv time.
