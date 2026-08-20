@@ -269,6 +269,26 @@ MeshGroup::MeshGroup(
   // 500ms retransmit stall on ~4.5% of PP decode barriers from exactly this
   // empty-FIFO UC drop.
   mesh_.post_data_recv_pool();
+  // ROOT-CAUSE FIX (2026-08-20): arm the jaccl-v2 standing POOL_RECV_WR pool
+  // HERE, before the bootstrap barrier -- exactly as reconnect() and
+  // reconnect_fresh() already do. It was the ONLY one of the four standing
+  // pools left to lazy arming (v2_ensure_pool() on first entry to
+  // reliable_all_reduce_v2), and lazy is too late on a FRESH connection for
+  // the same reason it was too late after a reconnect: the pool gets posted
+  // AFTER this barrier, i.e. after the peer is already free to return from
+  // the ctor and issue its first collective. Whichever rank reaches the first
+  // v2 collective later has an EMPTY pool FIFO while the peer's entire first
+  // pass is already on the wire; UC silently drops every frame, and since the
+  // peer completes optimistically (it DID receive our chunks) and moves on to
+  // a non-v2 collective, it never polls the v2 CQ again to service our
+  // retransmit-request status. The late rank then sits out its full 15s
+  // deadline with all_recv=0 / peer_in_call=0 -- the "unidirectional dead UC
+  // path" observed on 2 of 3 warmups since 2026-07-06 and referenced in exo's
+  // runner.py _warmup_with_reconnect() docstring. Same bug class as the
+  // ack/p2p-retry/data pools; the fix simply had never been applied to the
+  // fresh-init path. No-ops when pool_connections_ is empty (PP mode /
+  // subgroups) or size_ != 2.
+  mesh_.post_v2_pool_recvs();
 
   // Bootstrap barrier: guarantee both ranks have completed
   // post_ack_recvs(0) before any rank can return from the ctor and
