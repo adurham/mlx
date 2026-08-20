@@ -760,6 +760,33 @@ void MeshGroup::rebuild_p2p_channel() {
 }
 
 void MeshGroup::reconnect() {
+  // ROOT-CAUSE FIX (2026-08-20, bug #5 of the jaccl chain): reconnect() —
+  // and therefore reconnect_fresh() — used to run with NO lock at all,
+  // while every collective entry point (all_sum/all_max/all_min/
+  // all_gather/send/recv, and barrier() via all_sum) takes
+  // collective_mutex_. Recovery is invoked from exo's warmup thread while
+  // MLX's eval thread can still dispatch a queued distributed op, so a
+  // concurrent collective was free to run mesh_.* against connections_/
+  // buffers_ at the exact moment reconnect_fresh() step 1 was clearing
+  // those vectors — a textbook use-after-free (MeshImpl holds spans over
+  // them, and Connection dtors destroy_qp/dealloc_pd/close_device).
+  //
+  // Live evidence (macstudio-m4-1, 2026-08-20 17:06:10, exit -11):
+  //   17:06:10.644  [jaccl] reconnect_fresh rank=1 ENTER (size=2)
+  //   17:06:10.656  [jaccl-v2] ENTER rank=1 call_id=5 ... small=1
+  //   17:06:10.734  IOConnectUnmapMemory failed (device close in flight)
+  //   17:06:10.782  Fatal Python error: Segmentation fault
+  // i.e. a small collective ENTERED the group 12ms AFTER teardown began
+  // and died mid-close. It could only do that because reconnect() held
+  // nothing. Note the rank=1 log never reaches the "releasing N live
+  // borrowing subgroup(s)" line, so the crash is inside step 0/1 teardown,
+  // concurrent with that call_id=5 — exactly this race.
+  //
+  // Holding collective_mutex_ across the ENTIRE recovery makes the group
+  // unusable-but-safe for the duration: a concurrent collective blocks
+  // here and resumes against the fully rebuilt transport.
+  std::lock_guard<std::mutex> guard(collective_mutex_);
+
   // In-place recovery: reset the wedged QPs and re-establish the connections
   // WITHOUT destroying PD/CQ/MRs or reloading the model. Both ranks call this
   // after a collective fault; the surviving TCP side_channel_ (coordinator)
@@ -1164,6 +1191,8 @@ void MeshGroup::reconnect_fresh() {
   //    Expired weak_ptrs are pruned as we go: a subgroup the caller already
   //    dropped holds no device state to worry about.
   std::vector<std::shared_ptr<MeshGroup>> live_subgroups;
+  // Held from step 0 until after step 6's rebuild; see the fix note below.
+  std::vector<std::unique_lock<std::mutex>> subgroup_guards;
   if (has_split_) {
     for (auto& weak_sub : subgroups_) {
       if (auto sub = weak_sub.lock()) {
@@ -1178,6 +1207,25 @@ void MeshGroup::reconnect_fresh() {
         rank_,
         live_subgroups.size());
     fflush(stderr);
+    // ROOT-CAUSE FIX (2026-08-20, bug #5, part 2): a collective invoked ON A
+    // SUBGROUP locks only that SUBGROUP's collective_mutex_ — never the
+    // parent's. So the parent's collective_mutex_ (taken at the top of
+    // reconnect()) does NOT protect the subgroups whose device state we are
+    // about to destroy and rebuild here. Under TP, exo's coord subgroup is
+    // exactly such a group and is used for small control-plane collectives
+    // independently of the main data path, i.e. precisely the traffic that
+    // shows up as the interleaved small [jaccl-v2] call in the crash log.
+    //
+    // Take each live subgroup's own mutex BEFORE releasing its device state
+    // and hold it until its rebuild_on_contexts() has completed in step 6.
+    // Lock order is always parent -> child, and a subgroup collective never
+    // reaches for the parent's mutex, so there is no inversion. The order
+    // within subgroups_ is deterministic and identical on every rank
+    // (split() is a collective run in matching order).
+    subgroup_guards.reserve(live_subgroups.size());
+    for (auto& sub : live_subgroups) {
+      subgroup_guards.emplace_back(sub->collective_mutex_);
+    }
     for (auto& sub : live_subgroups) {
       sub->release_borrowed_device_state();
     }
