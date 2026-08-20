@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 #include "jaccl/group.h"
 #include "jaccl/mesh_impl.h"
@@ -127,6 +129,36 @@ class MeshGroup : public Group {
   // (reconnect() falls back to the QP-only reset in that case). Gated by
   // MLX_JACCL_RECONNECT_FRESH=1 inside reconnect().
   void reconnect_fresh();
+
+  // ROOT-CAUSE FIX (2026-08-20, bug #3 of the jaccl-v2 chain): the two
+  // halves of making reconnect_fresh() safe when live subgroups borrow our
+  // ibv contexts. Called by the PARENT's reconnect_fresh() on each live
+  // borrowing subgroup, around the parent's device close/reopen:
+  //
+  //   release_borrowed_device_state()  -- BEFORE the parent closes its
+  //     devices. Drops every MR (SharedBuffer dtors) and every PD/CQ/QP
+  //     (Connection dtors) this subgroup built on top of the parent's
+  //     contexts, so nothing dangles when those contexts go away. The
+  //     subgroup object itself stays alive and usable; only its
+  //     device-side state is torn down.
+  //
+  //   rebuild_on_contexts(ctxs, exchange) -- AFTER the parent has reopened
+  //     its devices. Re-adopts the parent's NEW per-peer ibv_context*s and
+  //     re-runs the full subgroup bring-up (PD/CQ/QP -> MR registration ->
+  //     INIT -> destination exchange -> RTR/RTS), exactly as the subgroup
+  //     ctor does, then re-arms the ACK recv pool behind a barrier.
+  //
+  // Without this pair, reconnect() saw has_split_ == true, refused
+  // reconnect_fresh(), and silently degraded to the QP-only reset -- which
+  // mesh.h's own reconnect_fresh() comment above documents as INSUFFICIENT
+  // to clear a dead-UC wedge. It then printed "COMPLETE" on a still-dead
+  // transport, and the next collective on the parent group deadlocked with
+  // zero progress in both directions (all_recv=0/N, peer_in_call=0,
+  // symmetric on both ranks).
+  void release_borrowed_device_state();
+  void rebuild_on_contexts(
+      const std::vector<ibv_context*>& ctxs,
+      const ExchangeFn& exchange);
 
   void allocate_buffers();
 
@@ -252,9 +284,28 @@ class MeshGroup : public Group {
 
   FILE* trace_file_ = nullptr;
   bool hash_enabled_ = false;
-  // Set by split(): subgroups borrow our ibv contexts, which makes
-  // reconnect_fresh() (device close + reopen) unsafe from then on.
+  // Set by split(): subgroups borrow our ibv contexts.
+  //
+  // Historically this permanently disabled reconnect_fresh() (device close
+  // + reopen), because closing a context out from under a live subgroup
+  // leaves its PD/CQ/QP/MRs dangling. As of 2026-08-20 that veto is gone:
+  // subgroups_ below tracks the live borrowers, and reconnect_fresh() now
+  // tears their device state down before the close and rebuilds it against
+  // the reopened contexts afterwards. has_split_ is retained purely as a
+  // cheap "do we need to walk subgroups_" predicate.
   bool has_split_ = false;
+
+  // Live subgroups created by split() that BORROW our per-peer
+  // ibv_context*s (i.e. JACCL_SPLIT_FRESH_CTX unset -- the production
+  // default). weak_ptr, not shared_ptr: split() hands ownership to the
+  // Python/MLX caller, and a parent->child shared_ptr would both leak the
+  // subgroup for the process lifetime and create a cycle. Expired entries
+  // are pruned as they're encountered.
+  //
+  // Subgroups built with JACCL_SPLIT_FRESH_CTX=1 own their own contexts
+  // and are deliberately NOT tracked here -- the parent's device close
+  // cannot affect them.
+  std::vector<std::weak_ptr<MeshGroup>> subgroups_;
 };
 
 } // namespace jaccl

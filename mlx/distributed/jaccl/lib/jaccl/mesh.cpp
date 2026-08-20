@@ -429,7 +429,7 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
   // (PD/CQ/QP alloc → MR registration → INIT → exchange → RTR/RTS),
   // with the exchange done over the parent's side channel under our
   // mutex.
-  return std::make_shared<MeshGroup>(
+  auto sub = std::make_shared<MeshGroup>(
       rank_,
       size_,
       std::move(ctxs),
@@ -439,6 +439,16 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
         return side_channel_->all_gather(info);
       },
       color);
+
+  // Track BORROWING subgroups so reconnect_fresh() can tear their device
+  // state down before closing our contexts and rebuild it afterwards (see
+  // subgroups_ / release_borrowed_device_state() in mesh.h). A subgroup
+  // built with JACCL_SPLIT_FRESH_CTX=1 owns its own contexts and is
+  // unaffected by our device close, so it is deliberately not tracked.
+  if (!fresh_ctx) {
+    subgroups_.push_back(sub);
+  }
+  return sub;
 }
 
 void MeshGroup::open_trace_file_if_enabled() {
@@ -762,23 +772,47 @@ void MeshGroup::reconnect() {
   }
 
   // Fresh (hard) mode: rebuild the device contexts and everything on top of
-  // them. Opt-in via MLX_JACCL_RECONNECT_FRESH=1; silently degrades to the
-  // QP-only reset once subgroups exist (they borrow our contexts).
-  // IMPORTANT: both ranks must take the SAME branch — has_split_ flips at
-  // split(), which is itself a collective executed in matching order on all
-  // ranks, and the env var must be set identically cluster-wide.
+  // them. Opt-in via MLX_JACCL_RECONNECT_FRESH=1.
+  //
+  // IMPORTANT: both ranks must take the SAME branch. That holds because
+  // split() is itself a collective executed in matching order on all ranks,
+  // and the env var is set identically cluster-wide.
+  //
+  // ROOT-CAUSE FIX (2026-08-20, bug #3 of the jaccl-v2 chain): this used to
+  // read `if (!has_split_) reconnect_fresh();` and otherwise print
+  //   "FRESH requested but subgroups borrow our contexts — falling back to
+  //    QP-only reset"
+  // before degrading to the in-place QP reset below. That degrade was the
+  // bug. reconnect_fresh()'s own comment (mesh.h) documents that the dead-UC
+  // wedge "survives queue_pair_reset() -- which preserves PD/CQ/MRs/ctx --
+  // but clears with a fresh ibv_open_device". So the fallback path is, by
+  // this file's own documentation, INCAPABLE of clearing the wedge it was
+  // being asked to clear. It nevertheless ran every step successfully and
+  // printed "reconnect COMPLETE" on a still-dead transport.
+  //
+  // Under TP that degrade is unconditional, not a rare corner: exo's
+  // get_coord_group() calls split() during startup to build the coord
+  // subgroup, so has_split_ is ALWAYS true by the time any fault can occur.
+  // Live evidence (2026-08-20, both Mac Studios, 3 consecutive re-places):
+  // every post-reconnect reliable_all_reduce_v2 hit its 15s deadline with
+  //   all_recv=0/1 chunks_posted=1 small=1 peer_in_call=0
+  // symmetrically on BOTH ranks -- each rank posted its send and received
+  // literally nothing, i.e. zero forward progress in both directions, which
+  // is precisely a dead device-level UC transport rather than a protocol
+  // desync or an under-provisioned deadline. (Protocol state was already
+  // being reset correctly here via mesh_.reset_ack_state(); that was ruled
+  // out by reading it. A longer deadline cannot help a transfer making no
+  // progress at all.)
+  //
+  // The fix is to remove the veto's cause rather than the veto's symptom:
+  // reconnect_fresh() below now tears down each live borrowing subgroup's
+  // device state before closing the contexts and rebuilds it against the
+  // reopened ones, so a split parent is no longer a reason to refuse the
+  // only recovery that works.
   const char* fresh_env = std::getenv("MLX_JACCL_RECONNECT_FRESH");
   if (fresh_env != nullptr && std::string_view(fresh_env) == "1") {
-    if (!has_split_) {
-      reconnect_fresh();
-      return;
-    }
-    fprintf(
-        stderr,
-        "[jaccl] reconnect rank=%d FRESH requested but subgroups borrow our "
-        "contexts — falling back to QP-only reset\n",
-        rank_);
-    fflush(stderr);
+    reconnect_fresh();
+    return;
   }
 
   const bool has_ack = !ack_connections_.empty();
@@ -1003,6 +1037,99 @@ void MeshGroup::reconnect() {
   fflush(stderr);
 }
 
+void MeshGroup::release_borrowed_device_state() {
+  // Drop MRs first (SharedBuffer dtors call ibv_dereg_mr), then the
+  // Connections (dtors do destroy_qp/destroy_cq/dealloc_pd). Ordering is
+  // the same reverse-dependency ordering reconnect_fresh() step 1 uses.
+  // Every Connection here was built with owns_ctx=false (borrowing the
+  // parent's ctx), so no dtor closes a device -- that is the parent's job,
+  // and it happens right after this returns.
+  buffers_.clear();
+  ack_send_buffers_.clear();
+  ack_recv_buffers_.clear();
+  p2p_retry_send_buffers_.clear();
+  p2p_retry_recv_buffers_.clear();
+  data_pool_recv_buffers_.clear();
+  ring_send_buffers_.clear();
+  ring_recv_buffers_.clear();
+  ack_connections_.clear();
+  pool_connections_.clear();
+  p2p_retry_connections_.clear();
+  connections_.clear();
+  fprintf(
+      stderr,
+      "[jaccl] subgroup rank=%d color=%d released borrowed device state\n",
+      rank_,
+      color_);
+  fflush(stderr);
+}
+
+void MeshGroup::rebuild_on_contexts(
+    const std::vector<ibv_context*>& ctxs,
+    const ExchangeFn& exchange) {
+  // Mirror of the subgroup ctor, minus the object construction. Everything
+  // device-side was dropped by release_borrowed_device_state(); rebuild it
+  // against the parent's freshly reopened contexts.
+  //
+  // owns_ctx=false throughout: these are still the parent's contexts, just
+  // new ones. Subgroups never build pool_connections_ or
+  // p2p_retry_connections_ (see the subgroup ctor's NOTE) -- those vectors
+  // stay empty here too, and initialize()'s has_pool / has_p2p_retry guards
+  // skip them accordingly.
+  connections_.reserve(ctxs.size());
+  for (auto* ctx : ctxs) {
+    connections_.emplace_back(ctx, /*owns_ctx=*/false);
+  }
+  ack_connections_.reserve(static_cast<size_t>(size_));
+  for (auto& data_conn : connections_) {
+    ack_connections_.emplace_back(data_conn.ctx, /*owns_ctx=*/false);
+  }
+
+  // Same critical ordering as the ctor: PD/CQ/QP -> MR registration
+  // (allocate_buffers, called inside initialize()) -> INIT -> exchange ->
+  // RTR/RTS. macOS librdma locks the QP's MR table at the INIT transition.
+  initialize(exchange);
+
+  // MeshImpl/RingImpl hold spans over the vectors just rebuilt, so the old
+  // instances dangle -- reconstruct them, exactly as reconnect_fresh() does
+  // for the parent. A fresh MeshImpl also starts with clean ACK/v2
+  // bookkeeping, the equivalent of reset_ack_state() on the soft path.
+  mesh_ = MeshImpl(
+      rank_,
+      size_,
+      connections_,
+      ack_connections_,
+      pool_connections_,
+      p2p_retry_connections_,
+      buffers_,
+      ack_send_buffers_,
+      ack_recv_buffers_,
+      p2p_retry_send_buffers_,
+      p2p_retry_recv_buffers_,
+      data_pool_recv_buffers_);
+  ring_ = RingImpl(
+      rank_,
+      size_,
+      &connections_[(rank_ + size_ - 1) % size_],
+      &connections_[(rank_ + 1) % size_],
+      1,
+      ring_send_buffers_,
+      ring_recv_buffers_);
+
+  // Re-arm the ACK recv pool, then barrier -- identical rationale to the
+  // subgroup ctor: UC silently drops a send into an empty recv queue, so
+  // neither rank may return from here before BOTH have posted.
+  mesh_.post_ack_recvs(0);
+  (void)exchange(std::vector<Destination>{Destination{}});
+
+  fprintf(
+      stderr,
+      "[jaccl] subgroup rank=%d color=%d rebuilt on fresh contexts\n",
+      rank_,
+      color_);
+  fflush(stderr);
+}
+
 void MeshGroup::reconnect_fresh() {
   // Section 68 diagnostic: capture the sequence counters BEFORE the
   // MeshImpl rebuild below zeroes them. Paired with the post-rebuild log
@@ -1027,6 +1154,34 @@ void MeshGroup::reconnect_fresh() {
       rank_,
       size_);
   fflush(stderr);
+
+  // 0. Collect the live subgroups that BORROW our contexts and release their
+  //    device state BEFORE we close those contexts in step 1. Without this,
+  //    step 2's close_device() would leave every subgroup's PD/CQ/QP/MR
+  //    dangling -- which is exactly why reconnect() used to refuse to come
+  //    here at all once has_split_ was set, degrading instead to a QP-only
+  //    reset that cannot clear a dead-UC wedge (see reconnect()'s comment).
+  //    Expired weak_ptrs are pruned as we go: a subgroup the caller already
+  //    dropped holds no device state to worry about.
+  std::vector<std::shared_ptr<MeshGroup>> live_subgroups;
+  if (has_split_) {
+    for (auto& weak_sub : subgroups_) {
+      if (auto sub = weak_sub.lock()) {
+        live_subgroups.push_back(std::move(sub));
+      }
+    }
+    subgroups_.assign(live_subgroups.begin(), live_subgroups.end());
+    fprintf(
+        stderr,
+        "[jaccl] reconnect_fresh rank=%d releasing %zu live borrowing "
+        "subgroup(s) before device close\n",
+        rank_,
+        live_subgroups.size());
+    fflush(stderr);
+    for (auto& sub : live_subgroups) {
+      sub->release_borrowed_device_state();
+    }
+  }
 
   // 1. Tear down device-side state in reverse dependency order. Clearing the
   //    buffer vectors runs SharedBuffer dtors, which deregister every MR —
@@ -1182,6 +1337,30 @@ void MeshGroup::reconnect_fresh() {
   // its first ack_sync_pre before BOTH have posted their ACK recv pool
   // (UC silently drops sends into an empty recv queue).
   side_channel_->all_gather<int>(0);
+
+  // 6. Rebuild every live borrowing subgroup released in step 0, now that
+  //    our contexts are open again. Each rebuild re-runs the subgroup's full
+  //    bring-up (PD/CQ/QP -> MRs -> INIT -> exchange -> RTR/RTS) and ends in
+  //    its own barrier over OUR side channel, so both ranks stay lockstep.
+  //    Order is deterministic across ranks because split() is a collective
+  //    executed in matching order, so subgroups_ is populated identically on
+  //    every rank.
+  for (auto& sub : live_subgroups) {
+    sub->rebuild_on_contexts(
+        // The subgroup borrows our per-peer contexts, which step 2 just
+        // replaced -- hand it the NEW ones.
+        [this] {
+          std::vector<ibv_context*> ctxs;
+          ctxs.reserve(connections_.size());
+          for (auto& parent_conn : connections_) {
+            ctxs.push_back(parent_conn.ctx);
+          }
+          return ctxs;
+        }(),
+        [this](const std::vector<Destination>& info) {
+          return side_channel_->all_gather(info);
+        });
+  }
 
   fprintf(stderr, "[jaccl] reconnect_fresh rank=%d COMPLETE\n", rank_);
   fflush(stderr);
