@@ -1311,6 +1311,34 @@ void MeshGroup::allocate_buffers() {
           .register_to_protection_domain(connections_[right].protection_domain);
     }
   }
+  // ROOT-CAUSE FIX (2026-08-20): register the standing data-QP recv pool's
+  // OWN buffers to the data connection's PD. data_pool_recv_buffers_ was
+  // split out of buffers_ in 5f2b1961c (so a small collective can never
+  // share a slot with a standing pool recv) but that commit allocated them
+  // WITHOUT ever registering them to any protection domain. post_recv() on
+  // connections_[peer] calls to_scatter_gather_entry(
+  // connections_[peer].protection_domain), whose lkey lookup is
+  // memory_regions_.at(pd) -- an unregistered buffer therefore throws
+  // std::out_of_range("unordered_map::at: key not found") on FIRST USE.
+  // First use is mesh_.post_data_recv_pool() in the ctor (and in
+  // reconnect()/reconnect_fresh()), i.e. inside mx.distributed.init, so
+  // EVERY fresh runner failed init deterministically -- no amount of
+  // retry/backoff can fix a missing MR registration.
+  // Only the pool's own size classes are allocated, and only peer slots are
+  // ever posted (post_data_recv_pool skips peer == rank_), but we register
+  // every non-self slot for index alignment with data_pool_recv_buffer().
+  for (int k = 0; k < MeshImpl::DATA_RECV_POOL_SIZE_CLASSES; k++) {
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+      for (int j = 0; j < size_; j++) {
+        if (j == rank_ || connections_[j].ctx == nullptr) {
+          continue;
+        }
+        data_pool_recv_buffers_[k * NUM_BUFFERS * size_ + i * size_ + j]
+            .register_to_protection_domain(connections_[j].protection_domain);
+      }
+    }
+  }
+
   // Register ack buffers. Subgroups have a dedicated ACK connection per
   // peer — register to its PD (isolated FIFO recv queue). Top-level
   // group has no ACK connections — register to the data conn's PD
