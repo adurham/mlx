@@ -308,11 +308,13 @@ MeshGroup::MeshGroup(
     std::vector<std::string> device_names,
     bool owns_ctxs,
     const ExchangeFn& exchange,
-    int color)
+    int color,
+    const std::string& coord_addr)
     : rank_(rank),
       size_(size),
       color_(color),
       side_channel_(std::nullopt),
+      coord_addr_(coord_addr),
       device_names_(std::move(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
     std::ostringstream msg;
@@ -384,6 +386,27 @@ MeshGroup::MeshGroup(
   // parent's SideChannel, so QPs are RTS on both ranks before this.
   mesh_.post_ack_recvs(0);
 
+  // ROOT-CAUSE FIX (2026-08-20, bug #8): give this SUBGROUP its own reliable
+  // TCP coordinator so mesh_impl.h's `coordinator_ != nullptr` gates (the
+  // confirmed pre/post barriers and the reliable paths) are actually
+  // REACHABLE here. Before this, only the top-level ctor ever called
+  // set_coordinator(), so every subgroup collective was permanently pinned
+  // to the unordered ack_sync_pre path regardless of
+  // MLX_JACCL_CONFIRMED_BARRIER_PRE -- which is exactly why exo's warmup
+  // control-plane all_gather (running on the coord subgroup) kept stalling
+  // with "UC completion lost" after 0a8d8a4ee fixed the parent group.
+  // See coord_channel_'s member comment in mesh.h for why this must be a
+  // SEPARATE socket rather than the parent's side_channel_.
+  //
+  // Placed BEFORE the bootstrap barrier below so that barrier also fences
+  // the listen/connect: neither rank returns from this ctor -- and so
+  // neither can issue a collective that would use coord_channel_ -- until
+  // both have finished building it.
+  rebuild_coord_channel();
+  if (coord_channel_.has_value()) {
+    mesh_.set_coordinator(&*coord_channel_);
+  }
+
   // Bootstrap barrier: same rationale as the top-level ctor — without
   // a barrier AFTER post_ack_recvs(0), RANK_A can return from this
   // ctor first, fire its first ack_sync_pre on the subgroup, and
@@ -394,6 +417,50 @@ MeshGroup::MeshGroup(
   (void)exchange(std::vector<Destination>{Destination{}});
 
   open_trace_file_if_enabled();
+}
+
+void MeshGroup::rebuild_coord_channel() {
+  // Top-level groups use side_channel_ as their coordinator (wired in the
+  // top-level ctor); they never build this one.
+  if (side_channel_.has_value()) {
+    return;
+  }
+  if (coord_addr_.empty()) {
+    // No address was published by the parent's split() -- either an
+    // out-of-tree caller used the subgroup ctor directly, or the feature is
+    // disabled. Leave coordinator_ null: subgroup collectives keep the
+    // pre-2026-08-20 ack_sync_pre behaviour rather than failing.
+    return;
+  }
+  // Assigning to an already-engaged optional destroys the old SideChannel
+  // (closing its fd via ~TCPSocket) before the new one binds/connects, so a
+  // stale half-framed stream from a pre-fault barrier is discarded rather
+  // than misread. Same reasoning as rebuild_p2p_channel().
+  coord_channel_.emplace(rank_, size_, coord_addr_.c_str());
+  // Match side_channel_'s recovery-path headroom: this channel is used by
+  // confirmed_coord_barrier(), which legitimately waits for the peer to
+  // reach the same collective and can therefore be slow under load, and it
+  // must outlast the data path's own detection deadline for the same
+  // asymmetric-detection reason documented in the top-level ctor.
+  const double _data_path_deadline = [] {
+    const char* e = std::getenv("MLX_JACCL_RECV_RETRY_DEADLINE_SECS");
+    return e ? std::atof(e) : 60.0;
+  }();
+  const double _coord_retry_deadline = [&] {
+    const char* e = std::getenv("MLX_JACCL_COORD_RECV_RETRY_DEADLINE_SECS");
+    if (e) {
+      return std::atof(e);
+    }
+    return 2.0 * _data_path_deadline + 30.0;
+  }();
+  coord_channel_->set_recv_retry_deadline_secs(_coord_retry_deadline);
+  fprintf(
+      stderr,
+      "[jaccl] subgroup rank=%d color=%d coordinator channel ready on %s\n",
+      rank_,
+      color_,
+      coord_addr_.c_str());
+  fflush(stderr);
 }
 
 std::shared_ptr<Group> MeshGroup::split(int color, int key) {
@@ -445,6 +512,46 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
     }
   }
 
+  // Publish the SUBGROUP's own coordinator address (bug #8, 2026-08-20 --
+  // see coord_channel_'s member comment in mesh.h). Rank 0 reserves an
+  // ephemeral port on the coordinator's own IP and all_gathers "<ip>:<port>"
+  // to every rank over the PARENT's side_channel_, right here where the
+  // parent's collective_mutex_ is already held -- the same
+  // borrow-the-parent's-channel-under-the-parent's-lock pattern the QP
+  // destination exchange below uses, so no new concurrency is introduced.
+  // An ephemeral port rather than coordinator_port+2: co-hosted model
+  // instances get base ports assigned independently by exo's placement
+  // layer, so arithmetic derivation can collide with another instance's
+  // coordinator, and re-binding a fixed port on rebuild fights TIME_WAIT.
+  // Opt-out via MLX_JACCL_SUBGROUP_COORD=0 (leaves coordinator_ null, i.e.
+  // exactly the pre-fix behaviour).
+  std::string sub_coord_addr;
+  const bool subgroup_coord_enabled = [] {
+    const char* e = std::getenv("MLX_JACCL_SUBGROUP_COORD");
+    return e == nullptr || std::string_view(e) != "0";
+  }();
+  if (subgroup_coord_enabled && !coordinator_addr_.empty()) {
+    auto colon = coordinator_addr_.find(':');
+    if (colon == std::string::npos) {
+      throw std::runtime_error(
+          "[jaccl] Can't derive subgroup coordinator address from "
+          "coordinator_addr (missing ':'): " +
+          coordinator_addr_);
+    }
+    // Only the PORT is exchanged, never the address: rank 0's own
+    // coordinator_addr_ is a LISTEN address ("0.0.0.0:<port>", assigned that
+    // way by exo's placement layer) while every other rank holds rank 0's
+    // routable IP. Broadcasting rank 0's string would hand the peers
+    // "0.0.0.0" to connect to. Each rank therefore keeps the IP half of its
+    // OWN coordinator_addr_ and only adopts rank 0's port -- byte-for-byte
+    // the same construction rebuild_p2p_channel() uses for p2p_channel_
+    // (own ip + derived port).
+    std::string ip = coordinator_addr_.substr(0, colon);
+    int proposed = (rank_ == 0) ? reserve_ephemeral_port(ip) : 0;
+    auto ports = side_channel_->all_gather<int>(proposed);
+    sub_coord_addr = ip + ":" + std::to_string(ports[0]);
+  }
+
   // Build the subgroup. Its ctor runs the full init pipeline
   // (PD/CQ/QP alloc → MR registration → INIT → exchange → RTR/RTS),
   // with the exchange done over the parent's side channel under our
@@ -458,7 +565,8 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
       [this](const std::vector<Destination>& info) {
         return side_channel_->all_gather(info);
       },
-      color);
+      color,
+      sub_coord_addr);
 
   // Track BORROWING subgroups so reconnect_fresh() can tear their device
   // state down before closing our contexts and rebuild it afterwards (see
@@ -1162,6 +1270,19 @@ void MeshGroup::rebuild_on_contexts(
       1,
       ring_send_buffers_,
       ring_recv_buffers_);
+
+  // The fresh MeshImpl above starts with coordinator_ == nullptr, so re-wire
+  // this subgroup's own coordinator or every confirmed-barrier gate silently
+  // goes dead again after a recovery (bug #8's failure mode, re-armed). The
+  // channel itself is TCP and survived the parent's device close untouched --
+  // but for exactly that reason it may still hold bytes left mid-frame by the
+  // barrier that faulted, so tear it down and rebuild rather than reuse (same
+  // rationale as reconnect()'s rebuild_p2p_channel() call). The exchange
+  // barrier below fences it on both ranks.
+  rebuild_coord_channel();
+  if (coord_channel_.has_value()) {
+    mesh_.set_coordinator(&*coord_channel_);
+  }
 
   // Re-arm the ACK recv pool, then barrier -- identical rationale to the
   // subgroup ctor: UC silently drops a send into an empty recv queue, so

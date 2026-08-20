@@ -59,7 +59,8 @@ class MeshGroup : public Group {
       std::vector<std::string> device_names,
       bool owns_ctxs,
       const ExchangeFn& exchange,
-      int color = 0);
+      int color = 0,
+      const std::string& coord_addr = std::string());
 
   int rank() override {
     return rank_;
@@ -160,6 +161,13 @@ class MeshGroup : public Group {
       const std::vector<ibv_context*>& ctxs,
       const ExchangeFn& exchange);
 
+  // (Re)build coord_channel_ -- the SUBGROUP's OWN dedicated TCP coordinator.
+  // See coord_channel_'s member comment below for why a subgroup must not
+  // share the parent's side_channel_. Called from the subgroup ctor and from
+  // rebuild_on_contexts() (post-reconnect_fresh). No-op on top-level groups
+  // and whenever coord_addr_ is empty (feature disabled / no address given).
+  void rebuild_coord_channel();
+
   void allocate_buffers();
 
   void open_trace_file_if_enabled();
@@ -188,6 +196,53 @@ class MeshGroup : public Group {
   // in the ctor, right after side_channel_, on a port derived
   // deterministically from the coordinator's own port (+1) -- see ctor.
   std::optional<SideChannel> p2p_channel_;
+  // ROOT-CAUSE FIX (2026-08-20, bug #8 of the jaccl-v2 chain): a SUBGROUP's
+  // OWN reliable TCP coordinator, used for confirmed_coord_barrier().
+  //
+  // Every ordered/reliable path in mesh_impl.h -- all_reduce's confirmed
+  // barrier, all_gather's confirmed barrier (0a8d8a4ee), the reliable and
+  // reliable-optimistic v2 paths -- is gated on `coordinator_ != nullptr`.
+  // Only the TOP-LEVEL ctor ever called mesh_.set_coordinator(), so on a
+  // subgroup coordinator_ stayed nullptr FOREVER and every one of those
+  // gates was structurally dead: MLX_JACCL_CONFIRMED_BARRIER_PRE=1 could
+  // not engage no matter what. exo's warmup control-plane all_gather
+  // (generate.py, "control-plane sync" after warmup token generation) runs
+  // on exactly such a subgroup via get_coord_group()/split(), so it kept
+  // taking the OLD ack_sync_pre-then-immediate-send path and kept hitting
+  // the send-before-peer-recv-posted UC drop that 0a8d8a4ee fixed for the
+  // parent group ("all_gather STALLED ... UC completion lost").
+  //
+  // The subgroup must NOT share the parent's side_channel_. Two reasons,
+  // both fatal:
+  //   1. SideChannel is a plain framed TCP stream with NO operation-id
+  //      demux, and the parent and subgroup hold SEPARATE collective
+  //      mutexes -- so a subgroup barrier and a concurrent parent
+  //      collective are two independent writers to one socket. That is
+  //      byte-for-byte the corruption p2p_channel_ was split out to fix on
+  //      2026-07-17 (see its comment above); repeating it here would just
+  //      move the bug.
+  //   2. call_id namespaces are per-group (each MeshGroup has its own
+  //      next_call_id_), so confirmed_coord_barrier's self-verifying
+  //      "all ranks report the same call_id" check would compare a
+  //      subgroup call_id against a parent call_id and throw spurious
+  //      DESYNC.
+  // Hence: a separate socket, on its own port.
+  //
+  // The port is NOT derived arithmetically from the parent's (that was the
+  // first design; it collides across co-hosted model instances whose base
+  // ports are near each other, and it fights TIME_WAIT on rebuild).
+  // Instead subgroup rank 0 reserves an ephemeral port
+  // (reserve_ephemeral_port()) and split() publishes "<ip>:<port>" to every
+  // rank over the PARENT's side_channel_ while the parent's
+  // collective_mutex_ is already held -- the same borrow-the-parent's-
+  // channel-under-the-parent's-lock pattern the QP destination exchange
+  // already uses, so it introduces no new concurrency.
+  std::optional<SideChannel> coord_channel_;
+  // Address ("<ip>:<port>") coord_channel_ binds/connects on, stashed from
+  // the subgroup ctor arg so rebuild_on_contexts() can rebuild the channel
+  // after the parent's reconnect_fresh() without re-plumbing a parameter.
+  // Empty on top-level groups (they use side_channel_ directly).
+  std::string coord_addr_;
   // Stashed verbatim from the ctor arg so reconnect()/reconnect_fresh() can
   // rebuild p2p_channel_ on the SAME derived port (coordinator_addr's port
   // + 1) without threading a new parameter through every call site. Empty

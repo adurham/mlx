@@ -28,6 +28,24 @@ address_t parse_address(const std::string& ip, const std::string& port);
 address_t parse_address(const std::string& ip_port);
 
 /**
+ * Reserve an ephemeral TCP port on `ip` and return it.
+ *
+ * Binds a throwaway socket to <ip>:0, reads back the kernel-assigned port
+ * with getsockname(), then closes the socket. The port is NOT held open --
+ * the caller is expected to publish it to its peers and then bind it for
+ * real. That leaves a small window in which an unrelated process could take
+ * the port, but the socket is closed without ever having accepted a
+ * connection (so it leaves no TIME_WAIT entry) and TCPSocket::listen() sets
+ * SO_REUSEADDR/SO_REUSEPORT, so the realistic failure mode is a clean
+ * bind error rather than silent cross-talk.
+ *
+ * Used by MeshGroup::split() to pick a collision-free port for a subgroup's
+ * dedicated coordinator SideChannel, instead of deriving one arithmetically
+ * from the parent's port (which collides across co-hosted model instances).
+ */
+int reserve_ephemeral_port(const std::string& ip);
+
+/**
  * Small wrapper over a TCP socket to simplify initiating connections.
  */
 class TCPSocket {

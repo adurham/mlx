@@ -2,12 +2,14 @@
 
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <unistd.h>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 
 #include "jaccl/tcp.h"
@@ -52,6 +54,41 @@ address_t parse_address(const std::string& ip_port) {
   std::string port(ip_port.begin() + colon + 1, ip_port.end());
 
   return parse_address(ip, port);
+}
+
+int reserve_ephemeral_port(const std::string& ip) {
+  auto addr = parse_address(ip, "0");
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s < 0) {
+    throw std::runtime_error(
+        "[jaccl] reserve_ephemeral_port: couldn't create socket");
+  }
+  int enable = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+  setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(int));
+  if (bind(s, addr.get(), addr.len) < 0) {
+    int e = errno;
+    close(s);
+    std::ostringstream msg;
+    msg << "[jaccl] reserve_ephemeral_port: bind failed on " << ip
+        << ":0 (errno=" << e << ")";
+    throw std::runtime_error(msg.str());
+  }
+  sockaddr_storage bound{};
+  socklen_t len = sizeof(bound);
+  if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) < 0) {
+    int e = errno;
+    close(s);
+    std::ostringstream msg;
+    msg << "[jaccl] reserve_ephemeral_port: getsockname failed (errno=" << e
+        << ")";
+    throw std::runtime_error(msg.str());
+  }
+  close(s);
+  if (bound.ss_family == AF_INET6) {
+    return ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
+  }
+  return ntohs(reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
 }
 
 TCPSocket::TCPSocket(const char* tag) {
