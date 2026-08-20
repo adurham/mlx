@@ -782,10 +782,43 @@ void MeshGroup::reconnect() {
   }
 
   const bool has_ack = !ack_connections_.empty();
-  // CRITICAL DIVERGENCE FROM pool_connections_ (2026-08-10): unlike
-  // pool_connections_ -- which this soft path deliberately does NOT touch,
-  // since jaccl-v2's reliable-optimistic path is opt-in and idle on the
-  // default configuration -- p2p_retry_connections_ MUST be reset and
+  // ROOT-CAUSE FIX (2026-08-20): pool_connections_ MUST get the full soft
+  // recovery too. The comment that used to sit here said this path
+  // "deliberately does NOT touch pool_connections_, since jaccl-v2's
+  // reliable-optimistic path is opt-in and idle on the default
+  // configuration." That premise is FALSE in the TP production config and
+  // caused a 100%-reproducible segfault:
+  //
+  //   MLX_JACCL_RELIABLE_DATA=1 + MLX_JACCL_RELIABLE_OPTIMISTIC=1 are launch
+  //   defaults, so all_reduce() dispatches EVERY collective to
+  //   reliable_all_reduce_v2, which posts and polls EXCLUSIVELY on
+  //   pool_connections_. Under TP the v2 pool QP is the always-active hot
+  //   path -- the exact opposite of "idle". (Confirmed from the crash log:
+  //   every collective before and after the fault is a [jaccl-v2] line.)
+  //
+  // The failure sequence: a TP all_gather wedges -> exo calls reconnect() ->
+  // has_split_ is true (get_coord_group()'s split()) so reconnect_fresh() is
+  // refused and we land here -> connections_/ack_connections_ are reset and
+  // fully re-established while the v2 pool QP is left EXACTLY as wedged as
+  // it was, still holding its pre-fault posted WRs, stale CQEs and old
+  // peer destination. Meanwhile reset_ack_state() below unconditionally
+  // clears the v2 SOFTWARE state (v2_pool_posted_, v2_stash_, v2_prev_*,
+  // v2_send_outstanding_). So the two halves of the same protocol
+  // disagree: software says "fresh call, empty pool", hardware still holds
+  // pre-wedge frames. The next collective re-arms 8 more recvs on top of
+  // the stale queue and consume_pool() then parses V2Hdrs out of
+  // pre-fault/garbage buffers, dispatching on uncontrolled call_id/seq/len
+  // -> segfault, deterministically, on both ranks, right after
+  // "reconnect COMPLETE" prints on a transport that never actually
+  // recovered.
+  //
+  // pool_connections_ owns its own PD/CQ/QP (see initialize()), so
+  // queue_pair_reset() flushes its WRs and drains its own CQ -- no stale
+  // completion survives into the re-armed pool. Subgroups never build
+  // pool_connections_ (both ctor and initialize() skip it), so nothing
+  // borrows these QPs and resetting them under has_split_ is safe.
+  const bool has_pool = !pool_connections_.empty();
+  // CRITICAL (2026-08-10): p2p_retry_connections_ MUST be reset and
   // re-established here. It replaces p2p_channel_, the ALWAYS-ACTIVE hot
   // path that every single send()/recv() call depends on; leaving its QPs
   // wedged across a reconnect would leave the p2p retry protocol dead on
@@ -795,10 +828,12 @@ void MeshGroup::reconnect() {
   const bool has_p2p_retry = !p2p_retry_connections_.empty();
   fprintf(
       stderr,
-      "[jaccl] reconnect rank=%d ENTER (size=%d has_ack=%d has_p2p_retry=%d)\n",
+      "[jaccl] reconnect rank=%d ENTER (size=%d has_ack=%d has_pool=%d "
+      "has_p2p_retry=%d)\n",
       rank_,
       size_,
       has_ack ? 1 : 0,
+      has_pool ? 1 : 0,
       has_p2p_retry ? 1 : 0);
   fflush(stderr);
 
@@ -810,6 +845,13 @@ void MeshGroup::reconnect() {
   }
   if (has_ack) {
     for (auto& conn : ack_connections_) {
+      if (conn.ctx != nullptr) {
+        conn.queue_pair_reset();
+      }
+    }
+  }
+  if (has_pool) {
+    for (auto& conn : pool_connections_) {
       if (conn.ctx != nullptr) {
         conn.queue_pair_reset();
       }
@@ -837,6 +879,9 @@ void MeshGroup::reconnect() {
     if (has_ack) {
       ack_connections_[peer].queue_pair_init();
     }
+    if (has_pool) {
+      pool_connections_[peer].queue_pair_init();
+    }
     if (has_p2p_retry) {
       p2p_retry_connections_[peer].queue_pair_init();
     }
@@ -860,6 +905,22 @@ void MeshGroup::reconnect() {
     }
     ack_all_infos = exchange(ack_info);
   }
+  // Pool QP destinations. Ordering matters: both ranks run this identical
+  // sequence of exchange() rounds over the same TCP side channel, so the
+  // pool round must sit at the SAME position on every rank. has_pool is
+  // derived from a vector the mode-gated ctor built identically
+  // cluster-wide (jaccl_pipeline_mode_enabled() is a cached static read
+  // from a cluster-wide env var), and both ranks reach this branch of
+  // reconnect() together because has_split_ flips at split(), itself a
+  // collective executed in matching order on all ranks.
+  std::vector<std::vector<Destination>> pool_all_infos;
+  if (has_pool) {
+    std::vector<Destination> pool_info;
+    for (auto& conn : pool_connections_) {
+      pool_info.emplace_back(conn.info());
+    }
+    pool_all_infos = exchange(pool_info);
+  }
   std::vector<std::vector<Destination>> p2p_retry_all_infos;
   if (has_p2p_retry) {
     std::vector<Destination> p2p_retry_info;
@@ -880,6 +941,10 @@ void MeshGroup::reconnect() {
     if (has_ack) {
       ack_connections_[peer].queue_pair_rtr(ack_all_infos[peer][rank_]);
       ack_connections_[peer].queue_pair_rts();
+    }
+    if (has_pool) {
+      pool_connections_[peer].queue_pair_rtr(pool_all_infos[peer][rank_]);
+      pool_connections_[peer].queue_pair_rts();
     }
     if (has_p2p_retry) {
       p2p_retry_connections_[peer].queue_pair_rtr(
@@ -914,6 +979,13 @@ void MeshGroup::reconnect() {
   //    both have finished rebuilding p2p_channel_.
   mesh_.reset_ack_state();
   mesh_.post_ack_recvs(0);
+  // The v2 pool QP was reset above, discarding its standing POOL_RECV_WR
+  // pool. Re-arm it here, fenced by the same final barrier -- otherwise the
+  // peer returns from reconnect() and its first reliable_all_reduce_v2 send
+  // lands on an empty recv queue, UC silently drops it, and the transport
+  // re-wedges immediately. reset_ack_state() just cleared v2_pool_posted_,
+  // so this call actually posts rather than short-circuiting.
+  mesh_.post_v2_pool_recvs();
   // The p2p-retry QPs were reset above, which discarded their standing recv
   // pool along with every other posted WR -- re-arm it here, fenced by the
   // same final barrier, or the peer's first post-reconnect retry frame lands
@@ -1093,6 +1165,12 @@ void MeshGroup::reconnect_fresh() {
       ring_recv_buffers_);
 
   mesh_.post_ack_recvs(0);
+  // Same rationale as reconnect(): pool_connections_ was rebuilt against
+  // fresh ctxs above, so its standing POOL_RECV_WR pool is gone. Arm it
+  // eagerly here rather than lazily on the next collective, so the bootstrap
+  // barrier below fences it -- a lazy arm happens after the barrier, i.e.
+  // after the peer is already free to send into an empty recv queue.
+  mesh_.post_v2_pool_recvs();
   mesh_.post_p2p_retry_recvs();
   // Section 52 (2026-08-15): same lifecycle, same rationale, for the DATA QP's
   // sz=0 class -- see post_data_recv_pool() for the measurement showing a

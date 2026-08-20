@@ -643,6 +643,26 @@ class MeshImpl {
     return std::min(jaccl_reliable_max_sz(), BUFFER_SIZES - 1);
   }
 
+  // Re-arm the jaccl-v2 standing pool after MeshGroup::reconnect() has put
+  // pool_connections_ back through RESET -> INIT -> exchange -> RTR/RTS.
+  // The QP reset flushed every previously-posted POOL_RECV_WR, so the pool
+  // MUST be re-posted here, fenced by reconnect()'s final barrier -- UC
+  // silently drops a send into an empty recv queue, so the peer's first
+  // post-reconnect v2 frame would otherwise vanish and re-wedge the
+  // transport immediately.
+  //
+  // reset_ack_state() has already cleared v2_pool_posted_ (along with the
+  // rest of the v2 software bookkeeping), so v2_ensure_pool() would post
+  // lazily on the next collective anyway -- but doing it there is too late:
+  // that post happens AFTER reconnect()'s barrier, i.e. after the peer is
+  // already free to send. Arming eagerly here is what closes that window.
+  void post_v2_pool_recvs() {
+    if (pool_connections_.empty() || size_ != 2) {
+      return;
+    }
+    v2_ensure_pool((rank_ == 0) ? 1 : 0);
+  }
+
   void v2_ensure_pool(int peer) {
     if (v2_pool_posted_) {
       return;
@@ -838,7 +858,14 @@ class MeshImpl {
       } else if (hdr.call_id == call_id) {
         peer_in_call = true;
         if (hdr.seq == V2_STATUS_SEQ) {
-          if (hdr.len == static_cast<uint32_t>(num_chunks)) {
+          // The status payload is a 1-byte-per-chunk mask following the
+          // header. num_chunks is derived locally, but hdr.len is off the
+          // wire, and a stale/partial DMA can present a large one -- so
+          // bound the mask read by the real buffer as well as by the
+          // equality check.
+          if (hdr.len == static_cast<uint32_t>(num_chunks) &&
+              static_cast<int64_t>(num_chunks) <=
+                  static_cast<int64_t>(rb.size()) - V2_HDR) {
             peer_want.assign(num_chunks, 0);
             for (int k = 0; k < num_chunks; k++) {
               peer_want[k] =
@@ -867,8 +894,18 @@ class MeshImpl {
         }
         if (hdr.seq == V2_STATUS_SEQ) {
           v2_stash_.has_status = true;
+          // Bound by the ACTUAL buffer, not a bare 16384 constant. hdr.len
+          // comes off the wire and is uncontrolled for a stale/partial DMA
+          // (e.g. a pre-reconnect frame), so clamping it to a hardcoded
+          // number that merely happens to equal rb.size() at the default
+          // size class (FRAME_SIZE 4096 << sz=2) still overreads by V2_HDR
+          // there, and overreads by far more at any smaller class. The
+          // sibling chunk branch below already bounds by rb.size() - V2_HDR;
+          // this branch was the copy that missed it.
+          const uint32_t cap =
+              static_cast<uint32_t>(rb.size() - V2_HDR);
           v2_stash_.peer_got.assign(
-              p + V2_HDR, p + V2_HDR + std::min<uint32_t>(hdr.len, 16384));
+              p + V2_HDR, p + V2_HDR + std::min<uint32_t>(hdr.len, cap));
         } else if (v2_stash_.chunks.size() < 512) {
           uint32_t len = std::min<uint32_t>(
               hdr.len, static_cast<uint32_t>(rb.size() - V2_HDR));
@@ -878,7 +915,12 @@ class MeshImpl {
       } else if (hdr.call_id < call_id) {
         if (hdr.seq == V2_STATUS_SEQ && hdr.call_id == v2_prev_call_ &&
             v2_prev_small_ &&
-            hdr.len == static_cast<uint32_t>(v2_prev_num_chunks_)) {
+            hdr.len == static_cast<uint32_t>(v2_prev_num_chunks_) &&
+            // Same buffer bound as the current-call status branch above --
+            // v2_prev_num_chunks_ is retained bookkeeping and must never be
+            // trusted to index this buffer without checking it.
+            static_cast<int64_t>(v2_prev_num_chunks_) <=
+                static_cast<int64_t>(rb.size()) - V2_HDR) {
           // Peer is stuck in the previous call: queue retransmits.
           v2_prev_want_.assign(v2_prev_num_chunks_, 0);
           for (int k = 0; k < v2_prev_num_chunks_; k++) {
