@@ -1921,24 +1921,58 @@ class MeshImpl {
     int completed_send_count[PIPELINE] = {0};
     int write_offset[MESH_MAX_PEERS] = {0};
 
-    // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
-    if (jaccl_ack_sync_pre_enabled()) {
-      ack_sync_pre(call_id);
-    }
-
-    // Prefill the pipeline
     int buff = 0;
-    while (read_offset < total && buff < PIPELINE) {
-      post_recv_all(call_id, sz, buff);
-      std::copy(
-          our_data + read_offset,
-          our_data + std::min(read_offset + N, total),
-          send_buffer(sz, buff).begin<char>());
-      post_send_all(call_id, sz, buff);
+    if (coordinator_ != nullptr && jaccl_confirmed_barrier_pre()) {
+      // ORDERED start barrier -- identical shape to all_reduce's prefill
+      // (see the long comment there). all_gather was left on the bare
+      // ack_sync_pre path, which does NOT establish the ordering this
+      // collective needs: ack_sync_pre only proves the peer ENTERED the
+      // call (it exits as soon as the peer's ACK frame lands on the
+      // dedicated ACK QP), not that the peer has posted its DATA recv WRs
+      // on connections_. The peer posts its ACK *before* its data recvs,
+      // so whichever rank exits drain_acks first can post_send_all() into
+      // a peer whose data recv FIFO is still empty -- and UC drops that
+      // frame silently, with no completion ever generated on either side.
+      // That is exactly the observed first-collective-after-fresh-QP
+      // signature: "all_gather STALLED ... no forward progress ... UC
+      // completion lost" with in_flight stuck at its initial value.
+      // Fix: post ALL prefill recvs and fill the send buffers, THEN
+      // rendezvous over the reliable TCP coordinator (so BOTH ranks
+      // provably have their recvs posted), THEN post the sends.
+      int first = buff;
+      while (read_offset < total && buff < PIPELINE) {
+        post_recv_all(call_id, sz, buff);
+        std::copy(
+            our_data + read_offset,
+            our_data + std::min(read_offset + N, total),
+            send_buffer(sz, buff).begin<char>());
+        buff++;
+        in_flight += 2 * num_peers;
+        read_offset += N;
+      }
+      confirmed_coord_barrier(call_id, "pre");
+      for (int b = first; b < buff; b++) {
+        post_send_all(call_id, sz, b);
+      }
+    } else {
+      // Start-of-lambda cross-rank barrier. See ack_sync_pre doc above.
+      if (jaccl_ack_sync_pre_enabled()) {
+        ack_sync_pre(call_id);
+      }
 
-      buff++;
-      in_flight += 2 * num_peers;
-      read_offset += N;
+      // Prefill the pipeline
+      while (read_offset < total && buff < PIPELINE) {
+        post_recv_all(call_id, sz, buff);
+        std::copy(
+            our_data + read_offset,
+            our_data + std::min(read_offset + N, total),
+            send_buffer(sz, buff).begin<char>());
+        post_send_all(call_id, sz, buff);
+
+        buff++;
+        in_flight += 2 * num_peers;
+        read_offset += N;
+      }
     }
 
     // Main loop: keep going until we have no data in flight.
