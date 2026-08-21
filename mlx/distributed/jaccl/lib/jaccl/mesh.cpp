@@ -469,6 +469,20 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
   // exchange or the QP setup.
   std::lock_guard<std::mutex> guard(collective_mutex_);
 
+  // DIAGNOSTIC (2026-08-20, bug #8 investigation): the coordinator-channel
+  // "ready" log never appears in production, so either split() itself is
+  // never reached or coordinator_addr_ is unexpectedly empty at this point.
+  // Trace both directly rather than guessing further.
+  fprintf(
+      stderr,
+      "[jaccl-diag] split rank=%d color=%d ENTER coordinator_addr_='%s' "
+      "has_side_channel=%d\n",
+      rank_,
+      color,
+      coordinator_addr_.c_str(),
+      side_channel_.has_value() ? 1 : 0);
+  fflush(stderr);
+
   if (!side_channel_.has_value()) {
     throw std::runtime_error(
         "[jaccl] split is only supported on top-level groups (not on a "
