@@ -348,11 +348,31 @@ MeshGroup::MeshGroup(
     std::cerr << std::endl;
   }
 
+  // DIAGNOSTIC (2026-08-20, bug #8 investigation): unconditional milestone
+  // trace -- coord_channel_'s "ready" log never fires in production, so
+  // this pinpoints whether the stall is inside initialize() (the RDMA
+  // bring-up: PD/CQ/QP -> MRs -> INIT -> exchange -> RTR/RTS, over the
+  // parent's side_channel_) or after it.
+  fprintf(
+      stderr,
+      "[jaccl-diag] subgroup rank=%d color=%d BEFORE initialize()\n",
+      rank_,
+      color_);
+  fflush(stderr);
+
   // Run the same init sequence as the top-level path. The order
   // (PD/CQ/QP → MRs → INIT → exchange → RTR/RTS) matters; macOS
   // librdma locks the QP's MR table at the INIT transition, so MRs
   // must be registered before that.
   initialize(exchange);
+
+  fprintf(
+      stderr,
+      "[jaccl-diag] subgroup rank=%d color=%d AFTER initialize()\n",
+      rank_,
+      color_);
+  fflush(stderr);
+
 
   // NOTE: like pool_connections_, p2p_retry_connections_ is NOT built for
   // subgroups -- both stay empty here and are passed through to MeshImpl as
