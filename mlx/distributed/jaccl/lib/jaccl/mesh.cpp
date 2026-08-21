@@ -14,18 +14,43 @@
 
 namespace jaccl {
 
-// HARDWARE QP BUDGET (2026-08-10, root-cause fix for the PREPARING crash-loop).
+// HARDWARE QP BUDGET (2026-08-10, root-cause fix for the PREPARING crash-loop;
+// scope clarified 2026-08-21).
 //
 // Apple's Thunderbolt RDMA device reports max_qp=3 per HCA (verified with
 // `ibv_devinfo -v` on BOTH cluster nodes: rdma_en2/rdma_en3 alike report
-// max_qp:3, max_cq:6, max_pd:6). The top-level MeshGroup ctor had grown to
-// unconditionally build FOUR dedicated QP types per peer -- connections_
-// (data), ack_connections_, pool_connections_, and p2p_retry_connections_
-// (added earlier today for the TCP->RDMA p2p-retry migration). The fourth
-// ibv_create_qp therefore ALWAYS failed with EBUSY ("Couldn't create queue
-// pair"). utils_mlx.py's _init_jaccl_with_backoff was written for a genuinely
-// transient cause (leaked QPs from a crashed runner) and retried forever
-// without ever succeeding, because this cause is STRUCTURAL, not transient.
+// max_qp:3, max_cq:6, max_pd:6). NOT PUBLICLY DOCUMENTED by Apple as far as
+// we've found (checked TN3205 "Low-latency communication with RDMA over
+// Thunderbolt" and the developer forums) -- this number is empirical, read
+// live off this hardware's driver, not a spec value. Treat it as "true for
+// the HCAs we've tested," not as an Apple-guaranteed constant.
+//
+// SCOPE: PER HCA (PER PHYSICAL CABLE/PORT), NOT SYSTEM-WIDE. Verified by
+// reading create_connections() in rdma.cpp: it opens ONE ibv_context PER
+// DEVICE NAME in `device_names` (one context per physical Thunderbolt
+// cable), and connections_/ack_connections_/pool_connections_ all borrow
+// THAT SAME context (owns_ctx=false) -- i.e. all 3 QP types described below
+// live on ONE HCA's 3-QP budget. A second RDMA-capable cable (this cluster
+// has two: rdma_en3 + rdma_en4, each independently PORT_ACTIVE and each
+// independently reporting max_qp=3) has its OWN separate 3-QP budget. The
+// current topology opens `connections_` (the TP data path) on only ONE of
+// the two cables; the other is dedicated to jaccl's TCP coordinator traffic
+// (see the dual-cable topology split, 2026-08-21, placement_utils.py's
+// find_ip_prioritised/get_mlx_jaccl_coordinators) and its RDMA QP budget
+// currently sits entirely unused. If TP ever needs a 4th RDMA-native QP on
+// this cluster, opening it against the SECOND device's context (instead of
+// borrowing the first device's, as connections_/ack_connections_/
+// pool_connections_ do today) is the way to get one without hitting this
+// ceiling again -- not evaluated/implemented, flagged for whoever needs it.
+//
+// The top-level MeshGroup ctor had grown to unconditionally build FOUR
+// dedicated QP types per peer -- connections_ (data), ack_connections_,
+// pool_connections_, and p2p_retry_connections_ (added earlier today for the
+// TCP->RDMA p2p-retry migration). The fourth ibv_create_qp therefore ALWAYS
+// failed with EBUSY ("Couldn't create queue pair"). utils_mlx.py's
+// _init_jaccl_with_backoff was written for a genuinely transient cause
+// (leaked QPs from a crashed runner) and retried forever without ever
+// succeeding, because this cause is STRUCTURAL, not transient.
 //
 // The fix is not to retry harder -- it is to stop allocating QPs the running
 // mode will never use. The two modes need disjoint fourth QPs:
@@ -43,7 +68,51 @@ namespace jaccl {
 //       throughout TP's collectives. TP never calls the raw send()/recv() p2p
 //       path, so p2p_retry_connections_ is NOT built.
 //
-// Either way the mesh allocates exactly 3 QPs per peer and fits the budget.
+// Either way the mesh allocates exactly 3 QPs per peer and fits ONE HCA's
+// budget.
+//
+// WHY THESE 3 ARE NOT MERGEABLE INTO FEWER QPs (considered and rejected,
+// 2026-08-21): all three carry hot-path traffic for the SAME per-layer,
+// per-token collective (all_reduce/all_gather), not separable/optional
+// coordination overhead -- ack_connections_ fires twice per collective
+// (ack_sync_pre/ack_sync_post) on every one of 43 model layers, on every
+// prefill chunk AND every decode step; pool_connections_ is the standing
+// recv pool for the same collective's reliable-optimistic fast path. Merging
+// pool_connections_ into connections_ was tried once (pre-2026-07-17,
+// commit history: "dedicated QP for jaccl-v2 reliable-ARQ pool to coexist
+// with PP p2p") and caused REAL, OBSERVED corruption: pool_connections_'s
+// recv buffers use ONE UNIFORM SIZE CLASS (v2_pool_sz_); connections_ posts
+// buffers sized PER MESSAGE. A size mismatch on a shared QP throws
+// IBV_WC_LOC_LEN_ERR at the ibverbs/hardware level (buffer matching happens
+// below any application-layer framing -- self-delimiting message tagging
+// CANNOT prevent this, since the NIC commits to a receive buffer before any
+// software sees a framing byte), and since completion-error handling didn't
+// tag which logical stream (pool vs. raw data) an errored WR belonged to, it
+// silently discarded the slot instead of re-arming it -- eventually
+// starving the fixed-size pool and wedging BOTH traffic classes. The QP
+// split is the fix, not a workaround pending a better one: separate recv
+// queues is the only way to make that size-class collision structurally
+// impossible. (Consulted externally 2026-08-21 on whether this analysis
+// holds: confirmed -- ibverbs recv-buffer matching is below the framing
+// layer, so tagging fixes recovery but not the underlying collision; a real
+// merge would need uniform max-size buffers everywhere [wastes bandwidth on
+// every message] or an RDMA-write-with-immediate redesign [large transport
+// rewrite], not attempted.)
+//
+// WHAT *IS* SAFE TO MOVE OFF RDMA, AND WHAT ISN'T: this cluster's standing
+// principle (2026-08-21) is RDMA reserved for genuinely latency-critical
+// hot-path traffic; TCP for anything latency-tolerant given TCP's real
+// measured cost here (~0.8ms RDMA vs ~2-3ms TCP-over-Thunderbolt-bridge per
+// collective activation, ~30-50% higher CPU overhead -- see warm memory /
+// docs/dual-cable-topology-and-qp-budget-2026-08-21.md). One-time warmup
+// handshakes and per-decode-step task agreement (once per step, not once
+// per layer) fit that profile and now run over CoordGroup's dedicated TCP
+// channel (jaccl/coord_group.h, 2026-08-20/21) instead of contending for RDMA
+// QP budget. ack_connections_/pool_connections_ do NOT fit that profile --
+// they ARE the per-layer, per-token hot path, not something riding alongside
+// it -- so they stay on RDMA. See the doc above for the full writeup and the
+// reasoning trail, so this doesn't need re-litigating from scratch next time
+// someone eyes the QP count and asks the same reasonable question.
 //
 // WHY getenv AND NOT A CTOR PARAMETER: MeshGroup's top-level ctor signature
 // (rank, device_names, coordinator_addr) is reached through mlx's generic
