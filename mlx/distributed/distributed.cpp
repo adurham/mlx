@@ -138,6 +138,10 @@ Group Group::split(int color, int key /* = -1 */) const {
   return Group(group_->split(color, key));
 }
 
+Group Group::split_tcp_coord(int color) const {
+  return Group(group_->split_tcp_coord(color));
+}
+
 void Group::reconnect() const {
   group_->reconnect();
 }

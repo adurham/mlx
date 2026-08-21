@@ -41,6 +41,22 @@ class Group {
   virtual std::shared_ptr<Group> split(int color, int key = -1) {
     throw std::runtime_error("[jaccl] Group split not supported.");
   }
+
+  // Create a QP-LESS, TCP-only sibling group for small CONTROL-PLANE
+  // collectives (all_sum / all_max / all_min / all_gather / barrier on tiny
+  // payloads), with its own call_id namespace and its own dedicated socket.
+  //
+  // Unlike split(), this allocates NO RDMA queue pairs and borrows no device
+  // state from the parent. That is the entire point: Apple's Thunderbolt HCA
+  // reports max_qp=3 per device, and under Tensor sharding the top-level
+  // group already holds all three -- so split() can NEVER succeed there.
+  // See CoordGroup's class comment in coord_group.h for the full root cause.
+  //
+  // Default: not supported (backends without a TCP coordinator).
+  virtual std::shared_ptr<Group> split_tcp_coord(int color) {
+    throw std::runtime_error(
+        "[jaccl] TCP-only coord group not supported by this backend.");
+  }
 };
 
 /**

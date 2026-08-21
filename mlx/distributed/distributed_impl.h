@@ -21,6 +21,16 @@ class GroupImpl {
   virtual int size() = 0;
   virtual std::shared_ptr<GroupImpl> split(int color, int key = -1) = 0;
 
+  // Create a QP-less, TCP-backed sibling group for small CONTROL-PLANE
+  // collectives, with its own call_id namespace. Unlike split() this
+  // allocates no RDMA resources at all, which is the only way it can work on
+  // hardware whose queue-pair budget is already exhausted by the top-level
+  // group (Apple Thunderbolt HCA: max_qp=3). Default: not supported.
+  virtual std::shared_ptr<GroupImpl> split_tcp_coord(int color) {
+    throw std::runtime_error(
+        "This distributed backend does not support a TCP-only coord group.");
+  }
+
   // In-place recovery of a wedged transport (reset + re-establish connections
   // without a full re-place). Default no-op; overridden by backends that
   // support it (jaccl). Both ranks must call it.

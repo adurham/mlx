@@ -183,6 +183,14 @@ class JACCLGroup : public GroupImpl {
     return std::make_shared<JACCLGroup>(std::move(sub_group));
   }
 
+  std::shared_ptr<GroupImpl> split_tcp_coord(int color) override {
+    auto sub_group = group_->split_tcp_coord(color);
+    if (sub_group == nullptr) {
+      return nullptr;
+    }
+    return std::make_shared<JACCLGroup>(std::move(sub_group));
+  }
+
   void reconnect() override {
     group_->reconnect();
   }

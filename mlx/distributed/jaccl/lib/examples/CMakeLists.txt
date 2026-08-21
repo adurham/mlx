@@ -43,3 +43,7 @@ build_example(allreduce_bench.cpp)
 # Probes (feasibility experiments)
 build_example(uc_rdma_write_probe.cpp)
 build_example(hopid_budget_probe.cpp)
+
+# Tests. coord_group_loopback_test needs NO RDMA hardware -- it forks two
+# ranks over 127.0.0.1 and exercises the QP-less TCP coord group end to end.
+build_example(coord_group_loopback_test.cpp)

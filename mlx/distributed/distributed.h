@@ -41,6 +41,23 @@ struct MLX_API Group {
   Group split(int color, int key = -1) const;
 
   /**
+   * Create a QP-less, TCP-backed sibling group intended purely for small
+   * CONTROL-PLANE collectives (all_sum / all_max / all_min / all_gather on
+   * tiny payloads), with its own isolated call_id namespace and its own
+   * dedicated socket.
+   *
+   * Unlike ``split``, this allocates NO RDMA queue pairs and borrows no
+   * device state from the parent group. That matters on hardware whose
+   * queue-pair budget is already fully consumed by the top-level group
+   * (Apple's Thunderbolt HCA reports max_qp=3 per device), where ``split``
+   * can never succeed at all. Point-to-point ``send``/``recv`` and bulk
+   * payloads are deliberately unsupported on the returned group.
+   *
+   * Only the jaccl backend supports this; other backends throw.
+   */
+  Group split_tcp_coord(int color) const;
+
+  /**
    * In-place recovery of a wedged distributed transport: reset and
    * re-establish the underlying connections without tearing the process down.
    * All ranks must call this together. No-op for backends that don't support

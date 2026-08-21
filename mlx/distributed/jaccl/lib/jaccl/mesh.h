@@ -96,6 +96,22 @@ class MeshGroup : public Group {
   // on a subgroup (subgroup has no SideChannel for the destination exchange).
   std::shared_ptr<Group> split(int color, int key = -1) override;
 
+  // ROOT-CAUSE FIX (2026-08-21): QP-less, TCP-only coord subgroup. Replaces
+  // split() for exo's get_coord_group() control-plane path, which could
+  // never work over RDMA on this hardware (max_qp=3, all three already held
+  // by the top-level group under Tensor sharding). Reserves an ephemeral
+  // port on rank 0, publishes it over THIS group's side_channel_ (under
+  // collective_mutex_, same borrow-under-the-parent's-lock pattern split()
+  // uses for the QP destination exchange), and returns a CoordGroup that
+  // owns a dedicated SideChannel and NOTHING device-side.
+  //
+  // Deliberately does NOT set has_split_ and does NOT register in
+  // subgroups_: the returned group borrows no ibv_context, so the parent
+  // keeps unrestricted reconnect_fresh() capability -- the only recovery
+  // that clears a dead-UC wedge (see reconnect_fresh()'s comment above).
+  // The RDMA split() path permanently forfeited that.
+  std::shared_ptr<Group> split_tcp_coord(int color) override;
+
  private:
   template <typename T, typename ReduceOp>
   void all_reduce(

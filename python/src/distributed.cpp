@@ -209,6 +209,30 @@ void init_distributed(nb::module_& parent_module) {
               color (int): A value to group processes into subgroups.
               key (int, optional): A key to optionally change the rank ordering
                 of the processes.
+          )pbdoc")
+      .def(
+          "split_tcp_coord",
+          &mx::distributed::Group::split_tcp_coord,
+          "color"_a,
+          nb::sig("def split_tcp_coord(self, color: int) -> Group"),
+          R"pbdoc(
+            Create a QP-less, TCP-backed sibling group for small
+            control-plane collectives.
+
+            The returned group supports ``all_sum``/``all_max``/``all_min``/
+            ``all_gather`` on SMALL payloads and has its own isolated
+            call_id namespace, so control-plane traffic never shares an
+            ordered transport or a call_id counter with the parent group's
+            model traffic. It allocates NO RDMA queue pairs at all, so it
+            works even when the device's queue-pair budget is fully consumed
+            by the parent group. Point-to-point ``send``/``recv`` and bulk
+            payloads are not supported on it.
+
+            Every rank must call this with the same ``color``, in matching
+            order. Only the ``jaccl`` backend supports it; others raise.
+
+            Args:
+              color (int): A value to group processes into subgroups.
           )pbdoc");
 
   m.def(

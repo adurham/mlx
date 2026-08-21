@@ -8,6 +8,7 @@
 #include <string_view>
 #include <unistd.h>
 
+#include "jaccl/coord_group.h"
 #include "jaccl/reduction_ops.h"
 #include "jaccl/types.h"
 
@@ -348,30 +349,11 @@ MeshGroup::MeshGroup(
     std::cerr << std::endl;
   }
 
-  // DIAGNOSTIC (2026-08-20, bug #8 investigation): unconditional milestone
-  // trace -- coord_channel_'s "ready" log never fires in production, so
-  // this pinpoints whether the stall is inside initialize() (the RDMA
-  // bring-up: PD/CQ/QP -> MRs -> INIT -> exchange -> RTR/RTS, over the
-  // parent's side_channel_) or after it.
-  fprintf(
-      stderr,
-      "[jaccl-diag] subgroup rank=%d color=%d BEFORE initialize()\n",
-      rank_,
-      color_);
-  fflush(stderr);
-
   // Run the same init sequence as the top-level path. The order
   // (PD/CQ/QP → MRs → INIT → exchange → RTR/RTS) matters; macOS
   // librdma locks the QP's MR table at the INIT transition, so MRs
   // must be registered before that.
   initialize(exchange);
-
-  fprintf(
-      stderr,
-      "[jaccl-diag] subgroup rank=%d color=%d AFTER initialize()\n",
-      rank_,
-      color_);
-  fflush(stderr);
 
 
   // NOTE: like pool_connections_, p2p_retry_connections_ is NOT built for
@@ -489,20 +471,6 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
   // exchange or the QP setup.
   std::lock_guard<std::mutex> guard(collective_mutex_);
 
-  // DIAGNOSTIC (2026-08-20, bug #8 investigation): the coordinator-channel
-  // "ready" log never appears in production, so either split() itself is
-  // never reached or coordinator_addr_ is unexpectedly empty at this point.
-  // Trace both directly rather than guessing further.
-  fprintf(
-      stderr,
-      "[jaccl-diag] split rank=%d color=%d ENTER coordinator_addr_='%s' "
-      "has_side_channel=%d\n",
-      rank_,
-      color,
-      coordinator_addr_.c_str(),
-      side_channel_.has_value() ? 1 : 0);
-  fflush(stderr);
-
   if (!side_channel_.has_value()) {
     throw std::runtime_error(
         "[jaccl] split is only supported on top-level groups (not on a "
@@ -611,6 +579,72 @@ std::shared_ptr<Group> MeshGroup::split(int color, int key) {
     subgroups_.push_back(sub);
   }
   return sub;
+}
+
+std::shared_ptr<Group> MeshGroup::split_tcp_coord(int color) {
+  // Same collective discipline as split(): hold the mutex so no other
+  // collective on this group can race our use of side_channel_.
+  std::lock_guard<std::mutex> guard(collective_mutex_);
+
+  if (!side_channel_.has_value()) {
+    throw std::runtime_error(
+        "[jaccl] split_tcp_coord is only supported on top-level groups (not "
+        "on a subgroup created by an earlier split).");
+  }
+
+  // Verify all ranks agree on the color -- same contract as split(), and it
+  // doubles as proof that every rank reached this call in matching order
+  // before we start binding sockets.
+  auto colors = side_channel_->all_gather<int>(color);
+  for (int peer = 0; peer < size_; peer++) {
+    if (colors[peer] != color) {
+      std::ostringstream msg;
+      msg << "[jaccl] split_tcp_coord requires every rank to use the same "
+          << "color (rank " << peer << " gave color=" << colors[peer]
+          << ", this rank gave color=" << color << ").";
+      throw std::runtime_error(msg.str());
+    }
+  }
+
+  if (coordinator_addr_.empty()) {
+    throw std::runtime_error(
+        "[jaccl] split_tcp_coord needs the group's coordinator address to "
+        "derive the coord group's own listen IP, but coordinator_addr_ is "
+        "empty.");
+  }
+  auto colon = coordinator_addr_.find(':');
+  if (colon == std::string::npos) {
+    throw std::runtime_error(
+        "[jaccl] Can't derive a TCP coord group address from "
+        "coordinator_addr (missing ':'): " +
+        coordinator_addr_);
+  }
+  // Only the PORT is exchanged, never the address. rank 0's own
+  // coordinator_addr_ is a LISTEN address ("0.0.0.0:<port>", assigned that
+  // way by exo's placement layer) while every other rank holds rank 0's
+  // routable IP -- broadcasting rank 0's string would hand the peers
+  // "0.0.0.0" to connect to. Each rank keeps the IP half of its OWN
+  // coordinator_addr_ and adopts only rank 0's port. Byte-for-byte the same
+  // construction split() uses for the subgroup coordinator and
+  // rebuild_p2p_channel() uses for p2p_channel_.
+  //
+  // An EPHEMERAL port, not coordinator_port+N: co-hosted model instances get
+  // base ports assigned independently by exo's placement layer, so arithmetic
+  // derivation can collide with another instance's coordinator, and
+  // re-binding a fixed port fights TIME_WAIT.
+  std::string ip = coordinator_addr_.substr(0, colon);
+  int proposed = (rank_ == 0) ? reserve_ephemeral_port(ip) : 0;
+  auto ports = side_channel_->all_gather<int>(proposed);
+  std::string coord_addr = ip + ":" + std::to_string(ports[0]);
+
+  // NOTE: has_split_ is deliberately NOT set and the result is NOT pushed
+  // into subgroups_. A CoordGroup holds no ibv_context, no PD/CQ/QP and no
+  // MRs -- there is nothing for the parent's device close/reopen to dangle,
+  // and nothing to tear down and rebuild across reconnect_fresh(). Keeping
+  // has_split_ false is the point: it preserves the parent's unrestricted
+  // reconnect_fresh(), which mesh.h documents as the only recovery that
+  // actually clears a dead-UC wedge.
+  return std::make_shared<CoordGroup>(rank_, size_, coord_addr);
 }
 
 void MeshGroup::open_trace_file_if_enabled() {
