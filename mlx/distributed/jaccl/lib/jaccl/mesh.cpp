@@ -736,10 +736,14 @@ void MeshGroup::open_trace_file_if_enabled() {
   }
   const char* hash_env = std::getenv("JACCL_TRACE_HASH");
   hash_enabled_ = (hash_env != nullptr && std::string_view(hash_env) == "1");
+  const char* timing_env = std::getenv("JACCL_TRACE_TIMING");
+  timing_enabled_ =
+      (timing_env != nullptr && std::string_view(timing_env) == "1");
   std::fprintf(
       trace_file_,
-      "# call_id\top\tmsg_bytes%s\n",
-      hash_enabled_ ? "\thash" : "");
+      "# call_id\top\tmsg_bytes%s%s\n",
+      hash_enabled_ ? "\thash" : "",
+      timing_enabled_ ? "\ttransport_us" : "");
   std::fflush(trace_file_);
 }
 
@@ -750,14 +754,33 @@ void MeshGroup::trace_call(
   if (trace_file_ == nullptr) {
     return;
   }
-  // Suppress trailing newline when hash diagnostic is enabled — the
-  // hash, computed after the collective completes, will append it.
+  // Suppress trailing newline when a post-completion diagnostic (timing
+  // and/or hash) is enabled — whichever of those fires last appends it.
+  bool suppress_newline = hash_enabled_ || timing_enabled_;
   std::fprintf(
       trace_file_,
       "%u\t%s\t%lld%s",
       call_id,
       op,
       static_cast<long long>(msg_bytes),
+      suppress_newline ? "" : "\n");
+  std::fflush(trace_file_);
+}
+
+void MeshGroup::trace_duration(uint32_t call_id, double transport_us) {
+  if (trace_file_ == nullptr || !timing_enabled_) {
+    return;
+  }
+  // call_id is accepted for symmetry with trace_call/trace_hash and as a
+  // future cross-check hook (e.g. asserting monotonic call_id ordering
+  // in a post-processing script) -- not written into the line itself,
+  // since the value is always appended immediately after trace_call's
+  // matching call_id/op/bytes triple, making a duplicate redundant.
+  (void)call_id;
+  std::fprintf(
+      trace_file_,
+      "\ttransport_us=%.1f%s",
+      transport_us,
       hash_enabled_ ? "" : "\n");
   std::fflush(trace_file_);
 }
@@ -1884,10 +1907,29 @@ void MeshGroup::all_sum(
   std::lock_guard<std::mutex> guard(collective_mutex_);
   uint32_t call_id = next_call_id();
   trace_call(call_id, "all_sum", static_cast<int64_t>(n_bytes));
+  // 2026-08-21: real steady_clock timing tightly around the actual
+  // transport call, gated by JACCL_TRACE_TIMING=1. This measures the
+  // genuine per-call cost of this rank's ring-reduce transport
+  // (dispatch + wait-for-peer + wire), i.e. real time spent INSIDE
+  // jaccl, as opposed to sync-span/perf_counter approaches that
+  // (per an independent review) either measure near-nothing if MLX's
+  // graph is lazy, or conflate this cost with unrelated upstream work
+  // if forced eager. Overhead when JACCL_TRACE_TIMING is unset: a single
+  // relaxed bool check, no clock reads.
+  std::chrono::steady_clock::time_point t0;
+  if (timing_enabled_) {
+    t0 = std::chrono::steady_clock::now();
+  }
   dispatch_all_types(dtype, [&](auto type_tag) {
     using T = JACCL_GET_TYPE(type_tag);
     all_reduce<T>(call_id, input, output, n_bytes, SumOp<T>{});
   });
+  if (timing_enabled_) {
+    auto t1 = std::chrono::steady_clock::now();
+    double us =
+        std::chrono::duration<double, std::micro>(t1 - t0).count();
+    trace_duration(call_id, us);
+  }
   trace_hash(call_id, output, static_cast<int64_t>(n_bytes));
 }
 

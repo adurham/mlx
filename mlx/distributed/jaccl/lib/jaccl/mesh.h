@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -189,6 +190,22 @@ class MeshGroup : public Group {
   void open_trace_file_if_enabled();
   void trace_call(uint32_t call_id, const char* op, int64_t msg_bytes);
   void trace_hash(uint32_t call_id, const void* data, int64_t n_bytes);
+  // 2026-08-21: env-gated (JACCL_TRACE_TIMING=1, requires JACCL_TRACE_CALLS=1
+  // to also be set since it reuses that trace file) real steady_clock
+  // duration around the transport call inside a collective, appended to
+  // the same per-call trace line trace_call() already writes. Distinct
+  // from trace_call's own timestamp (that's just a call-ordering log
+  // line, written once at dispatch with no duration). This exists to
+  // decompose the moe.all_sum 34x software-overhead gap (raw jaccl wire
+  // floor ~120us vs in-model sync-span average ~4094us, see
+  // docs/offline-collective-microbenchmark-2026-08-21.md) into real
+  // per-call jaccl-internal transport duration vs whatever overhead sits
+  // OUTSIDE this call (MLX dispatch/eval-fence/rank-skew) -- a live
+  // NOP-ablation attempt at getting this same signal was found unsafe
+  // (destabilized the cluster) so this read-only timing probe is the
+  // safer replacement path. Overhead when disabled: one env var read at
+  // MeshGroup construction, then a single relaxed bool check per call.
+  void trace_duration(uint32_t call_id, double transport_us);
 
   int rank_;
   int size_;
@@ -355,6 +372,9 @@ class MeshGroup : public Group {
 
   FILE* trace_file_ = nullptr;
   bool hash_enabled_ = false;
+  // See trace_duration() above. Independent of hash_enabled_ -- both are
+  // opt-in add-ons to the base JACCL_TRACE_CALLS trace file.
+  bool timing_enabled_ = false;
   // Set by split(): subgroups borrow our ibv contexts.
   //
   // Historically this permanently disabled reconnect_fresh() (device close
