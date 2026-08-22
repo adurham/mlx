@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <cstdio>
+
 #include "jaccl/group.h"
 #include "jaccl/rdma.h"
 #include "jaccl/ring_impl.h"
@@ -79,6 +81,26 @@ class RingGroup : public Group {
   std::vector<SharedBuffer> send_buffers_;
   std::vector<SharedBuffer> recv_buffers_;
   RingImpl ring_;
+
+  // 2026-08-21: env-gated (JACCL_TRACE_TIMING=1) real steady_clock
+  // duration around this rank's all_sum transport call, appended as one
+  // line per call to /tmp/jaccl_ring_trace_rank_<rank>_pid_<pid>.log.
+  // Standalone (not shared with MeshGroup's JACCL_TRACE_CALLS/
+  // JACCL_TRACE_HASH machinery -- RingGroup had no existing trace
+  // infrastructure at all) because RingGroup, not MeshGroup, is the
+  // group class actually used for this 2-node ring topology
+  // (confirmed via jaccl.cpp's init(): cfg.get_prefer_ring() &&
+  // cfg.is_valid_ring() routes here first). Built to decompose the
+  // moe.all_sum 34x software-overhead gap (raw jaccl wire floor ~120us
+  // via an isolated microbenchmark vs in-model sync-span average
+  // ~4094us, see docs/offline-collective-microbenchmark-2026-08-21.md).
+  // Overhead when unset: one bool check per call, no clock reads, no
+  // I/O. Init happens lazily on first all_sum call (not in the
+  // constructor) to avoid touching RingGroup's constructor signature.
+  bool timing_enabled_ = false;
+  bool timing_checked_ = false;
+  FILE* timing_file_ = nullptr;
+  void maybe_open_timing_file();
 };
 
 } // namespace jaccl

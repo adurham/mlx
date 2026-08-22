@@ -1,10 +1,44 @@
 // Copyright © 2026 Apple Inc.
 
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <string_view>
+#include <unistd.h>
+
 #include "jaccl/ring.h"
 #include "jaccl/reduction_ops.h"
 #include "jaccl/types.h"
 
 namespace jaccl {
+
+void RingGroup::maybe_open_timing_file() {
+  if (timing_checked_) {
+    return;
+  }
+  timing_checked_ = true;
+  const char* env = std::getenv("JACCL_TRACE_TIMING");
+  if (env == nullptr || std::string_view(env) != "1") {
+    return;
+  }
+  timing_enabled_ = true;
+  char path[160];
+  std::snprintf(
+      path,
+      sizeof(path),
+      "/tmp/jaccl_ring_trace_rank_%d_pid_%d.log",
+      rank_,
+      static_cast<int>(getpid()));
+  timing_file_ = std::fopen(path, "w");
+  if (timing_file_ == nullptr) {
+    std::cerr << "[jaccl] Failed to open ring timing trace file " << path
+               << "\n";
+    timing_enabled_ = false;
+    return;
+  }
+  std::fprintf(timing_file_, "# op\ttransport_us\tn_bytes\n");
+  std::fflush(timing_file_);
+}
 
 RingGroup::RingGroup(
     int rank,
@@ -130,10 +164,26 @@ void RingGroup::all_sum(
     void* output,
     size_t n_bytes,
     int dtype) {
+  maybe_open_timing_file();
+  std::chrono::steady_clock::time_point t0;
+  if (timing_enabled_) {
+    t0 = std::chrono::steady_clock::now();
+  }
   dispatch_all_types(dtype, [&](auto type_tag) {
     using T = JACCL_GET_TYPE(type_tag);
     all_reduce<T>(input, output, n_bytes, SumOp<T>{});
   });
+  if (timing_enabled_ && timing_file_ != nullptr) {
+    auto t1 = std::chrono::steady_clock::now();
+    double us =
+        std::chrono::duration<double, std::micro>(t1 - t0).count();
+    std::fprintf(
+        timing_file_,
+        "all_sum\t%.1f\t%lld\n",
+        us,
+        static_cast<long long>(n_bytes));
+    std::fflush(timing_file_);
+  }
 }
 
 void RingGroup::all_max(
