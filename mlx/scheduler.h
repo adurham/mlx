@@ -11,6 +11,8 @@
 #include <future>
 #include <queue>
 #include <shared_mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <typeinfo>
 #include <unordered_map>
@@ -308,6 +310,98 @@ inline void throw_if_stream_exception() {
   if (auto e = scheduler().take_any_stream_exception()) {
     std::rethrow_exception(e);
   }
+}
+
+// exo-jaccl-fix (2026-09-10): render an exception_ptr as text without
+// rethrowing it to the caller. Used to fold a drained worker-thread fault
+// into another exception's message; see combined_eval_failure below.
+inline std::string describe_exception(const std::exception_ptr& e) {
+  if (!e) {
+    return "<none>";
+  }
+  try {
+    std::rethrow_exception(e);
+  } catch (const std::exception& ex) {
+    return std::string(typeid(ex).name()) + ": " + ex.what();
+  } catch (...) {
+    return "<non-std exception>";
+  }
+}
+
+// exo-jaccl-fix (2026-09-10): the exception thrown when a synchronous
+// primitive failure and an asynchronous stream-worker fault (e.g. a JACCL
+// RDMA collective error) happen in the SAME eval.
+//
+// WHY THIS TYPE EXISTS
+// --------------------
+// Two fault-reporting mechanisms read the same one-shot per-stream
+// exception slot (StreamThread::stored_exception, drained by
+// take_exception()):
+//
+//   1. This fork's throw_if_stream_exception(), called at the END of eval()
+//      (transforms.cpp), which surfaces async worker-thread faults.
+//   2. Upstream fe92a0565's cleanup handler inside eval_impl()'s tape loop,
+//      which calls synchronize(s) on every open stream when a primitive
+//      throws SYNCHRONOUSLY. synchronize() itself drains the slot.
+//
+// When both fire in one eval, (2) runs first and consumes the slot. Worse,
+// eval() has NO try/catch around its eval_impl() call, so once eval_impl
+// rethrows, eval()'s throw_if_stream_exception() is never reached at all.
+// The async fault is therefore lost twice over: drained by synchronize(),
+// then discarded by the bare catch(...) that guarded it. A real JACCL
+// transport fault would be replaced by whatever downstream symptom threw
+// synchronously -- exactly the wrong diagnosis for an ops team.
+//
+// The fix keeps BOTH mechanisms whole: upstream's cleanup still runs (it
+// protects against real state corruption), and the drained fault is carried
+// out on this exception instead of being dropped. Both causes are reported.
+//
+// Deliberately derives from std::runtime_error so every existing handler
+// (including exo's runner bootstrap, which converts any Exception into a
+// RunnerTerminationError) keeps working unchanged, and so pybind/nanobind
+// maps it to a Python RuntimeError like any other MLX error.
+class CombinedEvalFailure : public std::runtime_error {
+ public:
+  CombinedEvalFailure(
+      std::string what,
+      std::exception_ptr primitive_failure,
+      std::exception_ptr stream_failure)
+      : std::runtime_error(std::move(what)),
+        primitive_failure_(std::move(primitive_failure)),
+        stream_failure_(std::move(stream_failure)) {}
+
+  // The synchronous throw from inside the tape loop.
+  const std::exception_ptr& primitive_failure() const noexcept {
+    return primitive_failure_;
+  }
+
+  // The async worker-thread fault drained during cleanup (the JACCL fault).
+  const std::exception_ptr& stream_failure() const noexcept {
+    return stream_failure_;
+  }
+
+ private:
+  std::exception_ptr primitive_failure_;
+  std::exception_ptr stream_failure_;
+};
+
+// exo-jaccl-fix (2026-09-10): build the combined exception. Kept here rather
+// than in transforms.cpp so it is unit-testable without a full MLX build.
+inline CombinedEvalFailure combined_eval_failure(
+    const std::exception_ptr& primitive_failure,
+    const std::exception_ptr& stream_failure) {
+  std::string msg =
+      "[eval] a primitive threw during eval AND a stream worker thread "
+      "reported a fault. Both are reported below; the stream fault is "
+      "usually the root cause (e.g. a JACCL RDMA collective error whose "
+      "corrupt output made a downstream primitive fail).\n"
+      "  (1) stream worker fault: " +
+      describe_exception(stream_failure) +
+      "\n"
+      "  (2) primitive failure:   " +
+      describe_exception(primitive_failure);
+  return CombinedEvalFailure(
+      std::move(msg), primitive_failure, stream_failure);
 }
 
 } // namespace mlx::core::scheduler

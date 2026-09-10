@@ -331,6 +331,32 @@ array eval_impl(std::vector<array> outputs, bool async) {
     // later read of an affected array returns an unwritten buffer or blocks
     // forever. Signal the events and flush the touched streams, then let the
     // exception propagate.
+    //
+    // exo-jaccl-fix (2026-09-10): upstream discards whatever synchronize()
+    // throws here ("Preserve the original exception"). In this fork that is
+    // lossy, because synchronize() also DRAINS the one-shot per-stream
+    // exception slot that carries async worker-thread faults -- notably
+    // JACCL RDMA collective errors, which land on JACCL's pinned
+    // communication stream. That stream is in open_streams whenever the tape
+    // contains a collective (AllReduce is constructed with it; see
+    // distributed/ops.cpp + distributed/jaccl/jaccl.cpp), so this loop
+    // reliably drains it.
+    //
+    // Dropping it loses the fault outright: eval() has no try/catch around
+    // its eval_impl() call, so the `throw;` below skips eval()'s own
+    // scheduler::throw_if_stream_exception() entirely. The JACCL fault would
+    // never be reported by either mechanism, and the operator would see only
+    // the downstream symptom -- despite the RDMA fault being the likely root
+    // cause of it (a corrupt/aborted collective output is exactly what makes
+    // a downstream primitive throw synchronously).
+    //
+    // So: keep upstream's cleanup exactly as-is, but CAPTURE what
+    // synchronize() throws instead of discarding it, and report both causes.
+    // Note we must not simply put the fault back in the slot -- an unrelated
+    // later eval() would then report it wildly out of context.
+    auto primitive_failure = std::current_exception();
+    std::exception_ptr stream_failure;
+
     for (auto& [idx, e] : events) {
       try {
         auto es = e.stream();
@@ -343,8 +369,19 @@ array eval_impl(std::vector<array> outputs, bool async) {
       try {
         synchronize(s);
       } catch (...) {
-        // Preserve the original exception.
+        // First fault wins, matching StreamThread::stored_exception's own
+        // first-wins semantics. Still swallowed with respect to control
+        // flow -- every remaining stream must be flushed for upstream's
+        // state-corruption fix to hold -- but no longer discarded.
+        if (!stream_failure) {
+          stream_failure = std::current_exception();
+        }
       }
+    }
+
+    if (stream_failure) {
+      throw scheduler::combined_eval_failure(
+          primitive_failure, stream_failure);
     }
     throw;
   }
