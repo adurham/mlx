@@ -493,6 +493,12 @@ void sdpa_full_self_attention_metal(
         s, d, q, k, v, scale, o, do_causal_, mask, sinks);
   }
 
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int D = q.shape(3);
+  int gqa_factor = q.shape(1) / k.shape(1);
+
+  int qL = q.shape(2);
   int kL = k.shape(2);
 
   // NAX path does not support logsumexp output. Upstream's D whitelist
