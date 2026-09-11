@@ -2064,7 +2064,7 @@ void MeshGroup::all_reduce(
     // Large messages are bandwidth bound so use the reduce scatter + all gather
     // path which moves size_x less data per link than the fully connected
     // all_reduce.
-    mesh_.all_reduce_scatter_gather(in_ptr, out_ptr, count, reduce_op);
+    mesh_.all_reduce_scatter_gather(call_id, in_ptr, out_ptr, count, reduce_op);
   } else {
     // Small messages are latency bound so use the single phase fully
     // connected all_reduce cause it is a bit better.
