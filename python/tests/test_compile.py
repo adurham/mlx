@@ -45,6 +45,22 @@ class TestCompile(mlx_tests.MLXTestCase):
         self.assertEqual(out.dtype, mx.int32)
         self.assertTrue(mx.array_equal(out, mx.array([2, 4])))
 
+    def test_compile_sigmoid_matches_eager(self):
+        # Regression test: `Sigmoid` spelled an unqualified `metal::exp`, which
+        # the prebuilt metallib (-fno-fast-math) resolves to the precise
+        # implementation but a runtime-compiled kernel resolves to the fast
+        # approximation -- so a fused compiled chain returned a different, less
+        # accurate sigmoid than the eager primitive. `Exp` in the same header
+        # already spells `metal::precise::exp`.
+        x = mx.linspace(-12, 12, 4001)
+
+        for dtype in (mx.float32, mx.bfloat16):
+            xd = x.astype(dtype)
+            expected = mx.sigmoid(xd)
+            fused = mx.compile(lambda a: mx.sigmoid(a) * 1.0)(xd)
+            mx.eval(expected, fused)
+            self.assertTrue(mx.array_equal(fused, expected))
+
     def test_compile_nonfinite_constants(self):
         # Regression test: a non-finite scalar constant (NaN / infinity) baked
         # into a fused compiled kernel used to stream a bare token (e.g. `nan`)
@@ -1615,6 +1631,46 @@ class TestCompile(mlx_tests.MLXTestCase):
         w = mx.arange(120, dtype=mx.float32).reshape(2, 3, 4, 5)
         expected = w[::-1, :, ::-1, :] + 1.0
         self.assertTrue(mx.array_equal(p(w[::-1, :, ::-1, :]), expected))
+
+    def test_compile_abs_unsigned(self):
+        # abs has to compile for the wider unsigned types too
+        fun = lambda x: mx.abs(x) + 1
+        for dtype in [mx.uint8, mx.uint16, mx.uint32, mx.uint64]:
+            x = mx.array([1, 2, 3], dtype)
+            self.assertTrue(mx.array_equal(mx.compile(fun)(x), fun(x)))
+
+    def test_compiled_subnormal_bool_cast(self):
+        f32_sub = mx.array(np.array([0x00000001] * 4, dtype=np.uint32)).view(mx.float32)
+        f16_sub = mx.array(np.array([0x0001] * 4, dtype=np.uint16)).view(mx.float16)
+        bf16_sub = mx.array(np.array([0x0001] * 4, dtype=np.uint16)).view(mx.bfloat16)
+
+        # A single-op compile does not fuse; the fused path needs >= 2 ops.
+        fn = mx.compile(lambda x: mx.broadcast_to(x, (2, 4)).astype(mx.bool_))
+        for sub in (f32_sub, f16_sub, bf16_sub):
+            self.assertTrue(mx.all(fn(sub)).item())
+
+    def test_compile_different_log_bases(self):
+        # The logs are intermediates, since outputs are not simplified.
+        def entropies(p):
+            nats = -mx.sum(p * mx.log(p))
+            bits = -mx.sum(p * mx.log2(p))
+            return mx.stack([nats, bits])
+
+        p = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        expected = np.array(
+            [-(p * np.log(p)).sum(), -(p * np.log2(p)).sum()], dtype=np.float32
+        )
+        out = mx.compile(entropies)(mx.array(p))
+        self.assertTrue(np.allclose(out, expected, atol=1e-5))
+
+    def test_compile_equal_nan(self):
+        def fun(x):
+            return mx.stack(
+                [mx.array_equal(x, x), mx.array_equal(x, x, equal_nan=True)]
+            )
+
+        x = mx.array([1.0, float("nan"), 3.0])
+        self.assertTrue(mx.array_equal(mx.compile(fun)(x), mx.array([False, True])))
 
 
 if __name__ == "__main__":

@@ -14,7 +14,6 @@
 #include "jaccl/group.h"
 #include "jaccl/mesh_impl.h"
 #include "jaccl/rdma.h"
-#include "jaccl/ring_impl.h"
 
 namespace jaccl {
 
@@ -37,10 +36,15 @@ class MeshGroup : public Group {
       std::function<std::vector<std::vector<Destination>>(
           const std::vector<Destination>&)>;
 
+  // coordinator_addr is fork-local: rebuild_p2p_channel() derives the p2p
+  // retry channel's port from it (coordinator port + 1) on every
+  // reconnect()/reconnect_fresh(). Empty disables p2p_channel_, which is
+  // only used by the PP send()/recv() path.
   MeshGroup(
       int rank,
       const std::vector<std::string>& device_names,
-      const std::string& coordinator_addr);
+      SideChannel sc,
+      std::string coordinator_addr = std::string());
 
   // Subgroup ctor used by split(). Builds Connections that BORROW the
   // parent's per-peer ibv_context (one open per device on the system —
@@ -82,6 +86,9 @@ class MeshGroup : public Group {
 
   void all_gather(const void* input, void* output, size_t n_bytes) override;
 
+  void sum_scatter(const void* input, void* output, size_t n_bytes, int dtype)
+      override;
+
   void send(const void* input, size_t n_bytes, int dst) override;
   void recv(void* output, size_t n_bytes, int src) override;
 
@@ -117,6 +124,13 @@ class MeshGroup : public Group {
   template <typename T, typename ReduceOp>
   void all_reduce(
       uint32_t call_id,
+      const void* input,
+      void* output,
+      size_t n_bytes,
+      ReduceOp reduce_op);
+
+  template <typename T, typename ReduceOp>
+  void reduce_scatter(
       const void* input,
       void* output,
       size_t n_bytes,
@@ -357,8 +371,7 @@ class MeshGroup : public Group {
   // filtering can route the pool's CQEs unambiguously.
   std::vector<SharedBuffer> data_pool_recv_buffers_;
   std::vector<SharedBuffer> buffers_;
-  std::vector<SharedBuffer> ring_send_buffers_;
-  std::vector<SharedBuffer> ring_recv_buffers_;
+  std::vector<SharedBuffer> scatter_buffers_;
 
   MeshImpl mesh_;
   RingImpl ring_;

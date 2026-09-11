@@ -30,8 +30,11 @@
 // concurrent code path's own comment) is untouched.
 #define instantiate_attn_shapes_helper(iname, itype, mname, mtype)  \
     instantiate_attn(iname, itype, 32, 16, 256, 4, 1, mname, mtype) \
+    instantiate_attn(iname, itype, 32, 16, 192, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 16, 128, 4, 1, mname, mtype) \
+    instantiate_attn(iname, itype, 32, 32,  96, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  80, 4, 1, mname, mtype) \
+    instantiate_attn(iname, itype, 32, 32,  72, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 32, 32,  64, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype,  8,  8, 512, 1, 1, mname, mtype)
 

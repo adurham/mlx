@@ -814,8 +814,8 @@ class PyCustomFunction {
       }
       int array_index = 0;
       int tangent_index = 0;
-      auto new_tangents =
-          nb::cast<nb::tuple>(tree_map(args, [&](nb::handle element) {
+      auto new_tangents = nb::cast<nb::tuple>(
+          tree_map(args, [&](nb::handle element) -> nb::object {
             if (nb::isinstance<mx::array>(element) &&
                 have_tangents[array_index++]) {
               return nb::cast(tangents[tangent_index++]);
@@ -861,8 +861,8 @@ class PyCustomFunction {
       }
 
       int arr_index = 0;
-      auto new_axes =
-          nb::cast<nb::tuple>(tree_map(args, [&](nb::handle element) {
+      auto new_axes = nb::cast<nb::tuple>(
+          tree_map(args, [&](nb::handle element) -> nb::object {
             int axis = axes[arr_index++];
             if (nb::isinstance<mx::array>(element) && axis >= 0) {
               return nb::cast(axis);
@@ -1436,7 +1436,7 @@ void init_transforms(nb::module_& m) {
       "argnums"_a = nb::none(),
       "argnames"_a = std::vector<std::string>{},
       nb::sig(
-          "def value_and_grad(fun: Callable[P, R], argnums: Optional[Union[int, Sequence[int]]] = None, argnames: Union[str, Sequence[str]] = []) -> Callable[P, Tuple[R, Any]]"),
+          "def value_and_grad(fun: Callable[P, R], argnums: int | Sequence[int] | None = None, argnames: str | Sequence[str] = []) -> Callable[P, tuple[R, Any]]"),
       R"pbdoc(
         Returns a function which computes the value and gradient of ``fun``.
 
@@ -1505,7 +1505,7 @@ void init_transforms(nb::module_& m) {
       "argnums"_a = nb::none(),
       "argnames"_a = std::vector<std::string>{},
       nb::sig(
-          "def grad(fun: Callable[P, R], argnums: Optional[Union[int, Sequence[int]]] = None, argnames: Union[str, Sequence[str]] = []) -> Callable[P, Any]"),
+          "def grad(fun: Callable[P, R], argnums: int | Sequence[int] | None = None, argnames: str | Sequence[str] = []) -> Callable[P, Any]"),
       R"pbdoc(
         Returns a function which computes the gradient of ``fun``.
 
@@ -1575,7 +1575,7 @@ void init_transforms(nb::module_& m) {
       "outputs"_a = nb::none(),
       "shapeless"_a = false,
       nb::sig(
-          "def compile(fun: Callable[P, R], inputs: Optional[object] = None, outputs: Optional[object] = None, shapeless: bool = False) -> Callable[P, R]"),
+          "def compile(fun: Callable[P, R], inputs: object | None = None, outputs: object | None = None, shapeless: bool = False) -> Callable[P, R]"),
       R"pbdoc(
         Returns a compiled function which produces the same output as ``fun``.
 

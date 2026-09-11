@@ -100,6 +100,14 @@ MTL::ComputePipelineState* get_sort_kernel(
   return d.get_kernel(kernel_name);
 }
 
+MTL::ComputePipelineState* get_searchsorted_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array&,
+    bool) {
+  return d.get_kernel(kernel_name);
+}
+
 MTL::ComputePipelineState* get_mb_sort_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -345,6 +353,13 @@ MTL::ComputePipelineState* get_fft_kernel(
   return d.get_kernel(kernel_name, hash_name, func_consts);
 }
 
+MTL::ComputePipelineState* get_fft_twiddle_kernel(
+    metal::Device& d,
+    const std::string&,
+    const std::string&) {
+  return d.get_kernel("generate_bluestein_twiddles");
+}
+
 MTL::ComputePipelineState* get_quantized_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -367,6 +382,7 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int,
     int,
     int,
+    bool,
     bool) {
   return d.get_kernel(kernel_name, hash_name, func_consts);
 }
@@ -476,6 +492,7 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int,
     int,
     int,
+    bool,
     bool) {
   return d.get_kernel(kernel_name, hash_name, func_consts);
 }
@@ -506,7 +523,8 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     int,
     int,
     int,
-    const array&) {
+    const array&,
+    bool) {
   return d.get_kernel(kernel_name, hash_name, func_consts);
 }
 

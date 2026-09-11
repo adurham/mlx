@@ -172,6 +172,23 @@ class CoordGroup : public Group {
     }
   }
 
+  // Upstream 2026-09 added sum_scatter to the Group interface (reduce scatter
+  // with a sum reduction). The coord group exists solely for tiny
+  // control-plane collectives over ONE TCP socket, where a reduce-scatter has
+  // no meaningful bandwidth story -- and nothing in exo drives it here. Fail
+  // loudly rather than silently servicing it, same policy as send()/recv().
+  void sum_scatter(
+      const void* input,
+      void* output,
+      size_t n_bytes,
+      int dtype) override {
+    throw std::runtime_error(
+        "[jaccl] sum_scatter() is not supported on a TCP-only coord group -- "
+        "it exists solely for small control-plane collectives (all_sum / "
+        "all_max / all_min / all_gather / barrier). Use the top-level group "
+        "for reduce-scatter.");
+  }
+
   // Control plane only: point-to-point bulk transfer has no business here,
   // and silently servicing it over a single coordinator socket would be a
   // throughput cliff rather than an error. Fail loudly instead.

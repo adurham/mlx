@@ -6,7 +6,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mach/mach_time.h>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <thread>
@@ -491,85 +493,33 @@ inline int poll(
 }
 
 /**
- * Implement a TCP side channel to exchange information about the RDMA
- * connections.
+ * A function that performs an all-gather across ranks.
  *
- * Implements a simple all gather where every node sends to rank 0 and rank 0
- * broadcasts to every node.
+ * Args:
+ *   src: Pointer to this rank's data of size n_bytes.
+ *   dst: Pointer to an output buffer of size size_ * n_bytes. After the call,
+ *        dst[r * n_bytes, (r+1) * n_bytes] contains the data from rank r.
+ *   n_bytes: The number of bytes contributed by each rank.
  */
-class SideChannel {
+using AllGatherFn =
+    std::function<void(const char* src, char* dst, size_t n_bytes)>;
+
+class TCPAllGather {
  public:
-  SideChannel(int rank, int size, const char* addr);
-  SideChannel(SideChannel&& sc);
+  TCPAllGather(int rank, int size, const char* addr);
 
-  SideChannel(const SideChannel&) = delete;
-  SideChannel& operator=(const SideChannel&) = delete;
+  TCPAllGather(const TCPAllGather&) = delete;
+  TCPAllGather(TCPAllGather&&) = delete;
+  TCPAllGather& operator=(const TCPAllGather&) = delete;
+  TCPAllGather& operator=(TCPAllGather&&) = delete;
 
-  template <typename T>
-  std::vector<T> all_gather(const T& v) {
-    std::vector<T> result(size_);
+  void operator()(const char* src, char* dst, size_t n_bytes);
 
-    // T is a container of stuff like std::vector or std::string
-    if constexpr (is_container<T>::value) {
-      using U = typename T::value_type;
-
-      // Share the lengths first and set the communication size to be the
-      // maximum length of the containers.
-      auto lengths = all_gather<int>(v.size());
-      auto max_len = *std::max_element(lengths.begin(), lengths.end());
-      for (auto& s : result) {
-        s.resize(max_len);
-      }
-
-      // All gather of length max_len
-      if (rank_ == 0) {
-        std::copy(v.begin(), v.end(), result[rank_].begin());
-        for (int i = 1; i < size_; i++) {
-          sockets_[i - 1].recv(IBV_TAG, result[i].data(), sizeof(U) * max_len);
-        }
-        for (int i = 1; i < size_; i++) {
-          for (int j = 0; j < size_; j++) {
-            sockets_[i - 1].send(
-                IBV_TAG, result[j].data(), sizeof(U) * max_len);
-          }
-        }
-      } else {
-        std::copy(v.begin(), v.end(), result[rank_].begin());
-        sockets_[0].send(IBV_TAG, result[rank_].data(), sizeof(U) * max_len);
-        for (int i = 0; i < size_; i++) {
-          sockets_[0].recv(IBV_TAG, result[i].data(), sizeof(U) * max_len);
-        }
-      }
-
-      // Resize the outputs back to the original length
-      for (int i = 0; i < size_; i++) {
-        result[i].resize(lengths[i]);
-      }
-    }
-
-    // T is a scalar
-    else {
-      if (rank_ == 0) {
-        result[rank_] = v;
-        for (int i = 1; i < size_; i++) {
-          sockets_[i - 1].recv(IBV_TAG, &result[i], sizeof(T));
-        }
-        for (int i = 1; i < size_; i++) {
-          sockets_[i - 1].send(IBV_TAG, result.data(), size_ * sizeof(T));
-        }
-      } else {
-        sockets_[0].send(IBV_TAG, &v, sizeof(T));
-        sockets_[0].recv(IBV_TAG, result.data(), size_ * sizeof(T));
-      }
-    }
-
-    return result;
+  int rank() const {
+    return rank_;
   }
-
-  void barrier() {
-    // Twice has proven to be more robust to initialization issues.
-    all_gather<int>(0);
-    all_gather<int>(0);
+  int size() const {
+    return size_;
   }
 
   // Framed, self-validating 2-rank barrier for the reliable data path.
@@ -687,6 +637,121 @@ class SideChannel {
   int rank_;
   int size_;
   std::vector<TCPSocket> sockets_;
+  std::mutex mutex_;
+};
+
+/**
+ * Implement a TCP side channel to exchange information about the RDMA
+ * connections.
+ *
+ * Implements a simple all gather where every node sends to rank 0 and rank 0
+ * broadcasts to every node.
+ */
+class SideChannel {
+ public:
+  SideChannel(int rank, int size, AllGatherFn agf);
+  // Fork-local: TCP-backed channel. Keeps a handle on the TCPAllGather so the
+  // framed fork protocols below (reliable_barrier / p2p_retry_barrier /
+  // set_recv_retry_deadline_secs) can reach its sockets. The plain AllGatherFn
+  // ctor above leaves tcp_ null and those methods then throw.
+  SideChannel(int rank, int size, std::shared_ptr<TCPAllGather> tcp);
+  SideChannel(int rank, int size, const char* addr);
+  SideChannel(SideChannel&& sc);
+
+  SideChannel(const SideChannel&) = delete;
+  SideChannel& operator=(const SideChannel&) = delete;
+
+  template <typename T>
+  std::vector<T> all_gather(const T& v) {
+    std::vector<T> result(size_);
+
+    // T is a container of stuff like std::vector or std::string
+    if constexpr (is_container<T>::value) {
+      using U = typename T::value_type;
+
+      // Share the lengths first to set the communication size to be the
+      // maximum length of the containers.
+      auto lengths = all_gather<int>(v.size());
+      auto max_len = *std::max_element(lengths.begin(), lengths.end());
+
+      // Allocate flat memory for the all gather
+      std::vector<U> buffer;
+      buffer.resize(max_len * (size_ + 1));
+
+      // Copy our value and share it
+      std::copy(v.begin(), v.end(), buffer.begin());
+      all_gather_fn_(
+          reinterpret_cast<const char*>(&buffer[0]),
+          reinterpret_cast<char*>(&buffer[max_len]),
+          max_len * sizeof(U));
+
+      // Put the values into the individual containers
+      for (int i = 0; i < size_; i++) {
+        std::copy(
+            buffer.begin() + (i + 1) * max_len,
+            buffer.begin() + (i + 1) * max_len + lengths[i],
+            std::inserter(result[i], result[i].end()));
+      }
+    }
+
+    // T is a scalar
+    else {
+      all_gather_fn_(
+          reinterpret_cast<const char*>(&v),
+          reinterpret_cast<char*>(result.data()),
+          sizeof(T));
+    }
+
+    return result;
+  }
+
+  void barrier() {
+    // Twice has proven to be more robust to initialization issues.
+    all_gather<int>(0);
+    all_gather<int>(0);
+  }
+
+
+  // Fork-local framed protocols. These require a TCP-backed channel; a
+  // SideChannel built from a caller-supplied AllGatherFn (e.g. an mlx-level
+  // all-gather) has no sockets to frame over and throws here rather than
+  // silently misbehaving.
+  std::vector<uint8_t> reliable_barrier(
+      uint32_t call_id,
+      uint32_t round,
+      const std::vector<uint8_t>& got) {
+    return require_tcp("reliable_barrier")->reliable_barrier(call_id, round, got);
+  }
+
+  std::vector<uint8_t> p2p_retry_barrier(
+      uint32_t direction_tag,
+      uint32_t round,
+      const std::vector<uint8_t>& got) {
+    return require_tcp("p2p_retry_barrier")
+        ->p2p_retry_barrier(direction_tag, round, got);
+  }
+
+  void set_recv_retry_deadline_secs(double secs) {
+    if (tcp_) {
+      tcp_->set_recv_retry_deadline_secs(secs);
+    }
+  }
+
+ private:
+  TCPAllGather* require_tcp(const char* what) {
+    if (!tcp_) {
+      throw std::runtime_error(
+          std::string("[jaccl] SideChannel::") + what +
+          " requires a TCP-backed side channel (this one was built from a "
+          "caller-supplied all-gather function)");
+    }
+    return tcp_.get();
+  }
+
+  int rank_;
+  int size_;
+  AllGatherFn all_gather_fn_;
+  std::shared_ptr<TCPAllGather> tcp_;
 };
 
 } // namespace jaccl

@@ -2,8 +2,10 @@
 
 #include <dlfcn.h>
 #include <unistd.h>
+#include <cerrno>
 #include <iostream>
 #include <sstream>
+#include <system_error>
 
 #include "jaccl/rdma.h"
 
@@ -182,7 +184,12 @@ void Connection::create_queue_pair() {
   queue_pair = ibv().create_qp(protection_domain, &init_attr);
 
   if (queue_pair == nullptr) {
-    throw std::runtime_error("[jaccl] Couldn't create queue pair");
+    int err = errno;
+    std::string error_message = std::generic_category().message(err);
+    std::ostringstream msg;
+    msg << "[jaccl] Creating the queue pair failed with '" << error_message
+        << " (" << errno << ")'.";
+    throw std::runtime_error(msg.str());
   }
 }
 
@@ -193,16 +200,28 @@ const Destination& Connection::info() {
 
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
-  ibv_gid gid;
+  ibv_gid gid = {};
+  bool found_gid = false;
   for (int i = 0; i < port_attr.gid_tbl_len; i++) {
     ibv_gid tmp;
     if (ibv().query_gid(ctx, 1, i, &tmp) == 0) {
       if (*(uint64_t*)&tmp.raw[0] == 0 && *(uint16_t*)&tmp.raw[8] == 0 &&
           *(uint16_t*)&tmp.raw[10] == 0xffff) {
         gid = tmp;
+        found_gid = true;
         break;
       }
     }
+  }
+
+  // Fail here rather than hand an unset GID to the queue pair.
+  if (!found_gid) {
+    std::ostringstream msg;
+    msg << "[jaccl] No IPv4-mapped GID for this device. Thunderbolt RDMA ports "
+        << "only publish one once the interface has an IPv4 address; assign a "
+        << "link-local address to it, for example: ifconfig <interface> inet "
+        << "169.254.0.1 netmask 255.255.0.0 alias";
+    throw std::runtime_error(msg.str());
   }
 
   src.local_id = port_attr.lid;
@@ -315,6 +334,7 @@ std::vector<Connection> create_connections(
     }
 
     // Search for the name and try to open the device
+    bool found = false;
     for (int i = 0; i < num_devices; i++) {
       if (name == ibv().get_device_name(devices[i])) {
         auto ctx = ibv().open_device(devices[i]);
@@ -324,8 +344,18 @@ std::vector<Connection> create_connections(
           throw std::runtime_error(msg.str());
         }
         connections.emplace_back(ctx);
+        found = true;
         break;
       }
+    }
+
+    // Returning a shorter vector than device_names would leave the callers,
+    // which size themselves from device_names, indexing past its end.
+    if (!found) {
+      std::ostringstream msg;
+      msg << "[jaccl] Could not find device " << name << " (" << num_devices
+          << " available)";
+      throw std::runtime_error(msg.str());
     }
   }
   ibv().free_device_list(devices);
@@ -333,7 +363,7 @@ std::vector<Connection> create_connections(
   return connections;
 }
 
-SideChannel::SideChannel(int rank, int size, const char* addr)
+TCPAllGather::TCPAllGather(int rank, int size, const char* addr)
     : rank_(rank), size_(size) {
   auto address = parse_address(addr);
 
@@ -383,8 +413,43 @@ SideChannel::SideChannel(int rank, int size, const char* addr)
   }
 }
 
+void TCPAllGather::operator()(const char* src, char* dst, size_t n_bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (rank_ == 0) {
+    std::copy(src, src + n_bytes, dst);
+    for (int i = 1; i < size_; i++) {
+      sockets_[i - 1].recv(IBV_TAG, dst + i * n_bytes, n_bytes);
+    }
+    for (int i = 1; i < size_; i++) {
+      sockets_[i - 1].send(IBV_TAG, dst, size_ * n_bytes);
+    }
+  } else {
+    sockets_[0].send(IBV_TAG, src, n_bytes);
+    sockets_[0].recv(IBV_TAG, dst, size_ * n_bytes);
+  }
+}
+
+SideChannel::SideChannel(int rank, int size, AllGatherFn agf)
+    : rank_(rank), size_(size), all_gather_fn_(std::move(agf)) {}
+
+SideChannel::SideChannel(int rank, int size, std::shared_ptr<TCPAllGather> tcp)
+    : rank_(rank),
+      size_(size),
+      all_gather_fn_(
+          [tcp](const char* src, char* dst, size_t n_bytes) {
+            (*tcp)(src, dst, n_bytes);
+          }),
+      tcp_(std::move(tcp)) {}
+
+SideChannel::SideChannel(int rank, int size, const char* addr)
+    : SideChannel(rank, size, std::make_shared<TCPAllGather>(rank, size, addr)) {
+}
+
 SideChannel::SideChannel(SideChannel&& sc)
-    : rank_(sc.rank_), size_(sc.size_), sockets_(std::move(sc.sockets_)) {
+    : rank_(sc.rank_),
+      size_(sc.size_),
+      all_gather_fn_(std::move(sc.all_gather_fn_)),
+      tcp_(std::move(sc.tcp_)) {
   sc.rank_ = -1;
   sc.size_ = -1;
 }

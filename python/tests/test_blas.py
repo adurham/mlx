@@ -538,6 +538,37 @@ class TestBlas(mlx_tests.MLXTestCase):
                                     )
                                     self.assertTrue(np.array_equal(c_mlx, c_npy))
 
+    def test_dot_product(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("requires GPU")
+
+        def run_test(dtype, size, offset, atol):
+            with self.subTest(dtype=str(dtype), size=size, offset=offset):
+                np.random.seed(42)
+                scale = size**-0.5
+                a_mx = mx.array(
+                    np.random.normal(0.0, scale, size + offset).astype(np.float32)
+                ).astype(dtype)[offset:]
+                b_mx = mx.array(
+                    np.random.normal(0.0, scale, size + offset).astype(np.float32)
+                ).astype(dtype)[offset:]
+
+                expected = np.inner(
+                    np.array(a_mx.astype(mx.float32)),
+                    np.array(b_mx.astype(mx.float32)),
+                )
+                actual = np.array(mx.inner(a_mx, b_mx).astype(mx.float32))
+                self.assertTrue(np.allclose(actual, expected, atol=atol))
+
+        for dtype, atol in (
+            (mx.float32, 1e-5),
+            (mx.float16, 2e-3),
+            (mx.bfloat16, 2e-3),
+        ):
+            for size in (1023, 1024, 1025, 16385, 131072, 1000000):
+                for offset in (0, 1):
+                    run_test(dtype, size, offset, atol)
+
     def test_wide_matmul(self):
         if mx.default_device() == mx.cpu:
             self.skipTest("requires GPU")
@@ -1442,6 +1473,24 @@ class TestBlas(mlx_tests.MLXTestCase):
         for r, t in zip(dout_ref, dout_test):
             self.assertEqual(r.shape, t.shape)
             self.assertTrue(mx.allclose(r, t, atol=1e-4).item())
+
+    def test_gather_matmul_index_vjp_requires_stop_gradient(self):
+        a = mx.ones((4, 1, 2, 2))
+        b = mx.ones((4, 1, 2, 2))
+
+        def fun(w):
+            indices = mx.reshape(mx.argsort(w)[:2], (1, 2))
+            return mx.gather_mm(a, b, indices, indices).sum()
+
+        with self.assertRaisesRegex(ValueError, "stop_gradient"):
+            mx.grad(fun)(mx.array([3.0, 1.0, 2.0, 0.0]))
+
+        def fun_stopped(w):
+            indices = mx.stop_gradient(mx.reshape(mx.argsort(w)[:2], (1, 2)))
+            return mx.gather_mm(a, b, indices, indices).sum()
+
+        grad = mx.grad(fun_stopped)(mx.array([3.0, 1.0, 2.0, 0.0]))
+        self.assertTrue(mx.array_equal(grad, mx.zeros((4,))))
 
     def test_gather_mm_sorted(self):
         def gather_mm_ref(a, b, rhs):

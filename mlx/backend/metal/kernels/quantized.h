@@ -489,17 +489,16 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
           bits == 8,
       "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
 
+  const float s = float(scale);
+  const float b = float(bias);
+
   if (bits == 2) {
-    U s[4] = {
-        scale,
-        scale / static_cast<U>(4.0f),
-        scale / static_cast<U>(16.0f),
-        scale / static_cast<U>(64.0f)};
+    float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
     for (int i = 0; i < (N / 4); i++) {
-      w_local[4 * i] = s[0] * (w[i] & 0x03) + bias;
-      w_local[4 * i + 1] = s[1] * (w[i] & 0x0c) + bias;
-      w_local[4 * i + 2] = s[2] * (w[i] & 0x30) + bias;
-      w_local[4 * i + 3] = s[3] * (w[i] & 0xc0) + bias;
+      w_local[4 * i] = static_cast<U>(sc[0] * (w[i] & 0x03) + b);
+      w_local[4 * i + 1] = static_cast<U>(sc[1] * (w[i] & 0x0c) + b);
+      w_local[4 * i + 2] = static_cast<U>(sc[2] * (w[i] & 0x30) + b);
+      w_local[4 * i + 3] = static_cast<U>(sc[3] * (w[i] & 0xc0) + b);
     }
   }
 
@@ -508,22 +507,24 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
       w_local += 8 * i;
       w += 3 * i;
 
-      w_local[0] = (w[0] & 0x7) * scale + bias;
-      w_local[1] = ((w[0] & 0x38) >> 3) * scale + bias;
-      w_local[2] = (((w[0] & 0xc0) >> 6) + ((w[1] & 0x1) << 2)) * scale + bias;
-      w_local[3] = ((w[1] & 0xe) >> 1) * scale + bias;
-      w_local[4] = ((w[1] & 0x70) >> 4) * scale + bias;
-      w_local[5] = (((w[1] & 0x80) >> 7) + ((w[2] & 0x3) << 1)) * scale + bias;
-      w_local[6] = ((w[2] & 0x1c) >> 2) * scale + bias;
-      w_local[7] = ((w[2] & 0xe0) >> 5) * scale + bias;
+      w_local[0] = static_cast<U>((w[0] & 0x7) * s + b);
+      w_local[1] = static_cast<U>(((w[0] & 0x38) >> 3) * s + b);
+      w_local[2] =
+          static_cast<U>((((w[0] & 0xc0) >> 6) + ((w[1] & 0x1) << 2)) * s + b);
+      w_local[3] = static_cast<U>(((w[1] & 0xe) >> 1) * s + b);
+      w_local[4] = static_cast<U>(((w[1] & 0x70) >> 4) * s + b);
+      w_local[5] =
+          static_cast<U>((((w[1] & 0x80) >> 7) + ((w[2] & 0x3) << 1)) * s + b);
+      w_local[6] = static_cast<U>(((w[2] & 0x1c) >> 2) * s + b);
+      w_local[7] = static_cast<U>(((w[2] & 0xe0) >> 5) * s + b);
     }
   }
 
   else if (bits == 4) {
-    U s[2] = {scale, scale / static_cast<U>(16.0f)};
+    float sc[2] = {s, s / 16.0f};
     for (int i = 0; i < (N / 2); i++) {
-      w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
-      w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+      w_local[2 * i] = static_cast<U>(sc[0] * (w[i] & 0x0f) + b);
+      w_local[2 * i + 1] = static_cast<U>(sc[1] * (w[i] & 0xf0) + b);
     }
   }
 
@@ -532,14 +533,18 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
       w_local += 8 * i;
       w += 5 * i;
 
-      w_local[0] = (w[0] & 0x1f) * scale + bias;
-      w_local[1] = (((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * scale + bias;
-      w_local[2] = ((w[1] & 0x7c) >> 2) * scale + bias;
-      w_local[3] = (((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * scale + bias;
-      w_local[4] = (((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * scale + bias;
-      w_local[5] = ((w[3] & 0x3e) >> 1) * scale + bias;
-      w_local[6] = (((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * scale + bias;
-      w_local[7] = ((w[4] & 0xf8) >> 3) * scale + bias;
+      w_local[0] = static_cast<U>((w[0] & 0x1f) * s + b);
+      w_local[1] =
+          static_cast<U>((((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * s + b);
+      w_local[2] = static_cast<U>(((w[1] & 0x7c) >> 2) * s + b);
+      w_local[3] =
+          static_cast<U>((((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * s + b);
+      w_local[4] =
+          static_cast<U>((((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * s + b);
+      w_local[5] = static_cast<U>(((w[3] & 0x3e) >> 1) * s + b);
+      w_local[6] =
+          static_cast<U>((((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * s + b);
+      w_local[7] = static_cast<U>(((w[4] & 0xf8) >> 3) * s + b);
     }
   }
 
@@ -547,16 +552,18 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
     for (int i = 0; i < (N / 4); i++) {
       w_local += 4 * i;
       w += 3 * i;
-      w_local[0] = (w[0] & 0x3f) * scale + bias;
-      w_local[1] = (((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * scale + bias;
-      w_local[2] = (((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * scale + bias;
-      w_local[3] = ((w[2] >> 2) & 0x3f) * scale + bias;
+      w_local[0] = static_cast<U>((w[0] & 0x3f) * s + b);
+      w_local[1] =
+          static_cast<U>((((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * s + b);
+      w_local[2] =
+          static_cast<U>((((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * s + b);
+      w_local[3] = static_cast<U>(((w[2] >> 2) & 0x3f) * s + b);
     }
   }
 
   else if (bits == 8) {
     for (int i = 0; i < N; i++) {
-      w_local[i] = scale * w[i] + bias;
+      w_local[i] = static_cast<U>(s * w[i] + b);
     }
   }
 }
@@ -588,6 +595,12 @@ struct QuantizedBlockLoader {
   MLX_MTL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
   MLX_MTL_CONST short group_steps = group_size / BCOLS;
+
+  MLX_MTL_CONST bool partial_cols = group_size % BCOLS != 0;
+
+  static_assert(
+      group_size % (n_reads * pack_factor) == 0,
+      "The group size must be a multiple of the columns read per thread.");
 
   const int src_ld;
   const int tile_stride;
@@ -644,14 +657,7 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
-      }
-      return;
-    }
-
-    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+    if (bi >= src_tile_dim.y) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -1750,7 +1756,13 @@ template <typename T, int group_size, int bits, int D, bool batched>
       quad_lid);
 }
 
-template <typename T, int group_size, int bits, bool batched>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool batched,
+    bool has_global_scale = false,
+    int results_per_simdgroup = 4>
 [[kernel]] void affine_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1802,7 +1814,13 @@ template <typename T, int group_size, int bits, bool batched>
       simd_lid);
 }
 
-template <typename T, const int group_size, const int bits, bool batched>
+template <
+    typename T,
+    int group_size,
+    const int bits,
+    bool batched,
+    bool has_global_scale = false,
+    int results_per_simdgroup = 4>
 [[kernel]] void affine_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1913,7 +1931,12 @@ template <
       simd_lid);
 }
 
-template <typename T, const int group_size, const int bits, bool batched>
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    bool batched,
+    bool has_global_scale = false>
 [[kernel]] void affine_qvm(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2160,12 +2183,13 @@ template <
 
 template <
     typename T,
-    const int group_size,
-    const int bits,
-    const bool batched,
-    const int BM = 32,
-    const int BK = 32,
-    const int BN = 32>
+    int group_size,
+    int bits,
+    bool batched,
+    bool has_global_scale = false,
+    int BM = 32,
+    int BK = 32,
+    int BN = 32>
 [[kernel]] void affine_qmm_n(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2218,7 +2242,7 @@ template <
       w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void affine_gather_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2280,7 +2304,7 @@ template <typename T, int group_size, int bits>
       simd_lid);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void affine_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2342,7 +2366,7 @@ template <typename T, int group_size, int bits>
       simd_lid);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void affine_gather_qvm(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2410,6 +2434,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
+    const bool has_global_scale = false,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
@@ -2489,11 +2514,12 @@ template <
 
 template <
     typename T,
-    const int group_size,
-    const int bits,
-    const int BM = 32,
-    const int BK = 32,
-    const int BN = 32>
+    int group_size,
+    int bits,
+    bool has_global_scale = false,
+    int BM = 32,
+    int BK = 32,
+    int BN = 32>
 [[kernel]] void affine_gather_qmm_n(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2924,7 +2950,7 @@ template <
   }
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void affine_quantize(
     const device T* w [[buffer(0)]],
     device uint8_t* out [[buffer(1)]],
@@ -3029,7 +3055,7 @@ template <typename T, const int group_size, const int bits>
   }
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, int group_size, int bits, bool has_global_scale = false>
 [[kernel]] void affine_dequantize(
     const device uint8_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],

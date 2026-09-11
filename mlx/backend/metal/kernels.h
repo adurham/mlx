@@ -81,6 +81,12 @@ MTL::ComputePipelineState* get_sort_kernel(
     int bn,
     int tn);
 
+MTL::ComputePipelineState* get_searchsorted_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in,
+    bool right);
+
 MTL::ComputePipelineState* get_mb_sort_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -290,6 +296,11 @@ MTL::ComputePipelineState* get_fft_kernel(
     const metal::MTLFCList& func_consts,
     const std::string& template_def);
 
+MTL::ComputePipelineState* get_fft_twiddle_kernel(
+    metal::Device& d,
+    const std::string& library_name,
+    const std::string& template_def);
+
 MTL::ComputePipelineState* get_quantized_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -310,7 +321,8 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int bk,
     int wm,
     int wn,
-    bool transpose);
+    bool transpose,
+    bool has_global_scale);
 
 MTL::ComputePipelineState* get_gather_qmm_rhs_lhs_kernel(
     metal::Device& d,
@@ -405,7 +417,8 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int bk,
     int wm,
     int wn,
-    bool transpose);
+    bool transpose,
+    bool has_global_scale);
 
 MTL::ComputePipelineState* get_steel_attention_kernel(
     metal::Device& d,
@@ -431,7 +444,8 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     int bd,
     int wm,
     int wn,
-    const array& m);
+    const array& m,
+    bool split_d);
 
 // Create a GPU kernel template definition for JIT compilation
 template <typename... Args>

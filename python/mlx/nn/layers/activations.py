@@ -68,6 +68,10 @@ def log_softmax(x, axis=-1):
 
     Applies :math:`x - \log \sum_i e^{x_i}` element wise.
     """
+    # Shift by the max first. Subtracting the logsumexp of x directly loses the
+    # normalizer, since adding it to a large max rounds away before the
+    # subtraction happens.
+    x = x - mx.stop_gradient(mx.max(x, axis=axis, keepdims=True))
     return x - mx.logsumexp(x, axis=axis, keepdims=True)
 
 
@@ -225,7 +229,8 @@ def step(x: mx.array, threshold: float = 0.0):
     r"""Applies the Step Activation Function.
 
     This function implements a binary step activation, where the output is set
-    to 1 if the input is greater than a specified threshold, and 0 otherwise.
+    to 1 if the input is greater than or equal to a specified threshold, and 0
+    otherwise.
 
     .. math::
         \text{step}(x) = \begin{cases}
@@ -234,7 +239,7 @@ def step(x: mx.array, threshold: float = 0.0):
         \end{cases}
 
     Args:
-        threshold: The value to threshold at.
+        threshold: The value to threshold at. Default: ``0.0``.
     """
 
     return mx.where(x >= threshold, 1, 0)
@@ -606,7 +611,8 @@ class Step(Module):
     r"""Applies the Step Activation Function.
 
     This function implements a binary step activation, where the output is set
-    to 1 if the input is greater than a specified threshold, and 0 otherwise.
+    to 1 if the input is greater than or equal to a specified threshold, and 0
+    otherwise.
 
     .. math::
         \text{step}(x) = \begin{cases}
@@ -615,7 +621,7 @@ class Step(Module):
         \end{cases}
 
     Args:
-        threshold: The value to threshold at.
+        threshold: The value to threshold at. Default: ``0.0``.
     """
 
     def __init__(self, threshold: float = 0.0):

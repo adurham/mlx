@@ -8,6 +8,40 @@ using namespace fmt::literals;
 
 namespace mlx::core {
 
+#ifdef MLX_METAL_NO_NAX
+// NAX JIT preambles are only generated (via make_jit_source) when the SDK
+// requirement is met. On older SDKs they are skipped and MLX_METAL_NO_NAX is
+// defined, so is_nax_available() returns false and the get_*_nax_kernel entry
+// points below are never reached. These empty definitions only exist to satisfy
+// the linker for this translation unit.
+namespace metal {
+const char* gemm_nax() {
+  return "";
+}
+const char* steel_gemm_fused_nax() {
+  return "";
+}
+const char* steel_gemm_gather_nax() {
+  return "";
+}
+const char* steel_gemm_splitk_nax() {
+  return "";
+}
+const char* steel_gemm_segmented_nax() {
+  return "";
+}
+const char* quantized_nax() {
+  return "";
+}
+const char* fp_quantized_nax() {
+  return "";
+}
+const char* steel_attention_nax() {
+  return "";
+}
+} // namespace metal
+#endif // MLX_METAL_NO_NAX
+
 MTL::ComputePipelineState* get_arange_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -394,6 +428,25 @@ MTL::ComputePipelineState* get_sort_kernel(
           bn,
           tn);
     }
+    return kernel_source.str();
+  });
+  return d.get_kernel(kernel_name, lib);
+}
+
+MTL::ComputePipelineState* get_searchsorted_kernel(
+    metal::Device& d,
+    const std::string& kernel_name,
+    const array& in,
+    bool right) {
+  auto lib = d.get_library(kernel_name, [&]() {
+    std::ostringstream kernel_source;
+    // The kernel compares through LessThan, which lives in sort.h.
+    kernel_source << metal::utils() << metal::sort() << metal::searchsorted();
+    kernel_source << get_template_definition(
+        kernel_name,
+        "searchsorted",
+        get_type_string(in.dtype()),
+        right ? "true" : "false");
     return kernel_source.str();
   });
   return d.get_kernel(kernel_name, lib);
@@ -955,6 +1008,18 @@ MTL::ComputePipelineState* get_fft_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
+MTL::ComputePipelineState* get_fft_twiddle_kernel(
+    metal::Device& d,
+    const std::string& library_name,
+    const std::string& template_def) {
+  auto lib = d.get_library(library_name, [&]() {
+    std::ostringstream kernel_source;
+    kernel_source << metal::fft() << template_def;
+    return kernel_source.str();
+  });
+  return d.get_kernel("generate_bluestein_twiddles", lib);
+}
+
 MTL::ComputePipelineState* get_quantized_kernel(
     metal::Device& d,
     const std::string& kernel_name,
@@ -989,28 +1054,44 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
     int bk,
     int wm,
     int wn,
-    bool transpose) {
+    bool transpose,
+    bool has_global_scale) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
     concatenate(
         kernel_source, metal::utils(), metal::quantized_utils(), metal::gemm());
     bool is_affine = mode == "affine";
+    // Only the fp kernel takes a global scale.
+    auto template_def = is_affine ? get_template_definition(
+                                        lib_name,
+                                        "affine_gather_qmm_rhs",
+                                        get_type_string(x.dtype()),
+                                        group_size,
+                                        bits,
+                                        bm,
+                                        bn,
+                                        bk,
+                                        wm,
+                                        wn,
+                                        transpose)
+                                  : get_template_definition(
+                                        lib_name,
+                                        "fp_gather_qmm_rhs",
+                                        get_type_string(x.dtype()),
+                                        group_size,
+                                        bits,
+                                        bm,
+                                        bn,
+                                        bk,
+                                        wm,
+                                        wn,
+                                        transpose,
+                                        has_global_scale);
     concatenate(
         kernel_source,
         is_affine ? metal::quantized() : metal::fp_quantized(),
-        get_template_definition(
-            lib_name,
-            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs"),
-            get_type_string(x.dtype()),
-            group_size,
-            bits,
-            bm,
-            bn,
-            bk,
-            wm,
-            wn,
-            transpose));
+        template_def);
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
@@ -1231,7 +1312,8 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
     int bk,
     int wm,
     int wn,
-    bool transpose) {
+    bool transpose,
+    bool has_global_scale) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1241,21 +1323,36 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
         metal::gemm_nax(),
         metal::quantized_utils());
     bool is_affine = mode == "affine";
+    // Only the fp kernel takes a global scale.
+    auto template_def = is_affine ? get_template_definition(
+                                        lib_name,
+                                        "affine_gather_qmm_rhs_nax",
+                                        get_type_string(x.dtype()),
+                                        group_size,
+                                        bits,
+                                        bm,
+                                        bn,
+                                        bk,
+                                        wm,
+                                        wn,
+                                        transpose)
+                                  : get_template_definition(
+                                        lib_name,
+                                        "fp_gather_qmm_rhs_nax",
+                                        get_type_string(x.dtype()),
+                                        group_size,
+                                        bits,
+                                        bm,
+                                        bn,
+                                        bk,
+                                        wm,
+                                        wn,
+                                        transpose,
+                                        has_global_scale);
     concatenate(
         kernel_source,
         is_affine ? metal::quantized_nax() : metal::fp_quantized_nax(),
-        get_template_definition(
-            lib_name,
-            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs_nax"),
-            get_type_string(x.dtype()),
-            group_size,
-            bits,
-            bm,
-            bn,
-            bk,
-            wm,
-            wn,
-            transpose));
+        template_def);
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
@@ -1306,7 +1403,8 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     int bd,
     int wm,
     int wn,
-    const array& m) {
+    const array& m,
+    bool split_d) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
@@ -1316,7 +1414,7 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
         metal::steel_attention_nax(),
         get_template_definition(
             lib_name,
-            "attention_nax",
+            split_d ? "attention_nax_dsplit" : "attention_nax",
             get_type_string(q.dtype()),
             bq,
             bk,

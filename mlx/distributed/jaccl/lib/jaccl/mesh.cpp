@@ -148,11 +148,12 @@ inline bool jaccl_pipeline_mode_enabled() {
 MeshGroup::MeshGroup(
     int rank,
     const std::vector<std::string>& device_names,
-    const std::string& coordinator_addr)
+    SideChannel sc,
+    std::string coordinator_addr)
     : rank_(rank),
       size_(device_names.size()),
-      side_channel_(std::in_place, rank_, size_, coordinator_addr.c_str()),
-      coordinator_addr_(coordinator_addr),
+      side_channel_(std::move(sc)),
+      coordinator_addr_(std::move(coordinator_addr)),
       device_names_(device_names),
       connections_(create_connections(device_names)) {
   if (size_ > MESH_MAX_PEERS) {
@@ -312,7 +313,8 @@ MeshGroup::MeshGroup(
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
       p2p_retry_recv_buffers_,
-      data_pool_recv_buffers_);
+      data_pool_recv_buffers_,
+      scatter_buffers_);
   // Give the top-level mesh the reliable TCP coordinator for the confirmed
   // (ack-of-ack) barrier. side_channel_ is in-place and outlives mesh_.
   mesh_.set_coordinator(&*side_channel_);
@@ -443,7 +445,8 @@ MeshGroup::MeshGroup(
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
       p2p_retry_recv_buffers_,
-      data_pool_recv_buffers_);
+      data_pool_recv_buffers_,
+      scatter_buffers_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -988,6 +991,14 @@ void MeshGroup::initialize(const ExchangeFn& exchange) {
 }
 
 void MeshGroup::rebuild_p2p_channel() {
+  // Upstream's SideChannel can be built from a caller-supplied all-gather
+  // function with no coordinator address at all (Config::set_all_gather*),
+  // in which case there is no port to derive and no p2p channel to build.
+  // p2p_channel_ is only used by the PP send()/recv() retry protocol, which
+  // throws its own clear diagnostic if it is ever reached without one.
+  if (coordinator_addr_.empty()) {
+    return;
+  }
   auto colon = coordinator_addr_.find(':');
   if (colon == std::string::npos) {
     std::ostringstream msg;
@@ -1367,6 +1378,7 @@ void MeshGroup::release_borrowed_device_state() {
   data_pool_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
+  scatter_buffers_.clear();
   ack_connections_.clear();
   pool_connections_.clear();
   p2p_retry_connections_.clear();
@@ -1421,7 +1433,8 @@ void MeshGroup::rebuild_on_contexts(
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
       p2p_retry_recv_buffers_,
-      data_pool_recv_buffers_);
+      data_pool_recv_buffers_,
+      scatter_buffers_);
   ring_ = RingImpl(
       rank_,
       size_,
@@ -1547,6 +1560,7 @@ void MeshGroup::reconnect_fresh() {
   data_pool_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
+  scatter_buffers_.clear();
   ack_connections_.clear();
   pool_connections_.clear();
   p2p_retry_connections_.clear();
@@ -1643,7 +1657,8 @@ void MeshGroup::reconnect_fresh() {
       ack_recv_buffers_,
       p2p_retry_send_buffers_,
       p2p_retry_recv_buffers_,
-      data_pool_recv_buffers_);
+      data_pool_recv_buffers_,
+      scatter_buffers_);
   mesh_.set_coordinator(&*side_channel_);
   // Rebuild p2p_channel_ same as reconnect() -- it is a separate TCP socket
   // from the RDMA transport rebuilt above, so it does NOT get cleared by
@@ -1724,6 +1739,7 @@ void MeshGroup::allocate_buffers() {
   data_pool_recv_buffers_.clear();
   ring_send_buffers_.clear();
   ring_recv_buffers_.clear();
+  scatter_buffers_.clear();
 
   // Allocate data and ring buffers.
   for (int k = 0; k < BUFFER_SIZES; k++) {
@@ -1734,6 +1750,10 @@ void MeshGroup::allocate_buffers() {
       for (int j = 0; j < 2; j++) {
         ring_send_buffers_.emplace_back(FRAME_SIZE * (1 << k));
         ring_recv_buffers_.emplace_back(FRAME_SIZE * (1 << k));
+      }
+      // Scatter buffers (size_ send slots followed by size_ recv slots)
+      for (int j = 0; j < 2 * size_; j++) {
+        scatter_buffers_.emplace_back(FRAME_SIZE * (1 << k));
       }
     }
   }
@@ -1837,6 +1857,20 @@ void MeshGroup::allocate_buffers() {
           .register_to_protection_domain(connections_[left].protection_domain);
       ring_recv_buffers_[k * NUM_BUFFERS * 2 + i * 2 + 1]
           .register_to_protection_domain(connections_[right].protection_domain);
+
+      // Scatter buffers. Slot p (send to peer p) and slot size_ + p (recv from
+      // peer p) are both registered to peer p's protection domain. The slots
+      // for our own rank are unused but kept for uniform indexing.
+      int scatter_base = k * NUM_BUFFERS * 2 * size_ + i * 2 * size_;
+      for (int j = 0; j < size_; j++) {
+        if (j == rank_) {
+          continue;
+        }
+        scatter_buffers_[scatter_base + j].register_to_protection_domain(
+            connections_[j].protection_domain);
+        scatter_buffers_[scatter_base + size_ + j]
+            .register_to_protection_domain(connections_[j].protection_domain);
+      }
     }
   }
   // ROOT-CAUSE FIX (2026-08-20): register the standing data-QP recv pool's
@@ -1978,6 +2012,17 @@ void MeshGroup::all_gather(
   trace_hash(call_id, output, static_cast<int64_t>(n_bytes) * size_);
 }
 
+void MeshGroup::sum_scatter(
+    const void* input,
+    void* output,
+    size_t n_bytes,
+    int dtype) {
+  dispatch_all_types(dtype, [&](auto type_tag) {
+    using T = JACCL_GET_TYPE(type_tag);
+    reduce_scatter<T>(input, output, n_bytes, SumOp<T>{});
+  });
+}
+
 void MeshGroup::send(const void* input, size_t n_bytes, int dst) {
   std::lock_guard<std::mutex> guard(collective_mutex_);
   uint32_t call_id = next_call_id();
@@ -2015,13 +2060,30 @@ void MeshGroup::all_reduce(
   auto in_ptr = static_cast<const T*>(input);
   auto out_ptr = static_cast<T*>(output);
   int64_t count = n_bytes / sizeof(T);
-  if (size_ > 2 &&
-      ((std::is_same_v<T, bfloat16_t> && count > 256 * 1024) ||
-       count >= 8 * 1024 * 1024 / static_cast<int64_t>(sizeof(T)))) {
-    ring_.all_reduce<2>(in_ptr, out_ptr, count, 1, reduce_op);
+  if (size_ > 2 && n_bytes > 32 * 1024) {
+    // Large messages are bandwidth bound so use the reduce scatter + all gather
+    // path which moves size_x less data per link than the fully connected
+    // all_reduce.
+    mesh_.all_reduce_scatter_gather(in_ptr, out_ptr, count, reduce_op);
   } else {
+    // Small messages are latency bound so use the single phase fully
+    // connected all_reduce cause it is a bit better.
     mesh_.all_reduce(call_id, in_ptr, out_ptr, count, reduce_op);
   }
+}
+
+template <typename T, typename ReduceOp>
+void MeshGroup::reduce_scatter(
+    const void* input,
+    void* output,
+    size_t n_bytes,
+    ReduceOp reduce_op) {
+  // n_bytes is the size of the output (one chunk). The input holds size_ such
+  // chunks laid out contiguously.
+  auto in_ptr = static_cast<const T*>(input);
+  auto out_ptr = static_cast<T*>(output);
+  int64_t count = n_bytes / sizeof(T);
+  mesh_.sum_scatter(in_ptr, out_ptr, count, reduce_op);
 }
 
 } // namespace jaccl
