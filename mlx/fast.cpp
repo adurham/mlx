@@ -1078,7 +1078,15 @@ array scaled_dot_product_attention_quant(
     std::optional<array> opt_sinks =
         has_sinks ? std::optional<array>{inputs.back()} : std::nullopt;
     auto out = scaled_dot_product_attention(
-        q, k, v, scale, mask_mode, std::nullopt, opt_sinks, s);
+        q,
+        k,
+        v,
+        scale,
+        mask_mode,
+        std::nullopt,
+        opt_sinks,
+        /* force_fused = */ false,
+        s);
     return std::vector<array>{out};
   };
 
