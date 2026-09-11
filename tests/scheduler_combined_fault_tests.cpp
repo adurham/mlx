@@ -36,6 +36,8 @@
 
 #include "doctest/doctest.h"
 
+#include <functional>
+#include <future>
 #include <stdexcept>
 #include <string>
 
@@ -53,6 +55,40 @@ struct JacclLikeFault : public std::runtime_error {
 struct PrimitiveLikeFault : public std::runtime_error {
   PrimitiveLikeFault()
       : std::runtime_error("[matmul] shapes (2,3) and (4,5) do not match") {}
+};
+
+// Upstream 2026-09 moved StreamThread's definition out of scheduler.h into
+// scheduler.cpp, so these tests can no longer construct one directly. Drive a
+// real dedicated CPU stream through the public scheduler API instead -- same
+// slot, same first-wins/one-shot semantics, and it exercises the wrapper in
+// Scheduler::enqueue too (which is where a std::exception is now captured).
+struct FaultStream {
+  Stream s = new_stream(Device::cpu);
+
+  void enqueue(std::function<void()> f) {
+    scheduler::enqueue(s, std::move(f));
+  }
+
+  // Block until every task queued so far has run.
+  void drain() {
+    std::promise<void> done;
+    auto fut = done.get_future();
+    scheduler::enqueue(s, [&done]() { done.set_value(); });
+    fut.wait();
+  }
+
+  std::exception_ptr take_exception() {
+    return scheduler::scheduler().take_stream_exception(s);
+  }
+
+  // Upstream's Error slot is populated alongside ours by Scheduler::enqueue;
+  // clear it so a later synchronize() in an unrelated test does not throw.
+  void clear_upstream_error() {
+    try {
+      scheduler::check_error(s);
+    } catch (...) {
+    }
+  }
 };
 
 std::exception_ptr make_ptr_from(void (*thrower)()) {
@@ -77,15 +113,12 @@ void throw_primitive() {
 // ever changes to non-consuming, the fix below becomes unnecessary -- so
 // pin it down explicitly rather than leaving it implied.
 TEST_CASE("stream exception slot is one-shot") {
-  scheduler::StreamThread st;
+  FaultStream st;
 
   st.enqueue([]() { throw JacclLikeFault(); });
   // Drain the queue deterministically: a second task cannot run until the
-  // first has been through thread_fn's catch handler.
-  std::promise<void> done;
-  auto fut = done.get_future();
-  st.enqueue([&done]() { done.set_value(); });
-  fut.wait();
+  // first has been through the capture handler.
+  st.drain();
 
   auto first = st.take_exception();
   REQUIRE(first != nullptr);
@@ -95,32 +128,31 @@ TEST_CASE("stream exception slot is one-shot") {
   // synchronize() draining the slot hides the fault from a later
   // throw_if_stream_exception().
   CHECK(st.take_exception() == nullptr);
+  st.clear_upstream_error();
 }
 
 // First-wins storage, matching the `if (!stored_exception)` guard in
 // thread_fn. The combined-failure handler mirrors this, so keep them honest
 // about each other.
 TEST_CASE("stream exception slot keeps the FIRST fault") {
-  scheduler::StreamThread st;
+  FaultStream st;
 
   st.enqueue([]() { throw JacclLikeFault(); });
   st.enqueue([]() { throw PrimitiveLikeFault(); });
-  std::promise<void> done;
-  auto fut = done.get_future();
-  st.enqueue([&done]() { done.set_value(); });
-  fut.wait();
+  st.drain();
 
   auto e = st.take_exception();
   REQUIRE(e != nullptr);
   CHECK_THROWS_AS(std::rethrow_exception(e), JacclLikeFault);
   CHECK(st.take_exception() == nullptr);
+  st.clear_upstream_error();
 }
 
 // The worker thread must SURVIVE a fault -- the whole point of capturing
 // instead of rethrowing (a rethrow unwinds out of std::thread and
 // terminates the process).
 TEST_CASE("stream worker survives a captured fault") {
-  scheduler::StreamThread st;
+  FaultStream st;
 
   st.enqueue([]() { throw JacclLikeFault(); });
   std::promise<void> ran;
@@ -129,6 +161,7 @@ TEST_CASE("stream worker survives a captured fault") {
   // Would hang (then fail the suite) if the worker had died.
   CHECK(fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
   CHECK(st.take_exception() != nullptr);
+  st.clear_upstream_error();
 }
 
 TEST_CASE("describe_exception renders without rethrowing to the caller") {
@@ -188,14 +221,11 @@ TEST_CASE("CombinedEvalFailure is catchable as std::runtime_error") {
 // and the requirement that the drained fault is not lost. Written against
 // the same helper the real handler uses.
 TEST_CASE("cleanup that drains the slot must not lose the fault") {
-  scheduler::StreamThread st;
+  FaultStream st;
 
   // An async JACCL-like fault lands in the slot.
   st.enqueue([]() { throw JacclLikeFault(); });
-  std::promise<void> done;
-  auto fut = done.get_future();
-  st.enqueue([&done]() { done.set_value(); });
-  fut.wait();
+  st.drain();
 
   // A primitive throws synchronously; the handler runs cleanup.
   std::exception_ptr primitive_failure = make_ptr_from(&throw_primitive);
@@ -228,4 +258,5 @@ TEST_CASE("cleanup that drains the slot must not lose the fault") {
         std::string::npos;
   }
   CHECK(reported_jaccl);
+  st.clear_upstream_error();
 }
