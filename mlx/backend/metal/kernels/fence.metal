@@ -5,6 +5,9 @@
 #ifndef __METAL_MEMORY_SCOPE_SYSTEM__
 #define __METAL_MEMORY_SCOPE_SYSTEM__ 3
 #endif
+#ifndef __METAL_MEMORY_FLAGS_NONE__
+#define __METAL_MEMORY_FLAGS_NONE__ 0
+#endif
 namespace metal {
 constexpr constant metal::thread_scope thread_scope_system =
     static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
@@ -51,11 +54,25 @@ constexpr constant metal::thread_scope thread_scope_system =
         return;
       }
     }
-    // System-scope atomic load to force GPU cache refresh from SLC
+    // System-scope atomic load to force GPU cache refresh from SLC.
+    //
+    // Metal 4.1 (Xcode 27 / __METAL_VERSION__ >= 410) added a 4th "memory
+    // flags" operand to __metal_atomic_load_explicit. The pre-4.1 3-argument
+    // form is equivalent to passing __METAL_MEMORY_FLAGS_NONE__ -- that is the
+    // value the Metal standard library itself passes from its own no-flags
+    // atomic_load_explicit(object, order) overloads.
+#if __METAL_VERSION__ >= 410
+    uint cur = __metal_atomic_load_explicit(
+        timestamp,
+        int(metal::memory_order_relaxed),
+        __METAL_MEMORY_SCOPE_SYSTEM__,
+        __METAL_MEMORY_FLAGS_NONE__);
+#else
     uint cur = __metal_atomic_load_explicit(
         timestamp,
         int(metal::memory_order_relaxed),
         __METAL_MEMORY_SCOPE_SYSTEM__);
+#endif
     if (cur >= value) {
       return;
     }
