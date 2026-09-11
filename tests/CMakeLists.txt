@@ -26,6 +26,7 @@ target_sources(
           einsum_tests.cpp
           export_import_tests.cpp
           eval_tests.cpp
+          eval_combined_fault_tests.cpp
           fft_tests.cpp
           load_tests.cpp
           ops_tests.cpp
