@@ -130,7 +130,12 @@ Two negative controls, because a green test proves nothing on its own:
 `mlx/transforms.cpp` and the new test both pass `g++ -std=c++20
 -fsyntax-only`.
 
-## 6. What is NOT tested, and why
+## 6. What was NOT tested at authoring time, and why
+
+> **SUPERSEDED 2026-09-11 — see section 7.** The claims in this section were
+> the author's honest belief at the time, and two of them turned out to be
+> wrong: the fix *was* buildable and testable off-cluster all along. Kept
+> verbatim for the record; read section 7 for what is actually verified.
 
 **No full MLX build, and no end-to-end JACCL test.** Both are honest gaps:
 
@@ -153,3 +158,101 @@ synchronous primitive throw produces this exception on real hardware —
 remains unverified. **Before merging this branch, build it on a Studio while
 the cluster is drained and run `tests`.** The new test needs no GPU, no
 network, and no JACCL group.
+
+## 7. Verification and merge (2026-09-11)
+
+Independent review and re-verification corrected two claims in section 6 and
+found two blockers, both now closed. Nothing about the fix's logic changed;
+what changed is that it is now actually exercised.
+
+### 7.1 Section 6 was wrong about testability
+
+- **"JACCL is gated on SDK >= 26.2 so only the Studios can build it"** is
+  irrelevant *and* wrong. Irrelevant because the code under test is not JACCL
+  code: it is generic CPU-stream machinery in `transforms.cpp`/`scheduler.h`.
+  JACCL pins collectives to a plain **CPU** stream
+  (`jaccl.cpp:88 communication_stream_ = new_stream(Device::cpu)`) and
+  `all_sum` is `encoder.dispatch([]{...})` (`jaccl.cpp:113`) whose lambda
+  throws on the stream worker thread — no RDMA, no ibverbs, no Metal, no
+  second node required to reproduce the fault's *routing*. Wrong because
+  `MACOS_SDK_VERSION` is only set inside `if(MLX_BUILD_METAL)`, so with
+  `MLX_BUILD_METAL=OFF` the gate is never even evaluated; and a developer
+  laptop's SDK (26.5) satisfies it anyway.
+- **"The only machines that could build it are the production Studios"** is
+  false. All functional verification below ran on a non-production MacBook.
+
+Only the **RDMA → slot** leg still needs the cluster: that a real
+`wc.status != IBV_WC_SUCCESS` lands in `stored_exception` during a live
+two-node run. The hook for it already exists (`JACCL_INJECT_WC_ERROR=K`,
+`lib/jaccl/mesh_impl.h:1753`). Everything downstream of the slot — which is
+all this fix touches — is now verified by real execution.
+
+### 7.2 Blocker: the committed tests could not fail
+
+`tests/scheduler_combined_fault_tests.cpp` passes **7/7 with the fix
+reverted** (measured, not inferred). No case in it calls `eval()` or
+`eval_impl()`; it tests scheduler helpers plus a hand-rolled replica of the
+catch block. A regression guard that cannot fail is not a guard.
+
+Closed by `tests/eval_combined_fault_tests.cpp`, which drives the real
+`eval()` → `eval_impl()` path with a tape of
+`ones → AsyncStreamFault (pinned CPU comm stream) → SyncPrimitiveFault`.
+Measured on a CPU-only build (macOS 26.6.2 / Xcode 26.6):
+
+| Tree | New guard | Old committed file |
+|---|---|---|
+| With the fix | **6/6 pass**, 17/17 assertions | 7/7 pass |
+| `transforms.cpp` hunk reverted | **FAILS, 4/6, Status: FAILURE** | 7/7 pass |
+
+On the reverted tree `eval()` throws a bare `std::invalid_argument` reading
+only `[matmul] shapes (2,3) and (4,5) do not match`, JACCL fault absent —
+the original bug, reproduced by the guard. Full suite with the fix:
+**257/257 cases, 3278/3278 assertions, 0 failures, 0 `ERROR:` lines**.
+Guard re-run 10× consecutively: 10/10, no flakiness.
+
+### 7.3 Blocker: the branch lacked main's Metal 4.1/Xcode 27 fixes
+
+`origin/main` was **not** an ancestor of `upstream-sync-2026-09`
+(merge-base `e40a416b2`), so merging as-is would have shipped a tree without
+`837339cd1` / `e65e4f893` / `e19a1bbdf` and broken the Metal build on the
+Studios (Xcode 27.0 / Metal 4.1). Closed by merging `origin/main` into the
+branch first. The two commit ranges touch **disjoint file sets** (37 files vs
+18, zero overlap), so the merge is structural with no content resolution:
+every main-side file is byte-identical to `origin/main` in the result, and
+1,085 parent-unique lines across both sides survive with zero loss.
+
+### 7.4 Known limitation, deliberately not "fixed"
+
+The handler keeps only the **first** stream fault, and `open_streams` is a
+`std::set<Stream>` ordered by index — so with two faulting streams in one
+eval, the lower-indexed one wins regardless of relevance and the other is
+dropped. In production JACCL's comm stream is created at group-init and
+normally has a low index, so it normally wins, but *"the JACCL fault is never
+lost"* is not unconditionally true. Documented by the
+`with two faulting streams only one fault is surfaced` case rather than
+papered over. Collecting all stream faults into a vector would remove the
+caveat; not done here to keep the merge diff minimal.
+
+### 7.5 Python-visible exception type change (release-note item)
+
+nanobind maps by C++ type: `std::invalid_argument` → **ValueError**,
+`std::runtime_error` → **RuntimeError**, and there are no custom exception
+translators in `python/src/`. `CombinedEvalFailure` derives from
+`std::runtime_error`, so **in the combined case only**, Python sees
+`RuntimeError` where it previously saw `ValueError`. Proven at runtime: the
+combined exception is catchable as `std::runtime_error` and not as
+`std::invalid_argument`.
+
+Audited independently with an AST walk (not grep) over `src/exo` +
+`mlx-lm`: **388 handlers scanned, 164 narrow (type-specific) ones, 15 of
+which also wrap an eval-forcing call**, and **0 `except RuntimeError`
+handlers wrapping an eval-forcing call** that would newly swallow the wrapped
+type. Of the 15, only `utils_mlx.py:230` (`except ValueError` around
+`mx.eval(layer)`) is both narrow-non-RuntimeError and eval-forcing on a
+collective-capable path — and it sits inside `if group is None:`, the
+single-device branch, where no JACCL group and therefore no combined case
+exists. `utils_mlx.py:1918`'s `except RuntimeError` re-raises unless the
+message contains `"does not support a TCP-only coord group"`, which
+`CombinedEvalFailure`'s message does not. **No regression found**, but the
+type change is real and worth a release note.
+
